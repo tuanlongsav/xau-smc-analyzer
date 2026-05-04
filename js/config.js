@@ -1,17 +1,14 @@
 // ============================================================
-// CẤU HÌNH — Dynamic từ localStorage, fallback empty
+// CẤU HÌNH
 // ============================================================
 //
-// ⚠️ KHÔNG hardcode API key trong file này khi push lên GitHub!
-// Google quét public repo và tự động disable key dù có HTTP referrer.
+// Mọi API key (Gemini + TwelveData) được giấu trong Cloudflare Worker secret.
+// Frontend chỉ biết Worker URL — không tiếp xúc key.
 //
-// User-input pattern:
-// - User nhập key trong Settings panel (UI) → lưu localStorage
-// - Mỗi user dùng key riêng, an toàn
-// - Repo public không chứa key
+// User vẫn có thể override Gemini bằng key cá nhân (Settings panel) — frontend
+// sẽ gọi Google trực tiếp với key đó thay vì qua Worker.
 //
-// Để override default cho local dev: tạo file js/config.local.js (đã .gitignore)
-// và import nó từ index.html (thêm <script type="module" src="js/config.local.js">)
+// Local dev override: tạo js/config.local.js (đã .gitignore).
 
 const LS_KEY = "xau_api_keys";
 
@@ -27,38 +24,26 @@ function saveKeys(keys) {
   localStorage.setItem(LS_KEY, JSON.stringify(keys));
 }
 
-// CONFIG là một Proxy: đọc lấy giá trị live từ localStorage
 const _baseConfig = {
   GEMINI_MODEL: "gemini-2.5-flash",
   GEMINI_FALLBACK_MODEL: "gemini-2.5-flash-lite",
 
-  // URL của Cloudflare Worker proxy (giấu Gemini key).
-  // Worker code: ./worker/src/index.js. Set key: cd worker && wrangler secret put GEMINI_API_KEY
+  // URL Cloudflare Worker proxy (giấu Gemini + TwelveData keys).
+  // Worker code: ./worker/src/index.js
+  // Set keys: cd worker && wrangler secret put GEMINI_API_KEY (và TWELVEDATA_API_KEY)
   GEMINI_PROXY_URL: "https://xau-gemini-proxy.tuanlong-sav.workers.dev",
 
   SYMBOL: "XAU/USD",
   OUTPUT_SIZE: 1000,
 
-  // Map TwelveData interval → key chuẩn nội bộ
-  INTERVALS: {
-    "5min":  "5m",
-    "15min": "15m",
-    "1h":    "1h",
-    "4h":    "4h",
-    "1day":  "1d",
-  },
-
   // Default TF khi mở app
   DEFAULT_TF: "15m",
-
-  // Data source priority: 'stooq' (chính, free no-key), 'twelvedata' (optional, fallback khi Stooq lỗi)
-  DATA_SOURCES: ["stooq", "twelvedata"],
 };
 
+// Proxy để đọc Gemini override key từ localStorage
 export const CONFIG = new Proxy(_baseConfig, {
   get(target, prop) {
     if (prop === "GEMINI_API_KEY") return loadKeys().gemini || "";
-    if (prop === "TWELVEDATA_API_KEY") return loadKeys().twelvedata || "";
     return target[prop];
   },
 });
@@ -77,14 +62,7 @@ export function getApiKey(name) {
   return loadKeys()[name] || "";
 }
 
+// Có Gemini access (Worker proxy hoặc user override)
 export function hasGemini() {
   return !!loadKeys().gemini || !!_baseConfig.GEMINI_PROXY_URL;
-}
-
-export function hasGeminiProxy() {
-  return !!_baseConfig.GEMINI_PROXY_URL;
-}
-
-export function hasTwelveData() {
-  return !!loadKeys().twelvedata;
 }

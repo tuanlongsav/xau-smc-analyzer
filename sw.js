@@ -6,7 +6,7 @@
 // - API calls (TwelveData/Gemini/RSS): network-only (luôn cần fresh)
 // - Icons + Tailwind/CDN: cache-first
 
-const VERSION = "v1.0.0";
+const VERSION = "v1.2.0";
 const APP_CACHE = `xau-smc-app-${VERSION}`;
 
 const APP_SHELL = [
@@ -48,21 +48,21 @@ self.addEventListener("fetch", (e) => {
 
   // API calls → network only (data fresh)
   const NETWORK_ONLY_HOSTS = [
-    "api.twelvedata.com",
+    "api.twelvedata.com",          // (chỉ khi user override Gemini key - không dùng nữa cho data)
     "generativelanguage.googleapis.com",
     "api.rss2json.com",
     "api.allorigins.win",
+    "workers.dev",                 // Cloudflare Worker proxy (Gemini + TwelveData)
   ];
   if (NETWORK_ONLY_HOSTS.some(h => url.hostname.includes(h))) {
-    return; // mặc định fetch
+    return; // mặc định fetch — không SW handle
   }
 
-  // App shell + CDN: cache-first
+  // App shell + CDN: cache-first, fallback network, fallback error response
   e.respondWith(
     caches.match(e.request).then((cached) => {
       if (cached) return cached;
       return fetch(e.request).then((res) => {
-        // Chỉ cache GET với status 200
         if (res.ok && (url.origin === self.location.origin ||
                        url.hostname.includes("cdn.tailwindcss.com") ||
                        url.hostname.includes("unpkg.com"))) {
@@ -70,7 +70,13 @@ self.addEventListener("fetch", (e) => {
           caches.open(APP_CACHE).then(c => c.put(e.request, clone));
         }
         return res;
-      }).catch(() => cached); // offline fallback
+      }).catch((err) => {
+        // Network fail + không có cache → trả Response 504 thay vì undefined
+        return new Response(
+          `Service worker offline fallback: ${err.message}`,
+          { status: 504, headers: { "Content-Type": "text/plain" } }
+        );
+      });
     })
   );
 });

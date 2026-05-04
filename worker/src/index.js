@@ -55,7 +55,14 @@ export default {
       return jsonResponse(200, {
         ok: true,
         service: "xau-gemini-proxy",
-        hasKey: !!env.GEMINI_API_KEY,
+        hasGeminiKey: !!env.GEMINI_API_KEY,
+        hasTwelveDataKey: !!env.TWELVEDATA_API_KEY,
+        endpoints: [
+          "/health",
+          "/v1beta/models/{model}:generateContent",
+          "/twelvedata/time_series",
+          "/twelvedata/price",
+        ],
       }, origin);
     }
 
@@ -65,7 +72,60 @@ export default {
       return jsonResponse(403, { error: "Origin không được phép" }, origin);
     }
 
-    // Proxy: POST /v1beta/models/{model}:generateContent
+    // ──────────────────────────────────────────────────────────
+    // TwelveData proxy: GET /twelvedata/{time_series|price}?symbol=...&interval=...
+    // ──────────────────────────────────────────────────────────
+    // Free 800 req/ngày, real-time XAU/USD. Worker chèn apikey từ secret TWELVEDATA_API_KEY.
+    if (url.pathname.startsWith("/twelvedata/")) {
+      if (request.method !== "GET") {
+        return jsonResponse(405, { error: "TwelveData chỉ accept GET" }, origin);
+      }
+      if (!env.TWELVEDATA_API_KEY) {
+        return jsonResponse(500, {
+          error: "Worker chưa cấu hình TWELVEDATA_API_KEY. Chạy: wrangler secret put TWELVEDATA_API_KEY",
+        }, origin);
+      }
+
+      // Whitelist endpoint TD để tránh dùng Worker gọi endpoint paid
+      const tdPath = url.pathname.slice("/twelvedata".length); // "/time_series" hoặc "/price"
+      const ALLOWED_PATHS = ["/time_series", "/price"];
+      if (!ALLOWED_PATHS.includes(tdPath)) {
+        return jsonResponse(404, { error: `Endpoint TD "${tdPath}" không được phép` }, origin);
+      }
+
+      // Whitelist params
+      const ALLOWED_PARAMS = ["symbol", "interval", "outputsize", "format", "timezone", "start_date", "end_date"];
+      const fwd = new URLSearchParams();
+      for (const k of ALLOWED_PARAMS) {
+        const v = url.searchParams.get(k);
+        if (v) fwd.set(k, v);
+      }
+      // Validate symbol (chữ + số + slash, vd "XAU/USD")
+      const symbol = fwd.get("symbol") || "";
+      if (!/^[A-Za-z0-9/]+$/.test(symbol)) {
+        return jsonResponse(400, { error: "symbol không hợp lệ" }, origin);
+      }
+      // Worker chèn apikey
+      fwd.set("apikey", env.TWELVEDATA_API_KEY);
+
+      const tdUrl = `https://api.twelvedata.com${tdPath}?${fwd}`;
+      let upstream;
+      try {
+        upstream = await fetch(tdUrl, {
+          cf: { cacheEverything: true, cacheTtl: 30 },
+        });
+      } catch (e) {
+        return jsonResponse(502, { error: `Không gọi được TwelveData: ${e.message}` }, origin);
+      }
+      const respHeaders = new Headers(corsHeaders(origin));
+      respHeaders.set("Content-Type", upstream.headers.get("Content-Type") || "application/json");
+      respHeaders.set("Cache-Control", "public, max-age=30");
+      return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Gemini proxy: POST /v1beta/models/{model}:generateContent
+    // ──────────────────────────────────────────────────────────
     const match = url.pathname.match(/^\/v1beta\/models\/([^:/]+):generateContent$/);
     if (!match || request.method !== "POST") {
       return jsonResponse(404, { error: "Endpoint không tồn tại" }, origin);

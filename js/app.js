@@ -6,7 +6,7 @@ import { computeIndicators, calculateZones, detectAlerts } from "./indicators.js
 import { analyzeSmc, quickScan } from "./gemini.js";
 import { initChart, updateChart, resizeChart } from "./chart.js";
 import { fetchNews, formatNewsForPrompt } from "./news.js";
-import { CONFIG, setApiKey, getApiKey, hasGemini, hasTwelveData } from "./config.js";
+import { CONFIG, setApiKey, getApiKey, hasGemini } from "./config.js";
 
 // ============================================================
 // STATE
@@ -119,10 +119,8 @@ function renderHeader() {
   const src = state.candleSourceByTf[state.tf];
   const srcEl = $("#data-source");
   if (srcEl && src) {
-    srcEl.textContent = src === "twelvedata" ? "📡 TwelveData" : "📊 Stooq (free)";
-    srcEl.className = src === "twelvedata"
-      ? "text-xs text-green-500"
-      : "text-xs text-amber-500";
+    srcEl.textContent = "📡 TwelveData";
+    srcEl.className = "text-xs text-green-500";
   }
 
   // Render news panel
@@ -490,30 +488,26 @@ function setupSettingsPanel() {
     panel.classList.toggle("hidden");
     if (!panel.classList.contains("hidden")) {
       $("#gemini-key-input").value = getApiKey("gemini");
-      $("#td-key-input").value = getApiKey("twelvedata");
     }
   });
   $("#save-keys-btn").addEventListener("click", () => {
     setApiKey("gemini", $("#gemini-key-input").value);
-    setApiKey("twelvedata", $("#td-key-input").value);
     $("#keys-status").textContent = "✅ Đã lưu";
     setTimeout(() => $("#keys-status").textContent = "", 2000);
     refreshAll();
   });
   $("#clear-keys-btn").addEventListener("click", () => {
-    if (!confirm("Xoá toàn bộ API key đã lưu?")) return;
+    if (!confirm("Xoá Gemini key override?")) return;
     setApiKey("gemini", "");
-    setApiKey("twelvedata", "");
     $("#gemini-key-input").value = "";
-    $("#td-key-input").value = "";
     $("#keys-status").textContent = "🗑️ Đã xoá";
     setTimeout(() => $("#keys-status").textContent = "", 2000);
   });
 
-  // Auto mở settings nếu chưa có Gemini key
+  // Auto mở settings nếu chưa có Gemini access (proxy lẫn override đều rỗng)
   if (!hasGemini()) {
     panel.classList.remove("hidden");
-    $("#keys-status").innerHTML = `<span class="text-amber-500">⚠️ Cần Gemini key để phân tích AI</span>`;
+    $("#keys-status").innerHTML = `<span class="text-amber-500">⚠️ Cần Gemini key hoặc Worker proxy</span>`;
   }
 }
 
