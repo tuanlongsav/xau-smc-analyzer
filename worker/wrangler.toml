@@ -2,7 +2,15 @@ name = "xau-gemini-proxy"
 main = "src/index.js"
 compatibility_date = "2025-05-01"
 
+# Smart Placement: Cloudflare auto-route Worker chạy gần API origin (Google US/EU)
+# thay vì gần user. Mục đích: tránh Google chặn API ở 1 số quốc gia (VN, CN, HK...)
+# bằng cách egress từ datacenter US/EU.
+[placement]
+mode = "smart"
+
 # Secret cần set bằng tay sau khi deploy:
 #   npx wrangler secret put GEMINI_API_KEY
+#   npx wrangler secret put GEMINI_API_KEY_BACKUP
+#   npx wrangler secret put TWELVEDATA_API_KEY
 #
 # KHÔNG để key trong file này (file này commit lên Git).
