@@ -160,7 +160,7 @@ function renderNewsPanel() {
 }
 
 function renderChart() {
-  updateChart(state.candles);
+  updateChart(state.candles, state.tf);
 }
 
 function renderAlerts() {

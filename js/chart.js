@@ -6,8 +6,25 @@
 //
 // Globals: window.LightweightCharts (CDN trong index.html)
 
-// 100 nến cuối — candle to hơn, dễ đọc.
-const DEFAULT_VISIBLE_BARS = 100;
+// Số nến hiển thị mặc định — nhỏ hơn = candle to hơn (matching user preference).
+const DEFAULT_VISIBLE_BARS = 70;
+
+// Format tick time axis theo TF — 1d ẩn giờ phút, intraday hiện giờ:phút.
+function makeTickFormatter(tf) {
+  // TickMarkType: 0=Year, 1=Month, 2=DayOfMonth, 3=Time, 4=TimeWithSeconds
+  const pad = n => String(n).padStart(2, "0");
+  const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  return (time, tickMarkType) => {
+    const d = new Date(time * 1000);
+    const dateStr = `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}`;
+    const timeStr = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+    if (tickMarkType === 0) return String(d.getUTCFullYear());
+    if (tickMarkType === 1) return MONTHS[d.getUTCMonth()];
+    if (tickMarkType === 2) return dateStr;
+    // Time ticks — 1d không cần giờ
+    return tf === "1d" ? dateStr : timeStr;
+  };
+}
 
 let priceChart = null, rsiChart = null, macdChart = null;
 let candleSeries, ema20Series, ema50Series, ema200Series, bbUpperSeries, bbLowerSeries;
@@ -119,10 +136,20 @@ function syncTimeScale(charts) {
 
 /**
  * Cập nhật toàn bộ data lên 3 charts.
+ * @param {Array} candles
+ * @param {string} tf - timeframe để chọn time axis formatter
  */
-export function updateChart(candles) {
+export function updateChart(candles, tf = "15m") {
   if (!priceChart || !candleSeries) return;
   if (!candles || candles.length === 0) return;
+
+  // Apply tickMarkFormatter cho macdChart (chart duy nhất hiện time axis).
+  // applyOptions có thể gọi mỗi lần update — Lightweight Charts re-render axis hiệu quả.
+  if (macdChart) {
+    macdChart.applyOptions({
+      timeScale: { tickMarkFormatter: makeTickFormatter(tf) },
+    });
+  }
 
   // ── Price ──
   candleSeries.setData(candles.map(c => ({
