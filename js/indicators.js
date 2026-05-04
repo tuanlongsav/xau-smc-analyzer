@@ -31,6 +31,20 @@ function ema(values, period) {
 }
 
 /**
+ * Simple Moving Average.
+ */
+function sma(values, period) {
+  const out = new Array(values.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i >= period) sum -= values[i - period];
+    if (i >= period - 1) out[i] = sum / period;
+  }
+  return out;
+}
+
+/**
  * Wilder's smoothing — dùng cho RSI và ATR.
  */
 function wilderSmooth(values, period) {
@@ -136,10 +150,14 @@ export function computeIndicators(candles) {
   const highs = candles.map(c => c.high);
   const lows = candles.map(c => c.low);
 
-  const ema20 = ema(closes, 20);
-  const ema50 = ema(closes, 50);
+  const ema9   = ema(closes, 9);
+  const ema20  = ema(closes, 20);
+  const ema21  = ema(closes, 21);
+  const ema50  = ema(closes, 50);
   const ema200 = ema(closes, 200);
-  const rsi14 = rsi(closes, 14);
+  const sma50  = sma(closes, 50);
+  const sma200 = sma(closes, 200);
+  const rsi14  = rsi(closes, 14);
   const atr14 = atr(highs, lows, closes, 14);
   const { macd: macdLine, signal: macdSignal } = macd(closes);
   const { upper: bbUpper, middle: bbMiddle, lower: bbLower } = bollinger(closes, 20, 2);
@@ -148,9 +166,13 @@ export function computeIndicators(candles) {
 
   return candles.map((c, i) => ({
     ...c,
+    ema9: ema9[i],
     ema20: ema20[i],
+    ema21: ema21[i],
     ema50: ema50[i],
     ema200: ema200[i],
+    sma50: sma50[i],
+    sma200: sma200[i],
     rsi: rsi14[i],
     atr: atr14[i],
     macd: macdLine[i],
@@ -161,6 +183,52 @@ export function computeIndicators(candles) {
     recentHigh: recentHigh[i],
     recentLow: recentLow[i],
   }));
+}
+
+/**
+ * Fibonacci retracement từ swing high/low trong N nến gần nhất.
+ * Trả 5 levels: 0.236, 0.382, 0.5, 0.618, 0.786
+ * - Uptrend (low đến trước high): levels = HH - range × fib (giá retrace xuống)
+ * - Downtrend (high đến trước low): levels = LL + range × fib (giá retrace lên)
+ */
+export function computeFib(candles, lookback = 50) {
+  if (!candles || candles.length < 5) return null;
+  const window = candles.slice(-Math.min(lookback, candles.length));
+  let hhIdx = 0, llIdx = 0;
+  for (let i = 0; i < window.length; i++) {
+    if (window[i].high > window[hhIdx].high) hhIdx = i;
+    if (window[i].low  < window[llIdx].low)  llIdx = i;
+  }
+  const hh = window[hhIdx].high;
+  const ll = window[llIdx].low;
+  const range = hh - ll;
+  if (range <= 0) return null;
+  const isUptrend = llIdx < hhIdx; // low xuất hiện trước high
+  const fibs = [0.236, 0.382, 0.5, 0.618, 0.786];
+  const levels = fibs.map(f => ({
+    level: f,
+    price: isUptrend ? hh - range * f : ll + range * f,
+  }));
+  return { hh, ll, isUptrend, levels };
+}
+
+/**
+ * Detect Golden Cross / Death Cross historical events trong candles.
+ * Golden Cross: SMA 50 cắt LÊN SMA 200 → bullish
+ * Death Cross:  SMA 50 cắt XUỐNG SMA 200 → bearish
+ */
+export function detectCrosses(candles) {
+  const out = [];
+  for (let i = 1; i < candles.length; i++) {
+    const p = candles[i - 1], c = candles[i];
+    if (p.sma50 == null || p.sma200 == null || c.sma50 == null || c.sma200 == null) continue;
+    if (p.sma50 <= p.sma200 && c.sma50 > c.sma200) {
+      out.push({ time: c.time, type: "golden" });
+    } else if (p.sma50 >= p.sma200 && c.sma50 < c.sma200) {
+      out.push({ time: c.time, type: "death" });
+    }
+  }
+  return out;
 }
 
 /**

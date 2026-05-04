@@ -1,10 +1,11 @@
 // ============================================================
-// Chart manager — 3 panes synced (price + RSI + MACD)
+// Chart manager — 2 panes synced (price+RSI sub-pane + MACD)
 // ============================================================
-// Dùng TradingView Lightweight Charts v4. v4 không có native panes,
-// nên tạo 3 chart instance riêng và sync timeScale + crosshair.
+// Dùng TradingView Lightweight Charts v4. RSI lồng vào priceChart
+// qua leftPriceScale (sub-pane). MACD pane riêng, sync time scale.
 //
 // Globals: window.LightweightCharts (CDN trong index.html)
+import { computeFib, detectCrosses } from "./indicators.js";
 
 // Số nến hiển thị mặc định — nhỏ hơn = candle to hơn (matching user preference).
 const DEFAULT_VISIBLE_BARS = 70;
@@ -27,10 +28,15 @@ function makeTickFormatter(tf) {
 }
 
 let priceChart = null, macdChart = null;
-let candleSeries, ema20Series, ema50Series, ema200Series;
+let candleSeries;
+let ema9Series, ema20Series, ema21Series, ema50Series, ema200Series;
+let sma50Series, sma200Series;
 let bbUpperSeries, bbMiddleSeries, bbLowerSeries;
 let rsiSeries;  // attached vào priceChart, dùng leftPriceScale
 let macdLineSeries, macdSignalSeries, macdHistSeries;
+
+// Fibonacci priceLines — track để xóa khi update
+let fibPriceLines = [];
 
 // Flag chống loop khi sync visible range giữa các chart
 let isSyncingRange = false;
@@ -102,9 +108,16 @@ export function initChart(_container) {
     wickUpColor: "#22c55e", wickDownColor: "#ef4444",
     priceScaleId: "right",
   });
+  // Fast EMAs (short-term) — vàng nhạy biến động
+  ema9Series   = priceChart.addLineSeries({ color: "#fde68a", lineWidth: 1, title: "EMA 9",   priceScaleId: "right" });
+  ema21Series  = priceChart.addLineSeries({ color: "#ec4899", lineWidth: 1, title: "EMA 21",  priceScaleId: "right" });
+  // Medium/long-term EMAs
   ema20Series  = priceChart.addLineSeries({ color: "#3b82f6", lineWidth: 1, title: "EMA 20",  priceScaleId: "right" });
   ema50Series  = priceChart.addLineSeries({ color: "#f97316", lineWidth: 1, title: "EMA 50",  priceScaleId: "right" });
   ema200Series = priceChart.addLineSeries({ color: "#a855f7", lineWidth: 2, title: "EMA 200", priceScaleId: "right" });
+  // SMA 50/200 — golden cross visualization (dashed, mờ hơn EMAs)
+  sma50Series  = priceChart.addLineSeries({ color: "rgba(253,186,116,0.7)", lineWidth: 1, lineStyle: 2, title: "SMA 50",  priceScaleId: "right" });
+  sma200Series = priceChart.addLineSeries({ color: "rgba(196,181,253,0.7)", lineWidth: 1, lineStyle: 2, title: "SMA 200", priceScaleId: "right" });
   // BB(20, 2) — line solid cyan rõ ràng để detect breakout, middle là SMA20 dashed
   bbUpperSeries  = priceChart.addLineSeries({ color: "rgba(34,211,238,0.85)", lineWidth: 1, lineStyle: 0, title: "BB Upper",  priceScaleId: "right" });
   bbMiddleSeries = priceChart.addLineSeries({ color: "rgba(34,211,238,0.55)", lineWidth: 1, lineStyle: 2, title: "BB Mid (SMA20)", priceScaleId: "right" });
@@ -170,28 +183,57 @@ export function updateChart(candles, tf = "15m") {
   candleSeries.setData(candles.map(c => ({
     time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
   })));
+  ema9Series.setData(candles.filter(c => c.ema9 != null).map(c => ({ time: c.time, value: c.ema9 })));
   ema20Series.setData(candles.filter(c => c.ema20 != null).map(c => ({ time: c.time, value: c.ema20 })));
+  ema21Series.setData(candles.filter(c => c.ema21 != null).map(c => ({ time: c.time, value: c.ema21 })));
   ema50Series.setData(candles.filter(c => c.ema50 != null).map(c => ({ time: c.time, value: c.ema50 })));
   ema200Series.setData(candles.filter(c => c.ema200 != null).map(c => ({ time: c.time, value: c.ema200 })));
+  sma50Series.setData(candles.filter(c => c.sma50 != null).map(c => ({ time: c.time, value: c.sma50 })));
+  sma200Series.setData(candles.filter(c => c.sma200 != null).map(c => ({ time: c.time, value: c.sma200 })));
   bbUpperSeries.setData(candles.filter(c => c.bbUpper != null).map(c => ({ time: c.time, value: c.bbUpper })));
   bbMiddleSeries.setData(candles.filter(c => c.bbMiddle != null).map(c => ({ time: c.time, value: c.bbMiddle })));
   bbLowerSeries.setData(candles.filter(c => c.bbLower != null).map(c => ({ time: c.time, value: c.bbLower })));
 
-  // ── Marker thủng BB: arrow đỏ ↓ (close vượt BB upper) / xanh ↑ (close phá BB lower)
-  const bbMarkers = candles
-    .filter(c => c.bbUpper != null && c.bbLower != null)
-    .filter(c => c.close > c.bbUpper || c.close < c.bbLower)
-    .map(c => {
-      const breakUp = c.close > c.bbUpper;
-      return {
-        time: c.time,
-        position: breakUp ? "aboveBar" : "belowBar",
-        color: breakUp ? "#ef4444" : "#22c55e",
-        shape: breakUp ? "arrowDown" : "arrowUp",
-        text: breakUp ? "BB↑" : "BB↓",
-      };
-    });
-  candleSeries.setMarkers(bbMarkers);
+  // ── Markers: BB breakout + Golden/Death Cross ──
+  const markers = [];
+  // BB breakout
+  for (const c of candles) {
+    if (c.bbUpper == null || c.bbLower == null) continue;
+    if (c.close > c.bbUpper) {
+      markers.push({ time: c.time, position: "aboveBar", color: "#ef4444", shape: "arrowDown", text: "BB↑" });
+    } else if (c.close < c.bbLower) {
+      markers.push({ time: c.time, position: "belowBar", color: "#22c55e", shape: "arrowUp", text: "BB↓" });
+    }
+  }
+  // Golden Cross / Death Cross (SMA 50 cross SMA 200)
+  for (const x of detectCrosses(candles)) {
+    if (x.type === "golden") {
+      markers.push({ time: x.time, position: "belowBar", color: "#facc15", shape: "circle", text: "★ GC" });
+    } else {
+      markers.push({ time: x.time, position: "aboveBar", color: "#dc2626", shape: "circle", text: "✖ DC" });
+    }
+  }
+  // setMarkers yêu cầu sort theo time ascending
+  markers.sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(markers);
+
+  // ── Fibonacci retracement (auto từ swing 50 nến gần nhất) ──
+  fibPriceLines.forEach(line => candleSeries.removePriceLine(line));
+  fibPriceLines = [];
+  const fib = computeFib(candles, 50);
+  if (fib) {
+    for (const { level, price } of fib.levels) {
+      const line = candleSeries.createPriceLine({
+        price,
+        color: "rgba(217,70,239,0.55)",   // magenta dotted để phân biệt với EMA/BB
+        lineWidth: 1,
+        lineStyle: 1, // dotted
+        title: `Fib ${(level * 100).toFixed(1)}%`,
+        axisLabelVisible: true,
+      });
+      fibPriceLines.push(line);
+    }
+  }
 
   // ── RSI ──
   rsiSeries.setData(candles.filter(c => c.rsi != null).map(c => ({ time: c.time, value: c.rsi })));
