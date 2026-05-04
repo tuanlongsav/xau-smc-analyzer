@@ -7,20 +7,28 @@ html, body {
 
 #chart-container {
   width: 100%;
-  height: 720px;
-  min-height: 500px;
+  height: 520px;
+  min-height: 380px;
+}
+#rsi-container {
+  width: 100%;
+  height: 130px;
+}
+#macd-container {
+  width: 100%;
+  height: 150px;
 }
 
 @media (max-width: 1024px) {
-  #chart-container {
-    height: 560px;
-  }
+  #chart-container { height: 420px; }
+  #rsi-container { height: 110px; }
+  #macd-container { height: 130px; }
 }
 
 @media (max-width: 768px) {
-  #chart-container {
-    height: 460px;
-  }
+  #chart-container { height: 340px; }
+  #rsi-container { height: 90px; }
+  #macd-container { height: 110px; }
 }
 
 /* Loading overlay */
