@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="vi" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XAU/USD SMC Analyzer</title>
+  <meta name="description" content="Phân tích kỹ thuật XAU/USD với Smart Money Concepts + Gemini AI" />
+
+  <!-- Tailwind via CDN (Play CDN, không build) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: "class" };
+  </script>
+
+  <!-- TradingView Lightweight Charts (CDN) -->
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body class="bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 min-h-screen">
+
+  <!-- Loading overlay -->
+  <div id="loading-overlay" class="hidden">
+    <div class="spinner"></div>
+    <div id="loading-msg" class="text-sm">Đang tải...</div>
+  </div>
+
+  <!-- Error banner -->
+  <div id="error-banner" class="hidden fixed top-4 left-1/2 -translate-x-1/2 bg-red-500 text-white px-4 py-2 rounded shadow-lg z-50"></div>
+
+  <div class="max-w-7xl mx-auto p-4 md:p-6">
+
+    <!-- Header -->
+    <header class="flex items-center justify-between mb-6">
+      <div>
+        <h1 class="text-2xl md:text-3xl font-bold flex items-center gap-2">
+          🥇 XAU/USD SMC Analyzer
+        </h1>
+        <p class="text-sm text-slate-500 dark:text-slate-400">
+          Phân tích Smart Money Concepts với Gemini AI • Data từ TwelveData
+        </p>
+      </div>
+      <button id="theme-toggle" class="text-2xl px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">☀️</button>
+    </header>
+
+    <!-- Price metrics -->
+    <section class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
+      <div class="bg-slate-100 dark:bg-slate-800 p-3 rounded-lg col-span-2 md:col-span-1">
+        <div class="text-xs text-slate-500 dark:text-slate-400">Giá XAU/USD</div>
+        <div id="price" class="text-2xl font-bold">—</div>
+        <div id="change" class="text-sm">—</div>
+      </div>
+      <div class="bg-slate-100 dark:bg-slate-800 p-3 rounded-lg">
+        <div class="text-xs text-slate-500 dark:text-slate-400">RSI(14)</div>
+        <div id="rsi" class="text-xl font-semibold">—</div>
+      </div>
+      <div class="bg-slate-100 dark:bg-slate-800 p-3 rounded-lg">
+        <div class="text-xs text-slate-500 dark:text-slate-400">ATR(14)</div>
+        <div id="atr" class="text-xl font-semibold">—</div>
+      </div>
+      <div class="bg-slate-100 dark:bg-slate-800 p-3 rounded-lg">
+        <div class="text-xs text-slate-500 dark:text-slate-400">EMA 20/50/200</div>
+        <div id="ema-trio" class="text-sm font-mono">—</div>
+      </div>
+      <div class="bg-slate-100 dark:bg-slate-800 p-3 rounded-lg">
+        <div class="text-xs text-slate-500 dark:text-slate-400">Cập nhật</div>
+        <div id="updated" class="text-base font-semibold">—</div>
+        <button id="refresh-btn" class="mt-1 text-xs text-blue-500 hover:underline">🔄 Tải lại</button>
+      </div>
+    </section>
+
+    <!-- Timeframe selector + Chart -->
+    <section class="mb-6">
+      <div class="flex items-center gap-2 mb-3">
+        <span class="text-sm text-slate-500 dark:text-slate-400">Khung:</span>
+        <div id="tf-buttons" class="flex gap-1"></div>
+      </div>
+      <div class="bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700 p-2">
+        <div id="chart-container"></div>
+      </div>
+    </section>
+
+    <!-- Alerts -->
+    <section class="mb-6">
+      <h2 class="text-lg font-semibold mb-2">🚨 Cảnh báo kỹ thuật</h2>
+      <div id="alerts" class="space-y-2"></div>
+    </section>
+
+    <!-- AI Analysis -->
+    <section id="analysis-section" class="mb-6">
+      <h2 class="text-lg font-semibold mb-2">🤖 Phân tích AI (Gemini)</h2>
+
+      <div class="bg-slate-100 dark:bg-slate-800 p-3 rounded-lg mb-3">
+        <div class="text-xs text-slate-500 dark:text-slate-400 mb-2">Khung phân tích (chọn nhiều = top-down SMC):</div>
+        <div id="analysis-tfs" class="flex flex-wrap gap-3"></div>
+      </div>
+
+      <div class="flex flex-wrap gap-2 mb-4">
+        <button id="full-analysis-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-semibold">
+          🧠 Phân tích SMC
+        </button>
+        <button id="quick-scan-btn" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded font-semibold">
+          ⚡ Quick scan
+        </button>
+        <button id="clear-results-btn" class="bg-slate-300 dark:bg-slate-700 hover:bg-slate-400 dark:hover:bg-slate-600 px-4 py-2 rounded">
+          🗑️ Xoá kết quả
+        </button>
+      </div>
+
+      <div id="analysis-results"></div>
+    </section>
+
+    <!-- History -->
+    <section class="mb-6">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-lg font-semibold">📜 Lịch sử phân tích (50 gần nhất)</h2>
+        <button id="clear-history-btn" class="text-xs text-red-500 hover:underline">Xoá tất cả</button>
+      </div>
+      <div id="history-list" class="bg-slate-100 dark:bg-slate-800 rounded-lg p-3 max-h-80 overflow-y-auto"></div>
+    </section>
+
+    <!-- Disclaimer -->
+    <footer class="text-xs text-slate-500 dark:text-slate-400 border-t border-slate-200 dark:border-slate-700 pt-4">
+      <strong>⚠️ Tuyên bố miễn trừ:</strong> Công cụ này phục vụ phân tích kỹ thuật cá nhân. KHÔNG phải khuyến nghị đầu tư.
+      AI và indicators có thể sai. Mọi quyết định mua/bán và rủi ro tài chính thuộc về bạn.
+      Áp dụng quản trị rủi ro nghiêm ngặt: không risk quá 1-2% tài khoản mỗi lệnh, luôn dùng stop loss,
+      đa dạng hoá, và TEST TRÊN DEMO TRƯỚC.
+    </footer>
+
+  </div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
