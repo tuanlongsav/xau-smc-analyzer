@@ -56,11 +56,19 @@ function safe(v, dflt = 0) {
  * @param {Array} candles - OHLCV array
  * @param {string} timeframe - '5m' | '15m' | ...
  * @param {object} crossCheck - { twelvedata: price } (single source for web version)
- * @param {string} newsBlock - pre-formatted news block (từ formatNewsForPrompt)
+ * @param {string} newsBlock - pre-formatted news block (chỉ inject khi tf === "1d")
  */
 export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "") {
   const ccBlock = crossCheck && Object.keys(crossCheck).length
     ? `\n## Giá realtime tham chiếu\n${Object.entries(crossCheck).map(([k, v]) => `- ${k}: $${v.toFixed(2)}`).join("\n")}`
+    : "";
+
+  // News chỉ relevant khi phân tích khung ngày — macro/Fed/CPI tác động xu hướng trung-dài hạn,
+  // intraday chủ yếu là price action thuần kỹ thuật.
+  const includeNews = timeframe === "1d" && newsBlock && newsBlock.trim();
+  const newsSection = includeNews ? `\n${newsBlock}\n` : "";
+  const newsTask = includeNews
+    ? "\n6. **Đối chiếu tin tức macro với phân tích kỹ thuật**: tin tức trên có củng cố hay mâu thuẫn bias không? Chỉ ra 1-2 catalyst quan trọng nhất ảnh hưởng xu hướng 1-2 tuần tới."
     : "";
 
   const user = `DỮ LIỆU XAU/USD KHUNG ${timeframe}:
@@ -81,14 +89,14 @@ export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = n
 - SL tham khảo nếu SHORT: $${safe(zones.slShort).toFixed(2)}
 
 ## 10 nến gần nhất (OHLC)
-${fmtCandles(candles, 10)}${ccBlock}
+${fmtCandles(candles, 10)}${ccBlock}${newsSection}
 
 ## NHIỆM VỤ
 1. Xác định cấu trúc thị trường hiện tại (BOS/CHOCH gần nhất + mốc giá).
 2. Định vị Order Block và FVG gần nhất trong 10 nến — ghi rõ vùng [low - high].
 3. Nhận định bias chính: Bullish / Bearish / Sideways.
 4. Đề xuất 1 setup LONG và 1 setup SHORT (nếu không khả thi, ghi "không khả thi" + lý do).
-5. Liệt kê 2-3 rủi ro chính cho 24h tới.
+5. Liệt kê 2-3 rủi ro chính cho 24h tới.${newsTask}
 
 ## ĐỊNH DẠNG TRẢ LỜI — JSON CHÍNH XÁC, KHÔNG markdown:
 {
