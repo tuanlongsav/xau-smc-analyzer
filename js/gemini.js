@@ -94,15 +94,16 @@ async function callGemini(model, body, { maxRetries = 5, fallbackModel = null, f
 
 /**
  * Build generationConfig với thinking budget cho Gemini 2.5.
+ * Note: thinkingConfig chỉ thêm khi budget > 0. Một số phiên bản API
+ * trả 400 nếu set thinkingBudget=0 trên model không hỗ trợ thinking.
  */
-function buildConfig({ jsonMode = true, maxTokens = 4096, temperature = 0.5, thinkingBudget = 512 }) {
+function buildConfig({ jsonMode = true, maxTokens = 4096, temperature = 0.5, thinkingBudget = 0 }) {
   const cfg = {
     temperature,
     maxOutputTokens: maxTokens,
   };
   if (jsonMode) cfg.responseMimeType = "application/json";
-  // thinkingBudget=0 disable thinking; >0 cap thinking tokens
-  cfg.thinkingConfig = { thinkingBudget };
+  if (thinkingBudget > 0) cfg.thinkingConfig = { thinkingBudget };
   return cfg;
 }
 
@@ -159,6 +160,7 @@ export async function quickScan(latest, zones) {
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: [{ text: user }] }],
+    // thinkingBudget=0 → buildConfig sẽ omit thinkingConfig (an toàn cho mọi model)
     generationConfig: buildConfig({ jsonMode: false, maxTokens: 800, thinkingBudget: 0 }),
   };
   try {
@@ -168,6 +170,11 @@ export async function quickScan(latest, zones) {
     );
     return text || "(rỗng)";
   } catch (e) {
-    return `⚠️ Lỗi: ${e.message || e}`;
+    const msg = String(e.message || e);
+    // 400 thường do body invalid — log ra console để debug
+    if (msg.includes("400")) {
+      console.error("[quickScan] 400 body:", JSON.stringify(body).slice(0, 800));
+    }
+    return `⚠️ Lỗi: ${msg}`;
   }
 }
