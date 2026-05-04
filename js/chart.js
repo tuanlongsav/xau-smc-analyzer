@@ -270,30 +270,63 @@ export function resizeChart() {
 }
 
 /**
- * Toggle Pivot Point lines trên price chart.
+ * Helper: vẽ N priceLines song song giữa low-high → mô phỏng dải màu mờ.
+ * (Lightweight Charts v4 không có rectangle/band primitive, dùng multi-line workaround.)
+ */
+function drawBand(low, high, color, count = 6) {
+  const lines = [];
+  if (!candleSeries || high <= low) return lines;
+  for (let i = 1; i < count; i++) {
+    const price = low + (high - low) * (i / count);
+    lines.push(candleSeries.createPriceLine({
+      price, color,
+      lineWidth: 2, lineStyle: 0,
+      title: "", axisLabelVisible: false,
+    }));
+  }
+  return lines;
+}
+
+/**
+ * Toggle Pivot Point lines + bands trên price chart.
+ * Layout:
+ *   ─── R2 (rose đậm)
+ *   ▒▒▒ resistance band (rose mờ)        ← R1-R2 zone
+ *   ─── R1 (rose nhạt)
+ *   ─── PP (vàng)
+ *   ─── S1 (teal nhạt)
+ *   ▒▒▒ support band (teal mờ)           ← S1-S2 zone
+ *   ─── S2 (teal đậm)
+ *
  * @param {object|null} pivots - { pp, r1, r2, s1, s2 } hoặc null để xóa
  */
 export function setPivots(pivots) {
   pivotPriceLines.forEach(line => candleSeries && candleSeries.removePriceLine(line));
   pivotPriceLines = [];
   if (!pivots || !candleSeries) return;
-  // Bolder, full opacity, lineWidth 2 để nổi giữa rừng line khác
+
+  // ── Bands (nền — vẽ trước, mờ, không label) ──
+  // Resistance R1↔R2: rose mờ
+  pivotPriceLines.push(...drawBand(pivots.r1, pivots.r2, "rgba(244, 63, 94, 0.13)", 6));
+  // Support S1↔S2: teal mờ
+  pivotPriceLines.push(...drawBand(pivots.s2, pivots.s1, "rgba(20, 184, 166, 0.13)", 6));
+
+  // ── Main pivot lines (lineWidth 3, full opacity, label rõ) ──
   const styles = [
-    { key: "r2", label: "● R2", color: "#dc2626" },
-    { key: "r1", label: "● R1", color: "#f87171" },
-    { key: "pp", label: "● PP", color: "#facc15" },
-    { key: "s1", label: "● S1", color: "#86efac" },
-    { key: "s2", label: "● S2", color: "#16a34a" },
+    { key: "r2", label: "▲ R2", color: "#f43f5e" },   // rose 500
+    { key: "r1", label: "▲ R1", color: "#fb7185" },   // rose 400
+    { key: "pp", label: "◆ PP", color: "#fde047" },   // yellow 300 — sáng nhất
+    { key: "s1", label: "▼ S1", color: "#5eead4" },   // teal 300
+    { key: "s2", label: "▼ S2", color: "#14b8a6" },   // teal 500
   ];
   for (const { key, label, color } of styles) {
-    const line = candleSeries.createPriceLine({
+    pivotPriceLines.push(candleSeries.createPriceLine({
       price: pivots[key],
       color,
-      lineWidth: 2,
-      lineStyle: 0, // solid
+      lineWidth: 3,
+      lineStyle: 0,
       title: label,
       axisLabelVisible: true,
-    });
-    pivotPriceLines.push(line);
+    }));
   }
 }
