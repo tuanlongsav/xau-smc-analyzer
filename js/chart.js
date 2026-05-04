@@ -29,7 +29,7 @@ function makeTickFormatter(tf) {
 
 let priceChart = null, macdChart = null;
 let candleSeries;
-let ema9Series, ema20Series, ema21Series, ema50Series, ema200Series;
+let ema9Series, ema21Series, ema50Series, ema200Series;
 let sma50Series, sma200Series;
 let bbUpperSeries, bbMiddleSeries, bbLowerSeries;
 let rsiSeries;  // attached vào priceChart, dùng leftPriceScale
@@ -111,8 +111,7 @@ export function initChart(_container) {
   // Fast EMAs (short-term) — vàng nhạy biến động
   ema9Series   = priceChart.addLineSeries({ color: "#fde68a", lineWidth: 1, title: "EMA 9",   priceScaleId: "right" });
   ema21Series  = priceChart.addLineSeries({ color: "#ec4899", lineWidth: 1, title: "EMA 21",  priceScaleId: "right" });
-  // Medium/long-term EMAs
-  ema20Series  = priceChart.addLineSeries({ color: "#3b82f6", lineWidth: 1, title: "EMA 20",  priceScaleId: "right" });
+  // Medium/long-term EMAs (EMA 20 vẫn compute trong indicators để dùng metric card, không vẽ trên chart vì gần trùng EMA 21)
   ema50Series  = priceChart.addLineSeries({ color: "#f97316", lineWidth: 1, title: "EMA 50",  priceScaleId: "right" });
   ema200Series = priceChart.addLineSeries({ color: "#a855f7", lineWidth: 2, title: "EMA 200", priceScaleId: "right" });
   // SMA 50/200 — golden cross visualization (dashed, mờ hơn EMAs)
@@ -184,7 +183,6 @@ export function updateChart(candles, tf = "15m") {
     time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
   })));
   ema9Series.setData(candles.filter(c => c.ema9 != null).map(c => ({ time: c.time, value: c.ema9 })));
-  ema20Series.setData(candles.filter(c => c.ema20 != null).map(c => ({ time: c.time, value: c.ema20 })));
   ema21Series.setData(candles.filter(c => c.ema21 != null).map(c => ({ time: c.time, value: c.ema21 })));
   ema50Series.setData(candles.filter(c => c.ema50 != null).map(c => ({ time: c.time, value: c.ema50 })));
   ema200Series.setData(candles.filter(c => c.ema200 != null).map(c => ({ time: c.time, value: c.ema200 })));
