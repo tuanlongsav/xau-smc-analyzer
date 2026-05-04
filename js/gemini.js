@@ -52,7 +52,7 @@ function buildGeminiUrl(model) {
   return null;
 }
 
-async function callGemini(model, body, { maxRetries = 3, fallbackModel = null } = {}) {
+async function callGemini(model, body, { maxRetries = 5, fallbackModel = null, fallbackRetries = 3 } = {}) {
   const url = buildGeminiUrl(model);
   if (!url) throw new Error("no_gemini_key");
   let lastErr;
@@ -68,13 +68,15 @@ async function callGemini(model, body, { maxRetries = 3, fallbackModel = null } 
         const errText = await r.text();
         const transient = r.status === 503 || r.status === 429 || errText.includes("UNAVAILABLE");
         if (transient && attempt < maxRetries - 1) {
-          const delay = (2 ** attempt) * 1000 + Math.random() * 500;
+          // Exponential backoff cap 8s + jitter
+          const delay = Math.min(8000, (2 ** attempt) * 1000) + Math.random() * 800;
           await new Promise(res => setTimeout(res, delay));
           continue;
         }
-        // Lần cuối + có fallback model + transient → thử fallback
+        // Hết retry primary + có fallback model + transient → switch sang fallback
         if (transient && fallbackModel && model !== fallbackModel) {
-          return callGemini(fallbackModel, body, { maxRetries: 1, fallbackModel: null });
+          console.warn(`[gemini] ${model} 503 sau ${maxRetries} lần, fallback ${fallbackModel}`);
+          return callGemini(fallbackModel, body, { maxRetries: fallbackRetries, fallbackModel: null });
         }
         throw new Error(`Gemini ${r.status}: ${errText.slice(0, 200)}`);
       }
@@ -113,12 +115,12 @@ export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck =
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: [{ text: user }] }],
-    generationConfig: buildConfig({ jsonMode: true, maxTokens: 4096, thinkingBudget: 2048 }),
+    generationConfig: buildConfig({ jsonMode: true, maxTokens: 4096, thinkingBudget: 1024 }),
   };
   try {
     const text = await callGemini(
       CONFIG.GEMINI_MODEL, body,
-      { maxRetries: 3, fallbackModel: CONFIG.GEMINI_FALLBACK_MODEL }
+      { maxRetries: 5, fallbackModel: CONFIG.GEMINI_FALLBACK_MODEL, fallbackRetries: 3 }
     );
     if (!text || !text.trim()) {
       return { error: "Gemini trả response rỗng. Thử lại sau." };
@@ -134,7 +136,7 @@ export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck =
       return { error: "Hết quota Gemini free (10 req/phút hoặc 250K tokens/ngày). Đợi vài phút." };
     }
     if (msg.includes("503") || msg.includes("UNAVAILABLE")) {
-      return { error: "Gemini server quá tải kéo dài. Thử lại sau." };
+      return { error: "Gemini server quá tải sau 5 retry primary + 3 retry fallback model. Đợi 1-2 phút rồi thử lại — free tier 2.5-flash hay 503 vào giờ peak (US/EU office hours UTC). Tip: phân tích 1-2 khung mỗi lần thay vì cả 5." };
     }
     if (msg === "no_gemini_key") {
       return { error: "Chưa có Gemini API key. Bấm ⚙️ Settings ở góc trên để nhập." };

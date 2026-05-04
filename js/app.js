@@ -406,7 +406,9 @@ async function onFullAnalysis() {
 
   try {
     const newsBlock = formatNewsForPrompt(state.news, 8);
-    const jobs = await Promise.all(tfs.map(async (t) => {
+    // Stagger 400ms giữa các call để tránh Gemini overload heuristics + free tier RPM
+    const jobs = await Promise.all(tfs.map(async (t, i) => {
+      if (i > 0) await new Promise(r => setTimeout(r, i * 400));
       const candles = await loadTfData(t);
       const latest = candles[candles.length - 1];
       const zones = calculateZones(latest);
