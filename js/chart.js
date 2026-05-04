@@ -26,9 +26,10 @@ function makeTickFormatter(tf) {
   };
 }
 
-let priceChart = null, rsiChart = null, macdChart = null;
-let candleSeries, ema20Series, ema50Series, ema200Series, bbUpperSeries, bbLowerSeries;
-let rsiSeries;
+let priceChart = null, macdChart = null;
+let candleSeries, ema20Series, ema50Series, ema200Series;
+let bbUpperSeries, bbMiddleSeries, bbLowerSeries;
+let rsiSeries;  // attached vào priceChart, dùng leftPriceScale
 let macdLineSeries, macdSignalSeries, macdHistSeries;
 
 // Flag chống loop khi sync visible range giữa các chart
@@ -68,50 +69,64 @@ function commonOptions(c, { showTimeAxis = true } = {}) {
 }
 
 /**
- * Init 3 charts.
- * @param {HTMLElement} _container - kept for backward compat (unused; ta dùng query selectors)
+ * Init 2 charts: priceChart (candles + EMAs + BB + RSI sub-pane) + macdChart.
  */
 export function initChart(_container) {
   // Cleanup chart cũ nếu có (idempotent)
-  [priceChart, rsiChart, macdChart].forEach(c => c && c.remove());
+  [priceChart, macdChart].forEach(ch => ch && ch.remove());
 
   const c = getThemeColors();
   const priceEl = document.getElementById("chart-container");
-  const rsiEl = document.getElementById("rsi-container");
   const macdEl = document.getElementById("macd-container");
 
-  // ── Price chart (candles + EMAs + BB) — chart trên cùng, không hiện time axis (RSI/MACD dưới sẽ hiện) ──
-  priceChart = LightweightCharts.createChart(priceEl, commonOptions(c, { showTimeAxis: false }));
+  // ── Price chart: 2 priceScales
+  //   - Right scale: candles + EMAs + BB → chiếm 70% trên (margins top 5%, bottom 30%)
+  //   - Left scale:  RSI                 → chiếm 25% dưới (margins top 75%, bottom 5%)
+  priceChart = LightweightCharts.createChart(priceEl, {
+    ...commonOptions(c, { showTimeAxis: false }),
+    leftPriceScale: {
+      visible: true,
+      borderColor: c.border,
+      scaleMargins: { top: 0.75, bottom: 0.05 },
+    },
+    rightPriceScale: {
+      visible: true,
+      borderColor: c.border,
+      scaleMargins: { top: 0.05, bottom: 0.30 },
+    },
+  });
+
   candleSeries = priceChart.addCandlestickSeries({
     upColor: "#22c55e", downColor: "#ef4444",
     borderUpColor: "#22c55e", borderDownColor: "#ef4444",
     wickUpColor: "#22c55e", wickDownColor: "#ef4444",
+    priceScaleId: "right",
   });
-  ema20Series  = priceChart.addLineSeries({ color: "#3b82f6", lineWidth: 1, title: "EMA 20" });
-  ema50Series  = priceChart.addLineSeries({ color: "#f97316", lineWidth: 1, title: "EMA 50" });
-  ema200Series = priceChart.addLineSeries({ color: "#a855f7", lineWidth: 2, title: "EMA 200" });
-  bbUpperSeries = priceChart.addLineSeries({ color: "rgba(148,163,184,0.6)", lineWidth: 1, lineStyle: 2, title: "BB Upper" });
-  bbLowerSeries = priceChart.addLineSeries({ color: "rgba(148,163,184,0.6)", lineWidth: 1, lineStyle: 2, title: "BB Lower" });
+  ema20Series  = priceChart.addLineSeries({ color: "#3b82f6", lineWidth: 1, title: "EMA 20",  priceScaleId: "right" });
+  ema50Series  = priceChart.addLineSeries({ color: "#f97316", lineWidth: 1, title: "EMA 50",  priceScaleId: "right" });
+  ema200Series = priceChart.addLineSeries({ color: "#a855f7", lineWidth: 2, title: "EMA 200", priceScaleId: "right" });
+  // BB(20, 2) — line solid cyan rõ ràng để detect breakout, middle là SMA20 dashed
+  bbUpperSeries  = priceChart.addLineSeries({ color: "rgba(34,211,238,0.85)", lineWidth: 1, lineStyle: 0, title: "BB Upper",  priceScaleId: "right" });
+  bbMiddleSeries = priceChart.addLineSeries({ color: "rgba(34,211,238,0.55)", lineWidth: 1, lineStyle: 2, title: "BB Mid (SMA20)", priceScaleId: "right" });
+  bbLowerSeries  = priceChart.addLineSeries({ color: "rgba(34,211,238,0.85)", lineWidth: 1, lineStyle: 0, title: "BB Lower",  priceScaleId: "right" });
 
-  // ── RSI chart ──
-  rsiChart = LightweightCharts.createChart(rsiEl, {
-    ...commonOptions(c, { showTimeAxis: false }),
-    rightPriceScale: { borderColor: c.border, autoScale: false, mode: 0 },
+  // RSI vào left scale — sub-pane phía dưới của priceChart
+  rsiSeries = priceChart.addLineSeries({
+    priceScaleId: "left",
+    color: "#fb923c", lineWidth: 1, title: "RSI(14)",
   });
-  rsiSeries = rsiChart.addLineSeries({ color: "#fb923c", lineWidth: 1, title: "RSI(14)" });
-  // Reference 30/70
   rsiSeries.createPriceLine({ price: 70, color: "#ef4444", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "70" });
-  rsiSeries.createPriceLine({ price: 50, color: c.grid,   lineWidth: 1, lineStyle: 3, axisLabelVisible: false });
+  rsiSeries.createPriceLine({ price: 50, color: c.grid,    lineWidth: 1, lineStyle: 3, axisLabelVisible: false });
   rsiSeries.createPriceLine({ price: 30, color: "#22c55e", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "30" });
 
-  // ── MACD chart (line + signal + histogram) — pane cuối có time axis ──
+  // ── MACD chart riêng (pane cuối, có time axis) ──
   macdChart = LightweightCharts.createChart(macdEl, commonOptions(c, { showTimeAxis: true }));
   macdHistSeries = macdChart.addHistogramSeries({ priceFormat: { type: "price", precision: 2, minMove: 0.01 } });
   macdLineSeries = macdChart.addLineSeries({ color: "#3b82f6", lineWidth: 1, title: "MACD" });
   macdSignalSeries = macdChart.addLineSeries({ color: "#fb923c", lineWidth: 1, title: "Signal" });
 
-  // Sync visible range giữa 3 charts
-  syncTimeScale([priceChart, rsiChart, macdChart]);
+  // Sync visible range giữa price + macd
+  syncTimeScale([priceChart, macdChart]);
 
   return priceChart;
 }
@@ -159,7 +174,24 @@ export function updateChart(candles, tf = "15m") {
   ema50Series.setData(candles.filter(c => c.ema50 != null).map(c => ({ time: c.time, value: c.ema50 })));
   ema200Series.setData(candles.filter(c => c.ema200 != null).map(c => ({ time: c.time, value: c.ema200 })));
   bbUpperSeries.setData(candles.filter(c => c.bbUpper != null).map(c => ({ time: c.time, value: c.bbUpper })));
+  bbMiddleSeries.setData(candles.filter(c => c.bbMiddle != null).map(c => ({ time: c.time, value: c.bbMiddle })));
   bbLowerSeries.setData(candles.filter(c => c.bbLower != null).map(c => ({ time: c.time, value: c.bbLower })));
+
+  // ── Marker thủng BB: arrow đỏ ↓ (close vượt BB upper) / xanh ↑ (close phá BB lower)
+  const bbMarkers = candles
+    .filter(c => c.bbUpper != null && c.bbLower != null)
+    .filter(c => c.close > c.bbUpper || c.close < c.bbLower)
+    .map(c => {
+      const breakUp = c.close > c.bbUpper;
+      return {
+        time: c.time,
+        position: breakUp ? "aboveBar" : "belowBar",
+        color: breakUp ? "#ef4444" : "#22c55e",
+        shape: breakUp ? "arrowDown" : "arrowUp",
+        text: breakUp ? "BB↑" : "BB↓",
+      };
+    });
+  candleSeries.setMarkers(bbMarkers);
 
   // ── RSI ──
   rsiSeries.setData(candles.filter(c => c.rsi != null).map(c => ({ time: c.time, value: c.rsi })));

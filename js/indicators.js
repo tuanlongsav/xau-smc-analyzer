@@ -142,7 +142,7 @@ export function computeIndicators(candles) {
   const rsi14 = rsi(closes, 14);
   const atr14 = atr(highs, lows, closes, 14);
   const { macd: macdLine, signal: macdSignal } = macd(closes);
-  const { upper: bbUpper, lower: bbLower } = bollinger(closes, 20, 2);
+  const { upper: bbUpper, middle: bbMiddle, lower: bbLower } = bollinger(closes, 20, 2);
   const recentHigh = rollingMax(highs, 50);
   const recentLow = rollingMin(lows, 50);
 
@@ -156,6 +156,7 @@ export function computeIndicators(candles) {
     macd: macdLine[i],
     macdSignal: macdSignal[i],
     bbUpper: bbUpper[i],
+    bbMiddle: bbMiddle[i],
     bbLower: bbLower[i],
     recentHigh: recentHigh[i],
     recentLow: recentLow[i],
