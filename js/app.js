@@ -680,6 +680,17 @@ function buildAnalysisTfCheckboxes() {
 }
 
 async function init() {
+  // Cleanup: xóa stale Gemini key trong localStorage từ thời Settings panel.
+  // Lý do: gemini.js giờ luôn đi qua Worker, key trong localStorage không còn dùng.
+  // Nếu để lại, user cũ trên VN sẽ vẫn bị 400 do code path direct cũ (lưu phòng cache cũ).
+  try {
+    const k = JSON.parse(localStorage.getItem("xau_api_keys") || "{}");
+    if (k.gemini || k.twelvedata) {
+      localStorage.removeItem("xau_api_keys");
+      console.log("[init] Cleaned legacy api keys from localStorage");
+    }
+  } catch {}
+
   setTheme(state.theme);
 
   buildTimeframeButtons();

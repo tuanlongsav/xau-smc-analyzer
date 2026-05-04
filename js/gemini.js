@@ -40,16 +40,11 @@ function extractJSON(text) {
  * @param {object} opts - { maxRetries, fallbackModel }
  */
 function buildGeminiUrl(model) {
-  // Direct mode: user nhập key trong Settings → ưu tiên (override)
-  const userKey = CONFIG.GEMINI_API_KEY;
-  if (userKey) {
-    return `${GOOGLE_BASE}/${model}:generateContent?key=${userKey}`;
-  }
-  // Proxy mode: gọi Worker, Worker chèn key
-  if (CONFIG.GEMINI_PROXY_URL) {
-    return `${CONFIG.GEMINI_PROXY_URL.replace(/\/$/, "")}/v1beta/models/${model}:generateContent`;
-  }
-  return null;
+  // LUÔN qua Worker proxy: tránh gọi trực tiếp Google API từ client
+  // (Google chặn API ở 1 số quốc gia bao gồm VN — phải đi qua Cloudflare).
+  // Settings panel đã bỏ nên không còn user key trong localStorage.
+  if (!CONFIG.GEMINI_PROXY_URL) return null;
+  return `${CONFIG.GEMINI_PROXY_URL.replace(/\/$/, "")}/v1beta/models/${model}:generateContent`;
 }
 
 async function callGemini(model, body, { maxRetries = 5, fallbackModel = null, fallbackRetries = 3 } = {}) {
