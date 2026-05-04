@@ -13,9 +13,12 @@ const GOOGLE_BASE = "https://generativelanguage.googleapis.com";
 // Origin nào được phép gọi (CORS). Browser sẽ enforce, curl thì không.
 function isAllowedOrigin(origin) {
   if (!origin) return false;
+  // Cloudflare Pages
   if (origin === "https://xau-smc-analyzer.pages.dev") return true;
   // Cloudflare Pages preview branches: <hash>.xau-smc-analyzer.pages.dev
   if (/^https:\/\/[a-z0-9-]+\.xau-smc-analyzer\.pages\.dev$/.test(origin)) return true;
+  // GitHub Pages: https://tuanlongsav.github.io (path /xau-smc-analyzer/ không thuộc origin)
+  if (origin === "https://tuanlongsav.github.io") return true;
   // Local dev
   if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return true;
   if (/^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)) return true;

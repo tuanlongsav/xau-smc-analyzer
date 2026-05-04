@@ -1,12 +1,18 @@
 // ============================================================
 // RSS news fetcher cho web app — qua rss2json proxy (CORS-friendly)
 // ============================================================
-// rss2json.com free: 10K req/ngày, không cần key
-// Cache headlines vào localStorage 30 phút để giảm req
+// rss2json.com free: 10K req/ngày, KHÔNG được dùng param `count` (bị 422 từ ~2026)
+// → bỏ count, dùng default 10 items/feed.
+//
+// Feed selection — chỉ chọn nguồn rss2json fetch được (đã verify):
+//  - fxstreet news (general): forex/gold/dollar — relevance cao nhất
+//  - investing economic (news_285): chỉ số kinh tế (CPI/Fed/jobs) ảnh hưởng gold
+//  - marketwatch markets: tin chứng khoán/macro
 
 const FEEDS = [
-  { source: "fxstreet",  url: "https://www.fxstreet.com/rss/news/gold" },
-  { source: "investing", url: "https://www.investing.com/rss/news_25.rss" },
+  { source: "fxstreet",    url: "https://www.fxstreet.com/rss/news" },
+  { source: "investing",   url: "https://www.investing.com/rss/news_285.rss" },
+  { source: "marketwatch", url: "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain" },
 ];
 
 const PROXY = "https://api.rss2json.com/v1/api.json";
@@ -28,13 +34,18 @@ function stripHtml(html) {
   return html.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
 }
 
-async function fetchOne(source, url, count = 15) {
-  const params = new URLSearchParams({ rss_url: url, count: String(count) });
+async function fetchOne(source, url) {
+  // KHÔNG truyền count — rss2json free trả 422 nếu có. Default ~10 items.
+  const params = new URLSearchParams({ rss_url: url });
   const r = await fetch(`${PROXY}?${params}`);
   if (!r.ok) throw new Error(`rss2json ${source} HTTP ${r.status}`);
   const data = await r.json();
-  if (data.status !== "ok" || !Array.isArray(data.items)) return [];
+  if (data.status !== "ok" || !Array.isArray(data.items)) {
+    console.warn(`[news] ${source} fail: ${data.message || "empty"}`);
+    return [];
+  }
 
+  // Tất cả feed bây giờ là general — lọc tin gold-relevant cho mọi nguồn
   return data.items
     .map(it => ({
       ts: new Date(it.pubDate).toISOString(),
@@ -43,12 +54,7 @@ async function fetchOne(source, url, count = 15) {
       summary: stripHtml(it.description || "").slice(0, 400),
       url: it.link || it.guid || "",
     }))
-    .filter(it => {
-      if (source === "investing" || source === "kitco") {
-        return isGoldRelevant(it.title, it.summary);
-      }
-      return true;
-    });
+    .filter(it => isGoldRelevant(it.title, it.summary));
 }
 
 /**

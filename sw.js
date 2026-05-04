@@ -6,7 +6,7 @@
 // - API calls (TwelveData/Gemini/RSS): network-only (luôn cần fresh)
 // - Icons + Tailwind/CDN: cache-first
 
-const VERSION = "v1.2.0";
+const VERSION = "v1.3.0";
 const APP_CACHE = `xau-smc-app-${VERSION}`;
 
 const APP_SHELL = [

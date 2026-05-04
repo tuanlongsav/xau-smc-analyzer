@@ -6,7 +6,7 @@ import { computeIndicators, calculateZones, detectAlerts } from "./indicators.js
 import { analyzeSmc, quickScan } from "./gemini.js";
 import { initChart, updateChart, resizeChart } from "./chart.js";
 import { fetchNews, formatNewsForPrompt } from "./news.js";
-import { CONFIG, setApiKey, getApiKey, hasGemini } from "./config.js";
+import { CONFIG } from "./config.js";
 
 // ============================================================
 // STATE
@@ -482,41 +482,11 @@ function buildAnalysisTfCheckboxes() {
   $$(".analysis-tf-cb").forEach(cb => cb.addEventListener("change", onAnalysisTfsChange));
 }
 
-function setupSettingsPanel() {
-  const panel = $("#settings-panel");
-  $("#settings-toggle").addEventListener("click", () => {
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) {
-      $("#gemini-key-input").value = getApiKey("gemini");
-    }
-  });
-  $("#save-keys-btn").addEventListener("click", () => {
-    setApiKey("gemini", $("#gemini-key-input").value);
-    $("#keys-status").textContent = "✅ Đã lưu";
-    setTimeout(() => $("#keys-status").textContent = "", 2000);
-    refreshAll();
-  });
-  $("#clear-keys-btn").addEventListener("click", () => {
-    if (!confirm("Xoá Gemini key override?")) return;
-    setApiKey("gemini", "");
-    $("#gemini-key-input").value = "";
-    $("#keys-status").textContent = "🗑️ Đã xoá";
-    setTimeout(() => $("#keys-status").textContent = "", 2000);
-  });
-
-  // Auto mở settings nếu chưa có Gemini access (proxy lẫn override đều rỗng)
-  if (!hasGemini()) {
-    panel.classList.remove("hidden");
-    $("#keys-status").innerHTML = `<span class="text-amber-500">⚠️ Cần Gemini key hoặc Worker proxy</span>`;
-  }
-}
-
 async function init() {
   setTheme(state.theme);
 
   buildTimeframeButtons();
   buildAnalysisTfCheckboxes();
-  setupSettingsPanel();
 
   $("#theme-toggle").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
   $("#refresh-btn").addEventListener("click", refreshAll);
