@@ -1,42 +1,44 @@
 // ============================================================
-// PROMPT TEMPLATES — SMC + scalping/day trading XAU/USD cho Gemini
+// PROMPT TEMPLATES — XAU/USD scalping/day trading + SMC overlay
 // ============================================================
+// Cấu trúc 3 tasks (theo chuẩn TA professional):
+//   1. Cấu trúc & Động lượng (phe kiểm soát? RSI/MACD phân kỳ?)
+//   2. Vùng cản quan trọng (S/R + Fibonacci nếu vừa có sóng đẩy)
+//   3. Kế hoạch giao dịch (kịch bản chính + entry/SL/TP/R:R cho LONG và SHORT)
 import { computeFib } from "./indicators.js";
 
-export const SMC_SYSTEM_PROMPT = `Bạn là chuyên gia phân tích kỹ thuật XAU/USD với 15 năm kinh nghiệm forex/futures tổ chức, kết hợp Smart Money Concepts (SMC) với scalping/day trading thực chiến.
+export const SMC_SYSTEM_PROMPT = `Bạn là chuyên gia phân tích kỹ thuật và giao dịch XAU/USD chuyên nghiệp với 15 năm kinh nghiệm scalping/day trading + Smart Money Concepts (SMC).
 
-NGUYÊN TẮC PHÂN TÍCH:
-1. Cấu trúc thị trường (Market Structure):
-   - BOS (Break of Structure): giá phá vỡ swing high/low theo hướng xu hướng → xác nhận tiếp diễn.
-   - CHOCH (Change of Character): giá phá vỡ swing high/low ngược hướng → cảnh báo đảo chiều.
-   - Top-down: HTF (D1/H4) định bias, MTF (H1) tìm setup, LTF (M15/M5) timing entry.
+NGUYÊN TẮC:
+1. Cấu trúc & Động lượng:
+   - Xác định phe đang kiểm soát (mua/bán) qua biên độ High-Low + vị trí giá hiện tại trong range.
+   - BOS (Break of Structure) / CHOCH (Change of Character) làm anchor cho bias.
+   - Phát hiện phân kỳ (divergence) RSI/MACD vs price hoặc dấu hiệu kiệt sức (RSI quá mua/bán + suy yếu momentum).
 
-2. Order Block (OB) + Fair Value Gap (FVG):
-   - Bullish OB: nến giảm cuối trước đợt tăng phá BOS → cầu tổ chức.
-   - Bearish OB: nến tăng cuối trước đợt giảm phá BOS → cung tổ chức.
-   - FVG: 3 nến liên tiếp tạo gap (high[1] < low[3] hoặc ngược lại) → giá thường fill lại.
-   - OB + FVG đồng thời → vùng entry tin cậy nhất.
+2. Vùng cản (S/R):
+   - Recent swing high/low + Pivot points + Fibonacci retracement (nếu giá vừa trải qua sóng đẩy mạnh).
+   - Order Block / FVG nếu có — giúp xác nhận vùng entry tin cậy.
 
-3. Liquidity & Stop Hunt:
-   - Equal highs/lows, swing prior → smart money quét stop trước khi đi hướng thật.
-   - SL phải đặt NGOÀI vùng liquidity rõ ràng (vd: dưới swing low + 1 ATR), không sát mép.
-
-4. Risk/Reward:
-   - Tỷ lệ R:R tối thiểu 1:1.5, ưu tiên 1:2 trở lên.
-   - SL theo cấu trúc (dưới OB/dưới swing), TP theo vùng đối ứng (FVG fill / OB ngược / liquidity pool).
+3. Kế hoạch giao dịch:
+   - Đặt SL NGOÀI vùng nhiễu giá (>1×ATR cách swing low/high) để tránh liquidity sweep / stop hunt.
+   - R:R tối thiểu 1:1.5, ưu tiên 1:2+. Tính chính xác (TP-Entry)/(Entry-SL) cho LONG và (Entry-TP)/(SL-Entry) cho SHORT.
+   - Horizon dự báo cụ thể theo TF.
 
 QUY TẮC TRẢ LỜI:
 - KHÔNG khuyến nghị "mua ngay/bán ngay". Chỉ mô tả setup + điều kiện confirm.
-- Mọi mức giá phải là số cụ thể.
-- Tính R:R rõ ràng (TP-Entry)/(Entry-SL) cho LONG và ngược lại cho SHORT.
-- Nếu data không đủ kết luận, ghi rõ "chưa rõ" thay vì đoán.
-- Trả lời tiếng Việt chuyên ngành, ngắn gọn, đi thẳng vào mốc giá.`;
+- Mọi mức giá phải là số cụ thể (float).
+- Nếu data không đủ → ghi "chưa rõ" / kha_thi=false.
+- Tiếng Việt chuyên ngành, ngắn gọn, đi thẳng vào mốc giá.`;
 
 export const QUICK_SCAN_SYSTEM = `Bạn là analyst XAU/USD. Trả lời cực ngắn (3-5 dòng), tiếng Việt, tập trung mốc giá quan trọng. KHÔNG khuyến nghị mua/bán.`;
 
 // ============================================================
 // HELPERS
 // ============================================================
+
+function safe(v, dflt = 0) {
+  return (v === null || v === undefined || isNaN(v)) ? dflt : v;
+}
 
 function fmtCandles(candles, n = 10) {
   return candles.slice(-n).map(c => {
@@ -45,21 +47,12 @@ function fmtCandles(candles, n = 10) {
   }).join("\n");
 }
 
-function safe(v, dflt = 0) {
-  return (v === null || v === undefined || isNaN(v)) ? dflt : v;
-}
-
-/**
- * Tính Open/High/Low của session UTC hôm nay (cho intraday TFs).
- * 4h/1d → trả về OHLC của nến mới nhất luôn.
- */
 function getIntradayOHL(candles, tf) {
   if (!candles || candles.length === 0) return null;
   const last = candles[candles.length - 1];
   if (tf === "1d" || tf === "4h") {
     return { open: last.open, high: last.high, low: last.low, label: "Nến hiện tại" };
   }
-  // Intraday: lấy candles cùng UTC date với nến hiện tại
   const lastDate = new Date(last.time * 1000);
   const dayStart = Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth(), lastDate.getUTCDate()) / 1000;
   const todays = candles.filter(c => c.time >= dayStart);
@@ -72,9 +65,6 @@ function getIntradayOHL(candles, tf) {
   };
 }
 
-/**
- * Horizon dự báo theo khung — match với scope phân tích.
- */
 function getTfHorizon(tf) {
   return {
     "5m":  "30-60 phút",
@@ -85,9 +75,6 @@ function getTfHorizon(tf) {
   }[tf] || "ngắn hạn";
 }
 
-/**
- * Top 3 Fib levels gần giá hiện tại nhất.
- */
 function getNearestFibs(candles, currentPrice) {
   const fib = computeFib(candles, 50);
   if (!fib) return null;
@@ -98,120 +85,160 @@ function getNearestFibs(candles, currentPrice) {
   return { trend: fib.isUptrend ? "uptrend" : "downtrend", hh: fib.hh, ll: fib.ll, near: sorted };
 }
 
+function describeBbPosition(latest) {
+  if (!latest.bbUpper || !latest.bbLower) return "chưa rõ";
+  if (latest.close > latest.bbUpper) return "VƯỢT dải trên (overbought zone)";
+  if (latest.close < latest.bbLower) return "PHÁ dải dưới (oversold zone)";
+  if (latest.bbMiddle && latest.close > latest.bbMiddle) return "trên trục giữa (bull territory)";
+  if (latest.bbMiddle && latest.close < latest.bbMiddle) return "dưới trục giữa (bear territory)";
+  return "dao động quanh trục giữa";
+}
+
+function describeMacd(latest) {
+  if (latest.macd == null || latest.macdSignal == null) return "chưa rõ";
+  const cross = latest.macd > latest.macdSignal ? "cắt LÊN đường tín hiệu (bullish)" : "cắt XUỐNG đường tín hiệu (bearish)";
+  const histVal = latest.macd - latest.macdSignal;
+  const hist = histVal > 0 ? `histogram dương ${histVal.toFixed(2)}` : `histogram âm ${histVal.toFixed(2)}`;
+  return `${cross}, ${hist}`;
+}
+
 // ============================================================
 // PUBLIC BUILDERS
 // ============================================================
 
 export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "") {
+  const updateTime = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const ohl = getIntradayOHL(candles, timeframe);
+  const fibInfo = getNearestFibs(candles, latest.close);
+  const horizon = getTfHorizon(timeframe);
+
   const ccBlock = crossCheck && Object.keys(crossCheck).length
-    ? `\n## Giá realtime tham chiếu\n${Object.entries(crossCheck).map(([k, v]) => `- ${k}: $${v.toFixed(2)}`).join("\n")}`
+    ? `\n- Spot realtime: ${Object.entries(crossCheck).map(([k, v]) => `${k}=$${v.toFixed(2)}`).join(", ")}`
     : "";
 
-  // News chỉ relevant cho HTF (4h, 1d)
   const isHtf = timeframe === "4h" || timeframe === "1d";
   const includeNews = isHtf && newsBlock && newsBlock.trim();
-  const newsSection = includeNews ? `\n${newsBlock}\n` : "";
-  const newsTask = includeNews
-    ? `\n7. **Đối chiếu tin tức kinh tế với phân tích kỹ thuật**: tin macro (Fed/CPI/yields/DXY/inflation/jobs) củng cố hay mâu thuẫn bias? Chỉ ra 1-2 catalyst quan trọng nhất.`
-    : "";
+  const macroBlock = includeNews
+    ? `\n## Bối cảnh vĩ mô (Macro)\n${newsBlock.trim()}`
+    : `\n## Bối cảnh vĩ mô (Macro)\n(Không có dữ liệu kinh tế quan trọng — phân tích thuần kỹ thuật.)`;
 
-  // Intraday session O/H/L
-  const ohl = getIntradayOHL(candles, timeframe);
   const ohlBlock = ohl
-    ? `\n## Hành vi giá ${ohl.label}\n- Open: $${ohl.open.toFixed(2)}\n- High: $${ohl.high.toFixed(2)}\n- Low:  $${ohl.low.toFixed(2)}`
+    ? `- Hành vi giá ${ohl.label}: Open $${ohl.open.toFixed(2)}, High $${ohl.high.toFixed(2)}, Low $${ohl.low.toFixed(2)}`
     : "";
 
-  // Fibonacci levels gần giá hiện tại
-  const fibInfo = getNearestFibs(candles, latest.close);
   const fibBlock = fibInfo
     ? `\n## Fibonacci Retracement (${fibInfo.trend}, swing ${fibInfo.ll.toFixed(2)} → ${fibInfo.hh.toFixed(2)})\n` +
       fibInfo.near.map(l => `- ${(l.level * 100).toFixed(1)}%: $${l.price.toFixed(2)}`).join("\n")
     : "";
 
-  const horizon = getTfHorizon(timeframe);
+  const user = `# DỮ LIỆU XAU/USD KHUNG ${timeframe} — Cập nhật ${updateTime}
 
-  // BB position
-  let bbPos = "trong band";
-  if (latest.close > latest.bbUpper) bbPos = "VƯỢT dải trên";
-  else if (latest.close < latest.bbLower) bbPos = "PHÁ dải dưới";
-  else if (latest.bbMiddle && latest.close > latest.bbMiddle) bbPos = "trên trục giữa";
-  else if (latest.bbMiddle && latest.close < latest.bbMiddle) bbPos = "dưới trục giữa";
+## Giá & Hành vi
+- Giá hiện tại: $${safe(latest.close).toFixed(2)}${ccBlock}
+${ohlBlock}
+- Recent High/Low (50 nến): $${safe(latest.recentHigh).toFixed(2)} / $${safe(latest.recentLow).toFixed(2)}
 
-  const user = `DỮ LIỆU XAU/USD KHUNG ${timeframe}:
+## Chỉ báo Xu hướng (Trend)
+- EMA 9 / 21:    ${safe(latest.ema9).toFixed(2)} / ${safe(latest.ema21).toFixed(2)}
+- EMA 50 / 200:  ${safe(latest.ema50).toFixed(2)} / ${safe(latest.ema200).toFixed(2)}
+- SMA 50 / 200:  ${safe(latest.sma50).toFixed(2)} / ${safe(latest.sma200).toFixed(2)} ${latest.sma50 > latest.sma200 ? "(SMA50>SMA200 — bullish trend)" : "(SMA50<SMA200 — bearish trend)"}
+- Bollinger (20, 2): Upper ${safe(latest.bbUpper).toFixed(2)} / Mid ${safe(latest.bbMiddle).toFixed(2)} / Lower ${safe(latest.bbLower).toFixed(2)} → giá đang ${describeBbPosition(latest)}
 
-## Giá & indicators (nến mới nhất)
-- Close: $${safe(latest.close).toFixed(2)}
-- EMA 9/21:    ${safe(latest.ema9).toFixed(2)} / ${safe(latest.ema21).toFixed(2)}
-- EMA 50/200:  ${safe(latest.ema50).toFixed(2)} / ${safe(latest.ema200).toFixed(2)}
-- SMA 50/200:  ${safe(latest.sma50).toFixed(2)} / ${safe(latest.sma200).toFixed(2)} (golden cross khi SMA50>SMA200)
-- RSI(14): ${safe(latest.rsi).toFixed(1)} ${latest.rsi > 70 ? "[QUÁ MUA]" : latest.rsi < 30 ? "[QUÁ BÁN]" : ""}
-- MACD / Signal: ${safe(latest.macd).toFixed(2)} / ${safe(latest.macdSignal).toFixed(2)} ${latest.macd > latest.macdSignal ? "[bullish cross]" : "[bearish cross]"}
-- ATR(14): ${safe(latest.atr).toFixed(2)} (dùng để đặt SL ngoài vùng nhiễu)
-- Bollinger (20, 2): Upper ${safe(latest.bbUpper).toFixed(2)} / Mid ${safe(latest.bbMiddle).toFixed(2)} / Lower ${safe(latest.bbLower).toFixed(2)} → giá đang ${bbPos}
-- Recent High / Low (50 nến): ${safe(latest.recentHigh).toFixed(2)} / ${safe(latest.recentLow).toFixed(2)}
+## Chỉ báo Động lượng (Momentum)
+- RSI(14): ${safe(latest.rsi).toFixed(1)} ${latest.rsi > 70 ? "[QUÁ MUA — cảnh báo điều chỉnh]" : latest.rsi < 30 ? "[QUÁ BÁN — cảnh báo phục hồi]" : "[trung tính]"}
+- MACD: ${describeMacd(latest)}
 
-## Vùng giá tham chiếu (tính từ ATR)
+## Chỉ báo Biến động (Volatility)
+- ATR(14): ${safe(latest.atr).toFixed(2)} (dùng đặt SL cách swing >1×ATR để tránh liquidity sweep)
+
+## Vùng giá tham chiếu
 - Hỗ trợ gần: $${safe(zones.support).toFixed(2)}
-- Kháng cự gần: $${safe(zones.resistance).toFixed(2)}
-- SL tham khảo nếu LONG (close - 1.5×ATR): $${safe(zones.slLong).toFixed(2)}
-- SL tham khảo nếu SHORT (close + 1.5×ATR): $${safe(zones.slShort).toFixed(2)}${ohlBlock}${fibBlock}
+- Kháng cự gần: $${safe(zones.resistance).toFixed(2)}${fibBlock}
 
 ## 10 nến gần nhất (OHLC)
-${fmtCandles(candles, 10)}${ccBlock}${newsSection}
+${fmtCandles(candles, 10)}${macroBlock}
 
-## NHIỆM VỤ (output JSON)
-1. **Cấu trúc & động lượng**: phe mua hay bán đang kiểm soát? RSI/MACD có phân kỳ (divergence) hay kiệt sức không? BOS/CHOCH gần nhất ở mốc nào?
-2. **Order Block + FVG**: định vị OB và FVG gần nhất trong 10 nến — vùng [low - high].
-3. **Bias chính**: Bullish / Bearish / Sideways.
-4. **Vùng cản quan trọng**: kết hợp S/R + Fib retracement (nếu có) + recent high/low.
-5. **Setup LONG + SHORT** (nếu không khả thi → "không khả thi" + lý do):
-   - Entry, SL, TP cụ thể.
-   - **SL đặt NGOÀI vùng nhiễu** (>1×ATR cách swing low/high) để tránh liquidity sweep.
-   - **R:R tối thiểu 1:1.5**, ưu tiên 1:2+. Tính chính xác trong field risk_reward.
-6. **Rủi ro chính** trong ${horizon} tới (2-3 điểm).${newsTask}
+# YÊU CẦU PHÂN TÍCH (3 tasks)
 
-## ĐỊNH DẠNG TRẢ LỜI — JSON CHÍNH XÁC, KHÔNG markdown:
+**TASK 1 — Đánh giá Cấu trúc & Động lượng (${timeframe})**
+- Dựa vào biên độ High/Low và giá hiện tại: phe MUA hay BÁN đang nắm quyền kiểm soát?
+- BOS hoặc CHOCH gần nhất ở mốc nào? Có Order Block / FVG nào còn fresh?
+- Sự kết hợp RSI + MACD có dấu hiệu kiệt sức (exhaustion) hay phân kỳ (divergence) báo hiệu đảo chiều không?
+
+**TASK 2 — Xác định Vùng Cản Quan Trọng**
+- Liệt kê 2 mức KHÁNG CỰ và 2 mức HỖ TRỢ gần nhất (ưu tiên có confluence: swing + Fib + EMA + Pivot).
+- Nếu giá vừa trải qua sóng đẩy mạnh → chỉ ra Fib retracement level đang active (ví dụ "đang test Fib 0.618 ở $X").
+
+**TASK 3 — Kế hoạch Giao dịch (Action plan, horizon ${horizon})**
+- Dự báo kịch bản xác suất cao nhất trong ${horizon} tới (long / short / sideways).
+- Đưa ra setup LONG và SHORT (nếu không khả thi → kha_thi=false + lý do):
+  - Entry point cụ thể (số chính xác).
+  - Stop Loss đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh liquidity sweep.
+  - Take Profit theo R:R tối thiểu 1:1.5, ưu tiên 1:2+.
+  - Tính chính xác risk_reward = (TP-Entry)/(Entry-SL) cho LONG.
+
+# ĐỊNH DẠNG TRẢ LỜI — JSON CHÍNH XÁC, KHÔNG markdown:
 {
-  "tom_tat": "<2-3 câu tóm tắt + horizon ${horizon}>",
+  "tom_tat": "<2-3 câu tóm tắt: phe nào control + horizon + setup chính>",
   "bias": "bullish | bearish | sideways",
   "do_tin_cay": "thấp | trung bình | cao",
-  "cau_truc_thi_truong": {
-    "loai": "BOS | CHOCH | chưa rõ",
-    "huong": "tăng | giảm",
-    "muc_gia": <float>,
-    "ghi_chu": "<có phân kỳ RSI/MACD không?>"
+
+  "task1_cau_truc_dong_luong": {
+    "phe_kiem_soat": "phe mua | phe bán | trung lập",
+    "ly_do_kiem_soat": "<1-2 câu giải thích dựa vào H/L/giá hiện tại>",
+    "bos_choch": {
+      "loai": "BOS | CHOCH | chưa rõ",
+      "huong": "tăng | giảm | -",
+      "muc_gia": <float>
+    },
+    "order_block_fvg": "<mô tả OB/FVG còn fresh nếu có, hoặc 'không có'>",
+    "rsi_macd_signal": "phân kỳ bullish | phân kỳ bearish | kiệt sức quá mua | kiệt sức quá bán | bình thường",
+    "phan_tich_dong_luong": "<1-2 câu kết luận về momentum>"
   },
-  "order_block": {
-    "loai": "bullish | bearish | không có",
-    "vung_thap": <float | null>,
-    "vung_cao": <float | null>,
-    "ghi_chu": "<có FVG đi kèm không, đã mitigated chưa>"
+
+  "task2_vung_can": {
+    "khang_cu": [
+      { "gia": <float>, "ghi_chu": "<vd: swing high + EMA 50 + Fib 0.5 confluence>" },
+      { "gia": <float>, "ghi_chu": "..." }
+    ],
+    "ho_tro": [
+      { "gia": <float>, "ghi_chu": "..." },
+      { "gia": <float>, "ghi_chu": "..." }
+    ],
+    "fib_active": "<vd: 'đang test Fib 0.618 ở 2345.50' hoặc 'không có sóng đẩy gần đây'>"
   },
-  "fvg_gan_nhat": {
-    "loai": "bullish | bearish | không có",
-    "vung_thap": <float | null>,
-    "vung_cao": <float | null>
+
+  "task3_ke_hoach": {
+    "kich_ban_chinh": "long | short | sideways",
+    "horizon": "${horizon}",
+    "ly_do_kich_ban": "<1-2 câu>"
   },
+
   "scenario_long": {
     "kha_thi": true | false,
-    "dieu_kien_xac_nhan": "<điều kiện cụ thể>",
-    "vung_vao_lenh": "<low - high>",
+    "dieu_kien_xac_nhan": "<vd: 'giá đóng cửa M15 trên $X + RSI > 50'>",
+    "entry": <float>,
     "stop_loss": <float>,
-    "target": <float>,
+    "take_profit": <float>,
     "risk_reward": <float, vd 2.1>,
-    "ly_do": "<1-2 câu, nêu rõ confluence: OB+FVG / Fib / EMA cross>"
+    "ly_do": "<confluence + tại sao SL ở vị trí này (ngoài liquidity)>"
   },
   "scenario_short": {
     "kha_thi": true | false,
-    "dieu_kien_xac_nhan": "<điều kiện cụ thể>",
-    "vung_vao_lenh": "<low - high>",
+    "dieu_kien_xac_nhan": "...",
+    "entry": <float>,
     "stop_loss": <float>,
-    "target": <float>,
+    "take_profit": <float>,
     "risk_reward": <float>,
-    "ly_do": "<1-2 câu>"
+    "ly_do": "..."
   },
-  "rui_ro_chinh": ["<rủi ro 1>", "<rủi ro 2>", "<rủi ro 3>"],
-  "ghi_chu": "<lưu ý liquidity sweep / catalyst sắp tới>"
+
+  "rui_ro_chinh": [
+    "<rủi ro 1: vd liquidity sweep dưới $X>",
+    "<rủi ro 2: vd tin macro sắp ra>",
+    "<rủi ro 3>"
+  ],
+  "ghi_chu": "<lưu ý đặc biệt nếu có catalyst sắp tới hoặc setup thiếu confluence>"
 }`;
 
   return { system: SMC_SYSTEM_PROMPT, user };
@@ -219,13 +246,13 @@ ${fmtCandles(candles, 10)}${ccBlock}${newsSection}
 
 export function buildQuickPrompt(latest, zones) {
   const user = `Giá: $${safe(latest.close).toFixed(2)} | RSI: ${safe(latest.rsi).toFixed(0)} | ATR: ${safe(latest.atr).toFixed(1)}
-Hỗ trợ/kháng cự: $${safe(zones.support).toFixed(2)} / $${safe(zones.resistance).toFixed(2)}
+S/R: $${safe(zones.support).toFixed(2)} / $${safe(zones.resistance).toFixed(2)}
 EMA 9/21/50/200: ${safe(latest.ema9).toFixed(2)} / ${safe(latest.ema21).toFixed(2)} / ${safe(latest.ema50).toFixed(2)} / ${safe(latest.ema200).toFixed(2)}
 SMA 50/200: ${safe(latest.sma50).toFixed(2)} / ${safe(latest.sma200).toFixed(2)}
 
 Trả lời 3-5 dòng:
-1. Trend hiện tại + EMA alignment?
-2. Mốc cần watch (S/R)?
+1. Phe nào kiểm soát + trend?
+2. Mốc S/R cần watch?
 3. Cảnh báo (BB break / RSI extreme / EMA cross)?`;
 
   return { system: QUICK_SCAN_SYSTEM, user };

@@ -271,28 +271,53 @@ function renderSmcCard(r, tf) {
   const biasIcon = { BULLISH: "📈", BEARISH: "📉", SIDEWAYS: "➡️" }[bias] || "❓";
   const biasColor = { BULLISH: "text-green-500", BEARISH: "text-red-500", SIDEWAYS: "text-slate-500" }[bias] || "";
 
-  const ms = r.cau_truc_thi_truong || {};
-  const ob = r.order_block || {};
-  const fvg = r.fvg_gan_nhat || {};
+  // Schema mới (3 tasks) — fallback các field cũ cho history legacy
+  const t1 = r.task1_cau_truc_dong_luong || {};
+  const t2 = r.task2_vung_can || {};
+  const t3 = r.task3_ke_hoach || {};
   const sl = r.scenario_long || {};
   const ss = r.scenario_short || {};
   const risks = r.rui_ro_chinh || [];
 
+  const bosChoch = t1.bos_choch || r.cau_truc_thi_truong || {};
+  const phe = t1.phe_kiem_soat || "";
+  const pheColor = phe.includes("mua") ? "text-green-500" : phe.includes("bán") ? "text-red-500" : "text-slate-500";
+
+  // Helper render S/R level
+  const renderLevels = (arr, label, color) => {
+    if (!Array.isArray(arr) || arr.length === 0) return "";
+    return arr.map(lv => {
+      const gia = typeof lv === "object" ? lv.gia : lv;
+      const note = typeof lv === "object" ? lv.ghi_chu : "";
+      return `<div class="text-xs ${color}">• <strong>$${fmt(gia)}</strong>${note ? ` — ${escapeHtml(note)}` : ""}</div>`;
+    }).join("");
+  };
+
   const scenarioCard = (sc, label, icon) => {
     const ok = sc.kha_thi;
     const okBadge = ok ? "✅" : "❌";
-    const body = ok
-      ? `<div class="text-xs mt-1"><strong>Vào:</strong> ${escapeHtml(sc.vung_vao_lenh || "")}</div>
-         <div class="grid grid-cols-2 gap-2 mt-2 text-sm">
-           <div>SL: <strong>$${fmt(sc.stop_loss)}</strong></div>
-           <div>TP: <strong>$${fmt(sc.target)}</strong></div>
-         </div>
-         <div class="text-xs italic mt-2 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do || "")}</div>`
-      : `<div class="text-xs italic mt-1 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do || "Chưa thuận")}</div>`;
+    if (!ok) {
+      return `<div class="border border-slate-300 dark:border-slate-700 rounded p-3">
+        <div class="font-semibold">${icon} ${label} ${okBadge}</div>
+        <div class="text-xs italic mt-1 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do || "Chưa thuận")}</div>
+      </div>`;
+    }
+    const entry = sc.entry ?? sc.vung_vao_lenh ?? "";  // backward compat
+    const tp = sc.take_profit ?? sc.target;
+    const rr = sc.risk_reward;
     return `<div class="border border-slate-300 dark:border-slate-700 rounded p-3">
-              <div class="font-semibold">${icon} ${label} ${okBadge}</div>
-              ${body}
-            </div>`;
+      <div class="flex items-center justify-between">
+        <span class="font-semibold">${icon} ${label} ${okBadge}</span>
+        ${rr != null ? `<span class="text-xs px-2 py-0.5 rounded bg-blue-500/20 text-blue-600 dark:text-blue-300 font-mono">R:R ${Number(rr).toFixed(2)}</span>` : ""}
+      </div>
+      <div class="text-xs mt-2"><strong>Entry:</strong> ${typeof entry === "number" ? `$${fmt(entry)}` : escapeHtml(String(entry))}</div>
+      <div class="grid grid-cols-2 gap-2 mt-1 text-sm">
+        <div class="text-red-500">SL: <strong>$${fmt(sc.stop_loss)}</strong></div>
+        <div class="text-green-500">TP: <strong>$${fmt(tp)}</strong></div>
+      </div>
+      ${sc.dieu_kien_xac_nhan ? `<div class="text-xs mt-2"><strong>Confirm:</strong> ${escapeHtml(sc.dieu_kien_xac_nhan)}</div>` : ""}
+      <div class="text-xs italic mt-2 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do || "")}</div>
+    </div>`;
   };
 
   return `
@@ -300,35 +325,53 @@ function renderSmcCard(r, tf) {
       <h3 class="text-lg font-semibold">📊 Khung ${tf}</h3>
       <span class="${biasColor} font-semibold">${biasIcon} ${bias}</span>
     </div>
-    <div class="bg-blue-500/10 border-l-4 border-blue-500 p-3 rounded text-sm mb-3">
+
+    <div class="bg-blue-500/10 border-l-4 border-blue-500 p-3 rounded text-sm mb-4">
       <strong>📋 Tóm tắt:</strong> ${escapeHtml(r.tom_tat || "")}
     </div>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3 text-sm">
-      <div class="border border-slate-300 dark:border-slate-700 rounded p-3">
-        <div class="font-semibold">Market Structure: ${escapeHtml(ms.loai || "N/A")}</div>
-        ${ms.muc_gia ? `<div class="text-xs mt-1">Mốc: <strong>$${fmt(ms.muc_gia)}</strong> (${escapeHtml(ms.huong || "")})</div>` : ""}
-        ${ms.ghi_chu ? `<div class="text-xs italic mt-1 text-slate-500">${escapeHtml(ms.ghi_chu)}</div>` : ""}
+
+    <!-- Task 1: Cấu trúc & Động lượng -->
+    <div class="border border-slate-300 dark:border-slate-700 rounded p-3 mb-3">
+      <div class="font-semibold mb-2">1️⃣ Cấu trúc & Động lượng</div>
+      ${phe ? `<div class="text-sm mb-2">Phe kiểm soát: <strong class="${pheColor}">${escapeHtml(phe.toUpperCase())}</strong>${t1.ly_do_kiem_soat ? ` — <span class="text-slate-600 dark:text-slate-400">${escapeHtml(t1.ly_do_kiem_soat)}</span>` : ""}</div>` : ""}
+      ${bosChoch.loai ? `<div class="text-xs mb-1">${escapeHtml(bosChoch.loai)} ${escapeHtml(bosChoch.huong || "")} tại <strong>$${fmt(bosChoch.muc_gia)}</strong></div>` : ""}
+      ${t1.order_block_fvg ? `<div class="text-xs mb-1"><strong>OB/FVG:</strong> ${escapeHtml(t1.order_block_fvg)}</div>` : ""}
+      ${t1.rsi_macd_signal ? `<div class="text-xs mb-1"><strong>RSI/MACD:</strong> ${escapeHtml(t1.rsi_macd_signal)}</div>` : ""}
+      ${t1.phan_tich_dong_luong ? `<div class="text-xs italic text-slate-600 dark:text-slate-400">${escapeHtml(t1.phan_tich_dong_luong)}</div>` : ""}
+    </div>
+
+    <!-- Task 2: Vùng cản -->
+    <div class="border border-slate-300 dark:border-slate-700 rounded p-3 mb-3">
+      <div class="font-semibold mb-2">2️⃣ Vùng cản quan trọng</div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm mb-2">
+        <div>
+          <div class="text-red-500 font-semibold mb-1">▲ Kháng cự</div>
+          ${renderLevels(t2.khang_cu, "Kháng cự", "text-slate-700 dark:text-slate-300")}
+        </div>
+        <div>
+          <div class="text-green-500 font-semibold mb-1">▼ Hỗ trợ</div>
+          ${renderLevels(t2.ho_tro, "Hỗ trợ", "text-slate-700 dark:text-slate-300")}
+        </div>
       </div>
-      <div class="border border-slate-300 dark:border-slate-700 rounded p-3">
-        <div class="font-semibold">Order Block: ${escapeHtml(ob.loai || "N/A")}</div>
-        ${ob.vung_thap && ob.vung_cao ? `<div class="text-xs mt-1">Vùng: <strong>$${fmt(ob.vung_thap)} – $${fmt(ob.vung_cao)}</strong></div>` : ""}
-        ${ob.ghi_chu ? `<div class="text-xs italic mt-1 text-slate-500">${escapeHtml(ob.ghi_chu)}</div>` : ""}
-      </div>
-      <div class="border border-slate-300 dark:border-slate-700 rounded p-3">
-        <div class="font-semibold">FVG gần nhất: ${escapeHtml(fvg.loai || "N/A")}</div>
-        ${fvg.vung_thap && fvg.vung_cao ? `<div class="text-xs mt-1">Vùng: <strong>$${fmt(fvg.vung_thap)} – $${fmt(fvg.vung_cao)}</strong></div>` : ""}
+      ${t2.fib_active ? `<div class="text-xs italic mt-2"><strong>Fib:</strong> ${escapeHtml(t2.fib_active)}</div>` : ""}
+    </div>
+
+    <!-- Task 3: Kế hoạch -->
+    <div class="border border-slate-300 dark:border-slate-700 rounded p-3 mb-3">
+      <div class="font-semibold mb-2">3️⃣ Kế hoạch giao dịch ${t3.horizon ? `<span class="text-xs font-normal text-slate-500">(horizon ${escapeHtml(t3.horizon)})</span>` : ""}</div>
+      ${t3.kich_ban_chinh ? `<div class="text-sm mb-2">Kịch bản chính: <strong class="uppercase">${escapeHtml(t3.kich_ban_chinh)}</strong>${t3.ly_do_kich_ban ? ` — <span class="text-slate-600 dark:text-slate-400">${escapeHtml(t3.ly_do_kich_ban)}</span>` : ""}</div>` : ""}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        ${scenarioCard(sl, "LONG", "📈")}
+        ${scenarioCard(ss, "SHORT", "📉")}
       </div>
     </div>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
-      ${scenarioCard(sl, "LONG", "📈")}
-      ${scenarioCard(ss, "SHORT", "📉")}
-    </div>
+
     ${risks.length > 0 ? `
-      <div class="text-sm">
+      <div class="text-sm mb-2">
         <div class="font-semibold mb-1">⚠️ Rủi ro chính</div>
         <ul class="list-disc list-inside text-xs space-y-1">${risks.map(rk => `<li>${escapeHtml(rk)}</li>`).join("")}</ul>
       </div>` : ""}
-    ${r.ghi_chu ? `<div class="text-xs italic mt-3 text-slate-500">📌 ${escapeHtml(r.ghi_chu)}</div>` : ""}
+    ${r.ghi_chu ? `<div class="text-xs italic mt-2 text-slate-500">📌 ${escapeHtml(r.ghi_chu)}</div>` : ""}
   `;
 }
 
