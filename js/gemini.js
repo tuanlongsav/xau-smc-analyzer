@@ -7,7 +7,7 @@
 //
 // Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}
 // Body: { contents, systemInstruction, generationConfig }
-import { CONFIG } from "./config.js";
+import { CONFIG, hasGemini } from "./config.js";
 import { buildSmcPrompt, buildQuickPrompt } from "./prompts.js";
 
 const BASE = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -38,6 +38,7 @@ function extractJSON(text) {
  * @param {object} opts - { maxRetries, fallbackModel }
  */
 async function callGemini(model, body, { maxRetries = 3, fallbackModel = null } = {}) {
+  if (!hasGemini()) throw new Error("no_gemini_key");
   const url = `${BASE}/${model}:generateContent?key=${CONFIG.GEMINI_API_KEY}`;
   let lastErr;
 
@@ -90,9 +91,10 @@ function buildConfig({ jsonMode = true, maxTokens = 4096, temperature = 0.5, thi
 
 /**
  * Phân tích SMC đầy đủ. Trả dict JSON đã parse hoặc {error}.
+ * @param {string} newsBlock - tin tức đã format (từ news.formatNewsForPrompt)
  */
-export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck = null) {
-  const { system, user } = buildSmcPrompt(latest, zones, candles, timeframe, crossCheck);
+export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "") {
+  const { system, user } = buildSmcPrompt(latest, zones, candles, timeframe, crossCheck, newsBlock);
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: [{ text: user }] }],
@@ -119,8 +121,14 @@ export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck =
     if (msg.includes("503") || msg.includes("UNAVAILABLE")) {
       return { error: "Gemini server quá tải kéo dài. Thử lại sau." };
     }
+    if (msg === "no_gemini_key") {
+      return { error: "Chưa có Gemini API key. Bấm ⚙️ Settings ở góc trên để nhập." };
+    }
+    if (msg.includes("leaked") || msg.includes("reported as leaked")) {
+      return { error: "Key này đã bị Google flag là 'leaked' (tìm thấy trên public repo). Tạo key mới: https://aistudio.google.com/app/apikey" };
+    }
     if (msg.includes("API_KEY") || msg.includes("PERMISSION_DENIED") || msg.includes("403")) {
-      return { error: "Gemini API key sai hoặc bị restrict. Check HTTP referrer trong Google Cloud Console." };
+      return { error: "Gemini API key sai/bị restrict. Mở Settings nhập lại key, hoặc tạo key mới: https://aistudio.google.com/app/apikey" };
     }
     return { error: `Gemini error: ${msg}` };
   }

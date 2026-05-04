@@ -6,6 +6,24 @@
   <title>XAU/USD SMC Analyzer</title>
   <meta name="description" content="Phân tích kỹ thuật XAU/USD với Smart Money Concepts + Gemini AI" />
 
+  <!-- PWA / mobile -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="XAU SMC" />
+
+  <!-- Favicons -->
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/icon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="icons/icon-16.png" />
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
+
+  <!-- Apple touch icons -->
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png" />
+  <link rel="apple-touch-icon" sizes="167x167" href="icons/icon-167.png" />
+  <link rel="apple-touch-icon" sizes="152x152" href="icons/icon-152.png" />
+
   <!-- Tailwind via CDN (Play CDN, không build) -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -40,8 +58,43 @@
           Phân tích Smart Money Concepts với Gemini AI • Data từ TwelveData
         </p>
       </div>
-      <button id="theme-toggle" class="text-2xl px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">☀️</button>
+      <div class="flex gap-1">
+        <button id="settings-toggle" class="text-2xl px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800" title="Settings">⚙️</button>
+        <button id="theme-toggle" class="text-2xl px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">☀️</button>
+      </div>
     </header>
+
+    <!-- Settings panel (ẩn mặc định) -->
+    <section id="settings-panel" class="hidden bg-amber-50 dark:bg-slate-800 border border-amber-300 dark:border-slate-600 rounded-lg p-4 mb-6">
+      <h2 class="text-lg font-semibold mb-3">⚙️ API Keys</h2>
+      <p class="text-xs text-slate-600 dark:text-slate-400 mb-3">
+        Key được lưu trong trình duyệt (localStorage), không gửi đi đâu khác. Mỗi browser/thiết bị cần nhập lại.
+      </p>
+
+      <div class="mb-3">
+        <label class="block text-sm font-medium mb-1">
+          Gemini API Key
+          <a href="https://aistudio.google.com/app/apikey" target="_blank" class="text-blue-500 text-xs ml-2 hover:underline">Lấy free →</a>
+        </label>
+        <input id="gemini-key-input" type="password" placeholder="AIzaSy..." class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono" />
+        <div class="text-xs text-slate-500 mt-1">⚠️ KHÔNG share key này. Google sẽ flag và disable nếu phát hiện public.</div>
+      </div>
+
+      <div class="mb-3">
+        <label class="block text-sm font-medium mb-1">
+          TwelveData API Key (optional — có Stooq free fallback)
+          <a href="https://twelvedata.com/account/api-keys" target="_blank" class="text-blue-500 text-xs ml-2 hover:underline">Lấy free →</a>
+        </label>
+        <input id="td-key-input" type="password" placeholder="32-char key..." class="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-sm font-mono" />
+        <div class="text-xs text-slate-500 mt-1">Free 800 req/ngày. Không có key → tự fallback Stooq (free, không spot price).</div>
+      </div>
+
+      <div class="flex gap-2">
+        <button id="save-keys-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">💾 Lưu</button>
+        <button id="clear-keys-btn" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded text-sm">🗑️ Xoá</button>
+        <span id="keys-status" class="text-sm self-center"></span>
+      </div>
+    </section>
 
     <!-- Price metrics -->
     <section class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
@@ -69,11 +122,15 @@
       </div>
     </section>
 
+    <!-- News panel -->
+    <section id="news-panel" class="mb-4"></section>
+
     <!-- Timeframe selector + Chart -->
     <section class="mb-6">
-      <div class="flex items-center gap-2 mb-3">
+      <div class="flex items-center gap-2 mb-3 flex-wrap">
         <span class="text-sm text-slate-500 dark:text-slate-400">Khung:</span>
         <div id="tf-buttons" class="flex gap-1"></div>
+        <span id="data-source" class="ml-2 text-xs"></span>
       </div>
       <div class="bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700 p-2">
         <div id="chart-container"></div>

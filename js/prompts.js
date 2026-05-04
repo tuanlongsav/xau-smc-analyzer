@@ -56,8 +56,9 @@ function safe(v, dflt = 0) {
  * @param {Array} candles - OHLCV array
  * @param {string} timeframe - '5m' | '15m' | ...
  * @param {object} crossCheck - { twelvedata: price } (single source for web version)
+ * @param {string} newsBlock - pre-formatted news block (từ formatNewsForPrompt)
  */
-export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = null) {
+export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "") {
   const ccBlock = crossCheck && Object.keys(crossCheck).length
     ? `\n## Giá realtime tham chiếu\n${Object.entries(crossCheck).map(([k, v]) => `- ${k}: $${v.toFixed(2)}`).join("\n")}`
     : "";

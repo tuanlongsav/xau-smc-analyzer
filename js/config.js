@@ -1,42 +1,41 @@
 // ============================================================
-// CẤU HÌNH API KEYS
+// CẤU HÌNH — Dynamic từ localStorage, fallback empty
 // ============================================================
 //
-// ⚠️ BẢO MẬT QUAN TRỌNG TRƯỚC KHI PUSH LÊN GITHUB ⚠️
+// ⚠️ KHÔNG hardcode API key trong file này khi push lên GitHub!
+// Google quét public repo và tự động disable key dù có HTTP referrer.
 //
-// Cả 2 key bên dưới sẽ visible trong source HTML khi deploy.
-// Để tránh bị abuse, BẮT BUỘC thiết lập restriction:
+// User-input pattern:
+// - User nhập key trong Settings panel (UI) → lưu localStorage
+// - Mỗi user dùng key riêng, an toàn
+// - Repo public không chứa key
 //
-// 1. GEMINI_API_KEY — Google Cloud Console (https://console.cloud.google.com/apis/credentials):
-//    - Edit key → Application restrictions → "HTTP referrers (web sites)"
-//    - Thêm: https://YOUR_USERNAME.github.io/xau-smc-analyzer/*
-//    - Có thể thêm http://localhost:* để test local
-//    - Sau khi set → key chỉ hoạt động từ domain này, copy ra nơi khác sẽ fail.
-//
-// 2. TWELVEDATA_API_KEY — KHÔNG có HTTP referrer restriction trên free tier.
-//    Free tier 800 req/ngày → nếu bị abuse sẽ hết quota, không bị bill.
-//    Có thể tạo key riêng cho web app (khác key Docker dashboard).
-//    Tham khảo: https://twelvedata.com/account/api-keys
-//
-// 3. Khi cần đổi key: chỉnh trực tiếp file này, commit + push.
-// ============================================================
+// Để override default cho local dev: tạo file js/config.local.js (đã .gitignore)
+// và import nó từ index.html (thêm <script type="module" src="js/config.local.js">)
 
-export const CONFIG = {
-  GEMINI_API_KEY: "AIzaSyChIlQ3bP1bQbRaM48zS9vA46sRlHj1Stk",
-  TWELVEDATA_API_KEY: "d6b0258d6529400a9a4f7670ae7cb35a",
+const LS_KEY = "xau_api_keys";
 
-  // Gemini model — 2.5-flash nhanh + free, lite làm fallback khi flash 503
+function loadKeys() {
+  try {
+    return JSON.parse(localStorage.getItem(LS_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveKeys(keys) {
+  localStorage.setItem(LS_KEY, JSON.stringify(keys));
+}
+
+// CONFIG là một Proxy: đọc lấy giá trị live từ localStorage
+const _baseConfig = {
   GEMINI_MODEL: "gemini-2.5-flash",
   GEMINI_FALLBACK_MODEL: "gemini-2.5-flash-lite",
 
-  // TwelveData symbol
   SYMBOL: "XAU/USD",
-
-  // Số nến lấy về cho mỗi khung (max free tier mỗi req)
-  // 5m × 1000 ≈ 3.5 ngày, 1h × 1000 ≈ 42 ngày
   OUTPUT_SIZE: 1000,
 
-  // Intervals hợp lệ TwelveData → key chuẩn nội bộ
+  // Map TwelveData interval → key chuẩn nội bộ
   INTERVALS: {
     "5min":  "5m",
     "15min": "15m",
@@ -44,4 +43,40 @@ export const CONFIG = {
     "4h":    "4h",
     "1day":  "1d",
   },
+
+  // Default TF khi mở app
+  DEFAULT_TF: "15m",
+
+  // Data source priority: 'twelvedata' (chính), 'stooq' (fallback free, no key)
+  DATA_SOURCES: ["twelvedata", "stooq"],
 };
+
+export const CONFIG = new Proxy(_baseConfig, {
+  get(target, prop) {
+    if (prop === "GEMINI_API_KEY") return loadKeys().gemini || "";
+    if (prop === "TWELVEDATA_API_KEY") return loadKeys().twelvedata || "";
+    return target[prop];
+  },
+});
+
+export function setApiKey(name, value) {
+  const keys = loadKeys();
+  if (value && value.trim()) {
+    keys[name] = value.trim();
+  } else {
+    delete keys[name];
+  }
+  saveKeys(keys);
+}
+
+export function getApiKey(name) {
+  return loadKeys()[name] || "";
+}
+
+export function hasGemini() {
+  return !!loadKeys().gemini;
+}
+
+export function hasTwelveData() {
+  return !!loadKeys().twelvedata;
+}

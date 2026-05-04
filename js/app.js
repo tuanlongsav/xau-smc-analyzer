@@ -5,6 +5,8 @@ import { fetchSpot, fetchOHLCV, TF_TO_TD } from "./data.js";
 import { computeIndicators, calculateZones, detectAlerts } from "./indicators.js";
 import { analyzeSmc, quickScan } from "./gemini.js";
 import { initChart, updateChart, resizeChart } from "./chart.js";
+import { fetchNews, formatNewsForPrompt } from "./news.js";
+import { CONFIG, setApiKey, getApiKey, hasGemini, hasTwelveData } from "./config.js";
 
 // ============================================================
 // STATE
@@ -13,13 +15,15 @@ const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"];
 const TF_LABELS = { "5m": "5 phút", "15m": "15 phút", "1h": "1 giờ", "4h": "4 giờ", "1d": "1 ngày" };
 
 const state = {
-  tf: "1h",
-  analysisTfs: ["1h"],
+  tf: CONFIG.DEFAULT_TF || "15m",
+  analysisTfs: [CONFIG.DEFAULT_TF || "15m"],
   candles: [],
-  candlesByTf: {},   // cache OHLCV theo tf
+  candlesByTf: {},        // cache OHLCV theo tf
+  candleSourceByTf: {},   // 'twelvedata' | 'stooq'
   spot: null,
-  smcResults: {},    // { tf: result }
+  smcResults: {},
   quickResult: null,
+  news: [],               // RSS news items
   loading: false,
   history: JSON.parse(localStorage.getItem("xau_history") || "[]"),
   theme: localStorage.getItem("xau_theme") || "dark",
@@ -54,24 +58,26 @@ function setLoading(on, msg = "") {
 // ============================================================
 async function loadTfData(tf) {
   if (state.candlesByTf[tf]) return state.candlesByTf[tf];
-  const tdInterval = TF_TO_TD[tf];
-  const raw = await fetchOHLCV(tdInterval);
+  const { candles: raw, source } = await fetchOHLCV(tf);
   const withInd = computeIndicators(raw);
   state.candlesByTf[tf] = withInd;
+  state.candleSourceByTf[tf] = source;
   return withInd;
 }
 
 async function refreshAll() {
-  setLoading(true, "Đang tải data từ TwelveData...");
+  setLoading(true, "Đang tải data...");
   try {
-    // Clear cache để fetch lại
     state.candlesByTf = {};
-    const [candles, spot] = await Promise.all([
+    state.candleSourceByTf = {};
+    const [candles, spot, news] = await Promise.all([
       loadTfData(state.tf),
       fetchSpot().catch(() => null),
+      fetchNews().catch(() => []),
     ]);
     state.candles = candles;
     state.spot = spot;
+    state.news = news;
     render();
   } catch (e) {
     showError(`Lỗi tải data: ${e.message}`);
@@ -108,6 +114,45 @@ function renderHeader() {
   $("#atr").textContent = fmt(latest.atr, 2);
   $("#ema-trio").textContent = `${fmt(latest.ema20)} / ${fmt(latest.ema50)} / ${fmt(latest.ema200)}`;
   $("#updated").textContent = new Date().toLocaleTimeString("vi-VN");
+
+  // Show data source badge
+  const src = state.candleSourceByTf[state.tf];
+  const srcEl = $("#data-source");
+  if (srcEl && src) {
+    srcEl.textContent = src === "twelvedata" ? "📡 TwelveData" : "📊 Stooq (free)";
+    srcEl.className = src === "twelvedata"
+      ? "text-xs text-green-500"
+      : "text-xs text-amber-500";
+  }
+
+  // Render news panel
+  renderNewsPanel();
+}
+
+function renderNewsPanel() {
+  const wrapper = $("#news-panel");
+  if (!wrapper) return;
+  if (!state.news || state.news.length === 0) {
+    wrapper.innerHTML = "";
+    return;
+  }
+  const items = state.news.slice(0, 8);
+  wrapper.innerHTML = `
+    <details class="bg-slate-100 dark:bg-slate-800 rounded-lg p-3">
+      <summary class="cursor-pointer font-semibold">📰 Tin tức 24h (${state.news.length}) — đã đưa vào prompt AI</summary>
+      <div class="mt-3 space-y-2">
+        ${items.map(it => {
+          const ago = (Date.now() - new Date(it.ts).getTime()) / 3600000;
+          const agoStr = ago >= 1 ? `${ago.toFixed(0)}h trước` : `${Math.round(ago * 60)} phút`;
+          return `<div class="text-sm border-l-2 border-blue-500 pl-3">
+            <div class="text-xs text-slate-500">[${it.source}] ${agoStr}</div>
+            <a href="${escapeHtml(it.url)}" target="_blank" rel="noopener" class="text-blue-500 hover:underline">${escapeHtml(it.title)}</a>
+            ${it.summary ? `<div class="text-xs text-slate-600 dark:text-slate-400 mt-1">${escapeHtml(it.summary.slice(0, 200))}</div>` : ""}
+          </div>`;
+        }).join("")}
+      </div>
+    </details>
+  `;
 }
 
 function renderChart() {
@@ -356,12 +401,13 @@ async function onFullAnalysis() {
   state.quickResult = null;
 
   try {
+    const newsBlock = formatNewsForPrompt(state.news, 8);
     const jobs = await Promise.all(tfs.map(async (t) => {
       const candles = await loadTfData(t);
       const latest = candles[candles.length - 1];
       const zones = calculateZones(latest);
       const cc = state.spot ? { twelvedata: state.spot } : null;
-      return analyzeSmc(latest, zones, candles, t, cc).then(r => [t, r]);
+      return analyzeSmc(latest, zones, candles, t, cc, newsBlock).then(r => [t, r]);
     }));
     jobs.forEach(([t, r]) => {
       state.smcResults[t] = r;
@@ -438,11 +484,45 @@ function buildAnalysisTfCheckboxes() {
   $$(".analysis-tf-cb").forEach(cb => cb.addEventListener("change", onAnalysisTfsChange));
 }
 
+function setupSettingsPanel() {
+  const panel = $("#settings-panel");
+  $("#settings-toggle").addEventListener("click", () => {
+    panel.classList.toggle("hidden");
+    if (!panel.classList.contains("hidden")) {
+      $("#gemini-key-input").value = getApiKey("gemini");
+      $("#td-key-input").value = getApiKey("twelvedata");
+    }
+  });
+  $("#save-keys-btn").addEventListener("click", () => {
+    setApiKey("gemini", $("#gemini-key-input").value);
+    setApiKey("twelvedata", $("#td-key-input").value);
+    $("#keys-status").textContent = "✅ Đã lưu";
+    setTimeout(() => $("#keys-status").textContent = "", 2000);
+    refreshAll();
+  });
+  $("#clear-keys-btn").addEventListener("click", () => {
+    if (!confirm("Xoá toàn bộ API key đã lưu?")) return;
+    setApiKey("gemini", "");
+    setApiKey("twelvedata", "");
+    $("#gemini-key-input").value = "";
+    $("#td-key-input").value = "";
+    $("#keys-status").textContent = "🗑️ Đã xoá";
+    setTimeout(() => $("#keys-status").textContent = "", 2000);
+  });
+
+  // Auto mở settings nếu chưa có Gemini key
+  if (!hasGemini()) {
+    panel.classList.remove("hidden");
+    $("#keys-status").innerHTML = `<span class="text-amber-500">⚠️ Cần Gemini key để phân tích AI</span>`;
+  }
+}
+
 async function init() {
   setTheme(state.theme);
 
   buildTimeframeButtons();
   buildAnalysisTfCheckboxes();
+  setupSettingsPanel();
 
   $("#theme-toggle").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
   $("#refresh-btn").addEventListener("click", refreshAll);
@@ -458,3 +538,12 @@ async function init() {
 }
 
 document.addEventListener("DOMContentLoaded", init);
+
+// Register PWA service worker (chỉ khi served qua http/https)
+if ("serviceWorker" in navigator && location.protocol !== "file:") {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js")
+      .then(reg => console.log("SW registered:", reg.scope))
+      .catch(err => console.warn("SW failed:", err));
+  });
+}
