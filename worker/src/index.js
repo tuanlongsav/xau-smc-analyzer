@@ -163,13 +163,10 @@ export default {
         upstream = null;
         continue;
       }
-      // Status không phải 429 → return luôn (success hoặc lỗi khác như 500/503)
+      // Bất kỳ 429 nào (quota daily, RPM, concurrency...) → rotate sang key tiếp theo.
+      // Mỗi key có quota/rate-limit độc lập nên rotate luôn an toàn, không cần phân biệt.
       if (upstream.status !== 429) break;
-      // 429 — kiểm tra có phải quota exhausted không (có thể là rate limit ngắn hạn)
-      const errText = await upstream.clone().text();
-      if (!/RESOURCE_EXHAUSTED|quota/i.test(errText)) break;
-      // Quota → log + thử key tiếp theo (nếu còn)
-      console.log(`[gemini] ${label} key quota exhausted, trying next`);
+      console.log(`[gemini] ${label} key 429, rotating to next key`);
     }
 
     if (!upstream) {
