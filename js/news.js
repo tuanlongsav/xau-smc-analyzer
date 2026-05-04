@@ -16,7 +16,8 @@ const FEEDS = [
 ];
 
 const PROXY = "https://api.rss2json.com/v1/api.json";
-const CACHE_KEY = "xau_news_cache";
+// Bump version → invalidate cache cũ từ phiên bản broken (rss2json count param 422)
+const CACHE_KEY = "xau_news_cache_v2";
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 phút
 
 const GOLD_KEYWORDS = [
@@ -88,13 +89,15 @@ export async function fetchNews(forceRefresh = false) {
       return true;
     });
 
-  // Cache
-  try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify({
-      fetchedAt: Date.now(),
-      items: dedup,
-    }));
-  } catch {}
+  // Chỉ cache khi có items (không lock user vào empty cache 30 phút)
+  if (dedup.length > 0) {
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify({
+        fetchedAt: Date.now(),
+        items: dedup,
+      }));
+    } catch {}
+  }
 
   return dedup;
 }

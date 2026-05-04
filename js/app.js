@@ -91,6 +91,7 @@ async function refreshAll() {
 // ============================================================
 function render() {
   renderHeader();
+  renderNewsPanel();   // tách ra: render kể cả khi candles chưa load
   renderChart();
   renderAlerts();
   renderAnalysis();
@@ -122,21 +123,26 @@ function renderHeader() {
     srcEl.textContent = "📡 TwelveData";
     srcEl.className = "text-xs text-green-500";
   }
-
-  // Render news panel
-  renderNewsPanel();
 }
 
 function renderNewsPanel() {
   const wrapper = $("#news-panel");
   if (!wrapper) return;
+
+  // Empty state — hiện vẫn có tiêu đề để user biết panel tồn tại
   if (!state.news || state.news.length === 0) {
-    wrapper.innerHTML = "";
+    wrapper.innerHTML = `
+      <div class="bg-slate-100 dark:bg-slate-800 rounded-lg p-3 text-sm">
+        <div class="font-semibold mb-1">📰 Tin tức gold-relevant (24h)</div>
+        <div class="text-xs text-slate-500">Chưa có tin lọc được. Có thể RSS proxy lỗi tạm hoặc không có tin gold trong 24h gần nhất.</div>
+      </div>
+    `;
     return;
   }
+
   const items = state.news.slice(0, 8);
   wrapper.innerHTML = `
-    <details class="bg-slate-100 dark:bg-slate-800 rounded-lg p-3">
+    <details class="bg-slate-100 dark:bg-slate-800 rounded-lg p-3" open>
       <summary class="cursor-pointer font-semibold">📰 Tin tức 24h (${state.news.length}) — đã đưa vào prompt AI</summary>
       <div class="mt-3 space-y-2">
         ${items.map(it => {
