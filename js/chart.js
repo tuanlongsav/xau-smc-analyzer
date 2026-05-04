@@ -4,6 +4,10 @@
 //
 // Globals: window.LightweightCharts (loaded từ CDN trong index.html)
 
+// Mặc định hiển thị 150 nến cuối — đủ context nhưng candle to, dễ đọc.
+// User vẫn scroll/zoom-out để xem toàn bộ history (1000 candles).
+const DEFAULT_VISIBLE_BARS = 150;
+
 let chart = null;
 let candleSeries = null;
 let ema20Series = null;
@@ -99,9 +103,13 @@ export function updateChart(candlesWithIndicators) {
     .map(c => ({ time: c.time, value: c.bbLower }));
   bbLowerSeries.setData(bbL);
 
-  chart.timeScale().fitContent();
+  // Zoom vào N nến cuối thay vì fitContent (1000 nến → mỗi nến tí hon).
+  const total = candlesWithIndicators.length;
+  const from = Math.max(0, total - DEFAULT_VISIBLE_BARS);
+  chart.timeScale().setVisibleLogicalRange({ from, to: total - 1 });
 }
 
 export function resizeChart() {
-  if (chart) chart.timeScale().fitContent();
+  // Khi resize window, GIỮ nguyên zoom state user đang xem (không reset về 150 cuối).
+  // Lightweight Charts với autoSize tự handle width, không cần làm gì.
 }
