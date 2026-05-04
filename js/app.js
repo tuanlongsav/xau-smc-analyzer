@@ -194,17 +194,139 @@ function renderAlerts() {
   if (!candles || candles.length < 2) return;
   const latest = candles[candles.length - 1];
   const prev = candles[candles.length - 2];
+
+  // ── Pivot Points cho key levels (always computed, độc lập với toggle hiển thị chart) ──
+  const pivots = computePivots(prev);
+
+  // ── Default panel: Xu hướng trong ngày + Key technical levels ──
+  container.innerHTML = renderTrendSummary(latest, candles, pivots);
+
+  // ── Rule-based alerts (nếu có) ──
   const alerts = detectAlerts(latest, prev);
   if (alerts.length === 0) {
-    container.innerHTML = `<div class="text-slate-500 text-sm">Không có cảnh báo rule-based.</div>`;
-    return;
+    container.innerHTML += `<div class="text-slate-500 text-xs italic mt-2">Không có cảnh báo rule-based đặc biệt (RSI/BB/MACD/Cross).</div>`;
+  } else {
+    alerts.forEach(a => {
+      const div = document.createElement("div");
+      div.className = "alert-item bg-amber-500/10 border-l-4 border-amber-500 p-3 rounded text-sm mt-2";
+      div.textContent = a;
+      container.appendChild(div);
+    });
   }
-  alerts.forEach(a => {
-    const div = document.createElement("div");
-    div.className = "alert-item bg-amber-500/10 border-l-4 border-amber-500 p-3 rounded text-sm";
-    div.textContent = a;
-    container.appendChild(div);
-  });
+}
+
+/**
+ * Default panel: trend in day + key technical price levels around current price.
+ * Hiện luôn (independent với rule-based alerts).
+ */
+function renderTrendSummary(latest, candles, pivots) {
+  const c = latest.close;
+
+  // Trend determination dựa vào EMA alignment + price position
+  let trend, icon, color;
+  const { ema21, ema50, ema200 } = latest;
+  if (ema200 == null || ema21 == null || ema50 == null) {
+    trend = "Chưa đủ data"; icon = "❓"; color = "text-slate-500";
+  } else if (c > ema200 && ema21 > ema50 && ema50 > ema200) {
+    trend = "Tăng mạnh"; icon = "🚀"; color = "text-green-500";
+  } else if (c > ema50 && c > ema200) {
+    trend = "Tăng"; icon = "📈"; color = "text-green-500";
+  } else if (c < ema200 && ema21 < ema50 && ema50 < ema200) {
+    trend = "Giảm mạnh"; icon = "🔻"; color = "text-red-500";
+  } else if (c < ema50 && c < ema200) {
+    trend = "Giảm"; icon = "📉"; color = "text-red-500";
+  } else {
+    trend = "Sideways"; icon = "↔️"; color = "text-amber-500";
+  }
+
+  // Today's UTC session O/H/L + position trong range
+  const lastDate = new Date(latest.time * 1000);
+  const dayStart = Date.UTC(lastDate.getUTCFullYear(), lastDate.getUTCMonth(), lastDate.getUTCDate()) / 1000;
+  const todays = candles.filter(cn => cn.time >= dayStart);
+  let sessionInfo = "";
+  let todayHigh = null, todayLow = null;
+  if (todays.length > 0) {
+    const sOpen = todays[0].open;
+    todayHigh = Math.max(...todays.map(cn => cn.high));
+    todayLow = Math.min(...todays.map(cn => cn.low));
+    const range = todayHigh - todayLow;
+    const pct = range > 0 ? ((c - todayLow) / range * 100).toFixed(0) : "—";
+    sessionInfo = `Phiên UTC: O <strong>$${fmt(sOpen)}</strong> / H <strong>$${fmt(todayHigh)}</strong> / L <strong>$${fmt(todayLow)}</strong> <span class="text-slate-500">(giá ở ${pct}% range)</span>`;
+  }
+
+  // SMA alignment
+  const smaAlign = (latest.sma50 != null && latest.sma200 != null)
+    ? (latest.sma50 > latest.sma200
+       ? `<span class="text-green-500">golden alignment (SMA50>200)</span>`
+       : `<span class="text-red-500">death alignment (SMA50<200)</span>`)
+    : "";
+
+  // RSI text
+  const rsiText = latest.rsi != null
+    ? (latest.rsi > 70 ? `<span class="text-red-500">${fmt(latest.rsi, 1)} quá mua</span>`
+       : latest.rsi < 30 ? `<span class="text-green-500">${fmt(latest.rsi, 1)} quá bán</span>`
+       : `${fmt(latest.rsi, 1)} trung tính`)
+    : "—";
+
+  // MACD text
+  const macdText = (latest.macd != null && latest.macdSignal != null)
+    ? (latest.macd > latest.macdSignal
+       ? `<span class="text-green-500">bullish</span>`
+       : `<span class="text-red-500">bearish</span>`)
+    : "—";
+
+  // ── Collect tất cả key levels ──
+  const levels = [];
+  const add = (price, label) => {
+    if (price != null && !isNaN(price)) levels.push({ price, label });
+  };
+  add(latest.recentHigh, "Recent High (50)");
+  add(latest.recentLow, "Recent Low (50)");
+  add(latest.bbUpper, "BB Upper");
+  add(latest.bbLower, "BB Lower");
+  add(latest.ema21, "EMA 21");
+  add(latest.ema50, "EMA 50");
+  add(latest.ema200, "EMA 200");
+  add(latest.sma50, "SMA 50");
+  add(latest.sma200, "SMA 200");
+  if (pivots) {
+    add(pivots.r2, "Pivot R2");
+    add(pivots.r1, "Pivot R1");
+    add(pivots.pp, "Pivot PP");
+    add(pivots.s1, "Pivot S1");
+    add(pivots.s2, "Pivot S2");
+  }
+  if (todayHigh != null) add(todayHigh, "Today High");
+  if (todayLow != null)  add(todayLow,  "Today Low");
+
+  // Sort: above ascending (gần nhất trước), below descending
+  const above = levels.filter(l => l.price > c).sort((a, b) => a.price - b.price).slice(0, 6);
+  const below = levels.filter(l => l.price < c).sort((a, b) => b.price - a.price).slice(0, 6);
+
+  return `
+    <div class="bg-blue-500/10 border-l-4 border-blue-500 p-3 rounded text-sm mb-3">
+      <div class="font-semibold mb-2">🧭 Xu hướng trong ngày</div>
+      <div class="text-xs space-y-1 mb-3">
+        <div>Trend: <strong class="${color}">${icon} ${trend}</strong> <span class="text-slate-500">| Giá hiện tại: <strong>$${fmt(c)}</strong></span></div>
+        ${sessionInfo ? `<div>${sessionInfo}</div>` : ""}
+        <div>RSI(14): ${rsiText} | MACD: ${macdText}${smaAlign ? ` | ${smaAlign}` : ""}</div>
+      </div>
+
+      <div class="font-semibold mb-2">📍 Mức giá kỹ thuật cần lưu ý</div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+        <div>
+          <div class="text-red-500 font-semibold mb-1">▲ Cản phía trên</div>
+          ${above.length === 0 ? `<div class="text-slate-500 italic">Không có data</div>` :
+            above.map(l => `<div><span class="font-mono">$${fmt(l.price)}</span> <span class="text-slate-500">— ${escapeHtml(l.label)} <span class="text-slate-400">(+${fmt(l.price - c)})</span></span></div>`).join("")}
+        </div>
+        <div>
+          <div class="text-green-500 font-semibold mb-1">▼ Đỡ phía dưới</div>
+          ${below.length === 0 ? `<div class="text-slate-500 italic">Không có data</div>` :
+            below.map(l => `<div><span class="font-mono">$${fmt(l.price)}</span> <span class="text-slate-500">— ${escapeHtml(l.label)} <span class="text-slate-400">(-${fmt(c - l.price)})</span></span></div>`).join("")}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function renderAnalysis() {
