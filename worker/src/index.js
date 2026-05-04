@@ -59,6 +59,7 @@ export default {
         ok: true,
         service: "xau-gemini-proxy",
         hasGeminiKey: !!env.GEMINI_API_KEY,
+        hasGeminiKeyBackup: !!env.GEMINI_API_KEY_BACKUP,
         hasTwelveDataKey: !!env.TWELVEDATA_API_KEY,
         endpoints: [
           "/health",
@@ -135,25 +136,44 @@ export default {
     }
     const model = match[1];
 
-    if (!env.GEMINI_API_KEY) {
+    // Multi-key rotation: thử primary, hết quota → tự switch backup
+    const keys = [];
+    if (env.GEMINI_API_KEY)        keys.push({ key: env.GEMINI_API_KEY,        label: "primary" });
+    if (env.GEMINI_API_KEY_BACKUP) keys.push({ key: env.GEMINI_API_KEY_BACKUP, label: "backup"  });
+    if (keys.length === 0) {
       return jsonResponse(500, {
         error: "Worker chưa cấu hình GEMINI_API_KEY. Chạy: wrangler secret put GEMINI_API_KEY",
       }, origin);
     }
 
-    // Forward body, inject key
-    const targetUrl = `${GOOGLE_BASE}/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
     const body = await request.text();
+    let upstream = null;
+    let lastError = null;
 
-    let upstream;
-    try {
-      upstream = await fetch(targetUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-      });
-    } catch (e) {
-      return jsonResponse(502, { error: `Không gọi được Google API: ${e.message}` }, origin);
+    for (const { key, label } of keys) {
+      const targetUrl = `${GOOGLE_BASE}/v1beta/models/${model}:generateContent?key=${key}`;
+      try {
+        upstream = await fetch(targetUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+      } catch (e) {
+        lastError = e;
+        upstream = null;
+        continue;
+      }
+      // Status không phải 429 → return luôn (success hoặc lỗi khác như 500/503)
+      if (upstream.status !== 429) break;
+      // 429 — kiểm tra có phải quota exhausted không (có thể là rate limit ngắn hạn)
+      const errText = await upstream.clone().text();
+      if (!/RESOURCE_EXHAUSTED|quota/i.test(errText)) break;
+      // Quota → log + thử key tiếp theo (nếu còn)
+      console.log(`[gemini] ${label} key quota exhausted, trying next`);
+    }
+
+    if (!upstream) {
+      return jsonResponse(502, { error: `Không gọi được Google API: ${lastError?.message || "unknown"}` }, origin);
     }
 
     // Stream response back, preserve status code
