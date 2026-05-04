@@ -71,16 +71,11 @@ async function refreshAll() {
   try {
     state.candlesByTf = {};
     state.candleSourceByTf = {};
-    // Pre-fetch 1d data cho Pivot Points (chỉ nếu khung hiện tại không phải 1d)
-    const dailyPromise = state.tf === "1d"
-      ? Promise.resolve(null)
-      : loadTfData("1d").catch(e => { console.warn("Pre-fetch 1d fail:", e.message); return null; });
     const [candles, spot, news] = await Promise.all([
       loadTfData(state.tf),
       fetchSpot().catch(() => null),
       fetchNews().catch(() => []),
     ]);
-    await dailyPromise;
     state.candles = candles;
     state.spot = spot;
     state.news = news;
@@ -167,11 +162,11 @@ function renderNewsPanel() {
 
 function renderChart() {
   updateChart(state.candles, state.tf);
-  // Pivot Points: lấy yesterday's daily candle (penultimate trong 1d data)
-  const dailyCandles = state.candlesByTf["1d"];
-  if (state.showPivots && dailyCandles && dailyCandles.length >= 2) {
-    const yesterday = dailyCandles[dailyCandles.length - 2];
-    setPivots(computePivots(yesterday));
+  // Pivot Points: dùng candle hoàn thành trước nến hiện tại của TF đang xem
+  // (5m → prev 5m, 15m → prev 15m, ..., 1d → yesterday daily)
+  if (state.showPivots && state.candles && state.candles.length >= 2) {
+    const previous = state.candles[state.candles.length - 2];
+    setPivots(computePivots(previous));
   } else {
     setPivots(null);
   }

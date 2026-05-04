@@ -277,18 +277,19 @@ export function setPivots(pivots) {
   pivotPriceLines.forEach(line => candleSeries && candleSeries.removePriceLine(line));
   pivotPriceLines = [];
   if (!pivots || !candleSeries) return;
+  // Bolder, full opacity, lineWidth 2 để nổi giữa rừng line khác
   const styles = [
-    { key: "r2", label: "R2", color: "rgba(239,68,68,0.85)" },
-    { key: "r1", label: "R1", color: "rgba(239,68,68,0.55)" },
-    { key: "pp", label: "PP", color: "rgba(250,204,21,0.85)" },
-    { key: "s1", label: "S1", color: "rgba(34,197,94,0.55)" },
-    { key: "s2", label: "S2", color: "rgba(34,197,94,0.85)" },
+    { key: "r2", label: "● R2", color: "#dc2626" },
+    { key: "r1", label: "● R1", color: "#f87171" },
+    { key: "pp", label: "● PP", color: "#facc15" },
+    { key: "s1", label: "● S1", color: "#86efac" },
+    { key: "s2", label: "● S2", color: "#16a34a" },
   ];
   for (const { key, label, color } of styles) {
     const line = candleSeries.createPriceLine({
       price: pivots[key],
       color,
-      lineWidth: 1,
+      lineWidth: 2,
       lineStyle: 0, // solid
       title: label,
       axisLabelVisible: true,
