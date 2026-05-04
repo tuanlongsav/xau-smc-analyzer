@@ -213,6 +213,26 @@ export function computeFib(candles, lookback = 50) {
 }
 
 /**
+ * Classical Pivot Points từ 1 candle (thường là yesterday's daily).
+ * PP = (H + L + C) / 3
+ * R1 = 2×PP − L,  R2 = PP + (H − L)
+ * S1 = 2×PP − H,  S2 = PP − (H − L)
+ */
+export function computePivots(candle) {
+  if (!candle) return null;
+  const H = candle.high, L = candle.low, C = candle.close;
+  const PP = (H + L + C) / 3;
+  const range = H - L;
+  return {
+    pp: PP,
+    r1: 2 * PP - L,
+    r2: PP + range,
+    s1: 2 * PP - H,
+    s2: PP - range,
+  };
+}
+
+/**
  * Detect Golden Cross / Death Cross historical events trong candles.
  * Golden Cross: SMA 50 cắt LÊN SMA 200 → bullish
  * Death Cross:  SMA 50 cắt XUỐNG SMA 200 → bearish

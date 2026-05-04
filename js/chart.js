@@ -37,6 +37,8 @@ let macdLineSeries, macdSignalSeries, macdHistSeries;
 
 // Fibonacci priceLines — track để xóa khi update
 let fibPriceLines = [];
+// Pivot priceLines — track riêng, toggle on/off
+let pivotPriceLines = [];
 
 // Flag chống loop khi sync visible range giữa các chart
 let isSyncingRange = false;
@@ -265,4 +267,32 @@ export function updateChart(candles, tf = "15m") {
 
 export function resizeChart() {
   // autoSize=true tự handle width. Giữ nguyên zoom user đang xem.
+}
+
+/**
+ * Toggle Pivot Point lines trên price chart.
+ * @param {object|null} pivots - { pp, r1, r2, s1, s2 } hoặc null để xóa
+ */
+export function setPivots(pivots) {
+  pivotPriceLines.forEach(line => candleSeries && candleSeries.removePriceLine(line));
+  pivotPriceLines = [];
+  if (!pivots || !candleSeries) return;
+  const styles = [
+    { key: "r2", label: "R2", color: "rgba(239,68,68,0.85)" },
+    { key: "r1", label: "R1", color: "rgba(239,68,68,0.55)" },
+    { key: "pp", label: "PP", color: "rgba(250,204,21,0.85)" },
+    { key: "s1", label: "S1", color: "rgba(34,197,94,0.55)" },
+    { key: "s2", label: "S2", color: "rgba(34,197,94,0.85)" },
+  ];
+  for (const { key, label, color } of styles) {
+    const line = candleSeries.createPriceLine({
+      price: pivots[key],
+      color,
+      lineWidth: 1,
+      lineStyle: 0, // solid
+      title: label,
+      axisLabelVisible: true,
+    });
+    pivotPriceLines.push(line);
+  }
 }

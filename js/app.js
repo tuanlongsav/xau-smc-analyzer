@@ -2,9 +2,9 @@
 // XAU/USD SMC Analyzer — main UI logic
 // ============================================================
 import { fetchSpot, fetchOHLCV, TF_TO_TD } from "./data.js";
-import { computeIndicators, calculateZones, detectAlerts } from "./indicators.js";
+import { computeIndicators, calculateZones, detectAlerts, computePivots } from "./indicators.js";
 import { analyzeSmc, quickScan } from "./gemini.js";
-import { initChart, updateChart, resizeChart } from "./chart.js";
+import { initChart, updateChart, resizeChart, setPivots } from "./chart.js";
 import { fetchNews, formatNewsForPrompt } from "./news.js";
 import { CONFIG } from "./config.js";
 
@@ -27,6 +27,7 @@ const state = {
   loading: false,
   history: JSON.parse(localStorage.getItem("xau_history") || "[]"),
   theme: localStorage.getItem("xau_theme") || "dark",
+  showPivots: localStorage.getItem("xau_show_pivots") !== "false",  // default ON
 };
 
 // ============================================================
@@ -70,11 +71,16 @@ async function refreshAll() {
   try {
     state.candlesByTf = {};
     state.candleSourceByTf = {};
+    // Pre-fetch 1d data cho Pivot Points (chỉ nếu khung hiện tại không phải 1d)
+    const dailyPromise = state.tf === "1d"
+      ? Promise.resolve(null)
+      : loadTfData("1d").catch(e => { console.warn("Pre-fetch 1d fail:", e.message); return null; });
     const [candles, spot, news] = await Promise.all([
       loadTfData(state.tf),
       fetchSpot().catch(() => null),
       fetchNews().catch(() => []),
     ]);
+    await dailyPromise;
     state.candles = candles;
     state.spot = spot;
     state.news = news;
@@ -161,6 +167,29 @@ function renderNewsPanel() {
 
 function renderChart() {
   updateChart(state.candles, state.tf);
+  // Pivot Points: lấy yesterday's daily candle (penultimate trong 1d data)
+  const dailyCandles = state.candlesByTf["1d"];
+  if (state.showPivots && dailyCandles && dailyCandles.length >= 2) {
+    const yesterday = dailyCandles[dailyCandles.length - 2];
+    setPivots(computePivots(yesterday));
+  } else {
+    setPivots(null);
+  }
+}
+
+function updatePivotButton() {
+  const btn = $("#pivot-toggle");
+  if (!btn) return;
+  btn.classList.toggle("bg-blue-600", state.showPivots);
+  btn.classList.toggle("text-white", state.showPivots);
+  btn.classList.toggle("border-blue-600", state.showPivots);
+}
+
+function onTogglePivot() {
+  state.showPivots = !state.showPivots;
+  localStorage.setItem("xau_show_pivots", state.showPivots ? "true" : "false");
+  updatePivotButton();
+  renderChart();
 }
 
 function renderAlerts() {
@@ -498,6 +527,8 @@ async function init() {
 
   $("#theme-toggle").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
   $("#refresh-btn").addEventListener("click", refreshAll);
+  $("#pivot-toggle").addEventListener("click", onTogglePivot);
+  updatePivotButton();
   $("#full-analysis-btn").addEventListener("click", onFullAnalysis);
   $("#quick-scan-btn").addEventListener("click", onQuickScan);
   $("#clear-results-btn").addEventListener("click", onClearResults);
