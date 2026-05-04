@@ -63,12 +63,14 @@ export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = n
     ? `\n## Giá realtime tham chiếu\n${Object.entries(crossCheck).map(([k, v]) => `- ${k}: $${v.toFixed(2)}`).join("\n")}`
     : "";
 
-  // News chỉ relevant khi phân tích khung ngày — macro/Fed/CPI tác động xu hướng trung-dài hạn,
-  // intraday chủ yếu là price action thuần kỹ thuật.
-  const includeNews = timeframe === "1d" && newsBlock && newsBlock.trim();
+  // News chỉ relevant cho HTF (4h, 1d) — macro/Fed/CPI/DXY tác động xu hướng trung-dài hạn.
+  // Intraday (5m/15m/1h) chủ yếu là price action thuần kỹ thuật, không inject news để tránh nhiễu.
+  const isHtf = timeframe === "4h" || timeframe === "1d";
+  const includeNews = isHtf && newsBlock && newsBlock.trim();
   const newsSection = includeNews ? `\n${newsBlock}\n` : "";
+  const horizonText = timeframe === "1d" ? "1-2 tuần" : "2-3 ngày";
   const newsTask = includeNews
-    ? "\n6. **Đối chiếu tin tức macro với phân tích kỹ thuật**: tin tức trên có củng cố hay mâu thuẫn bias không? Chỉ ra 1-2 catalyst quan trọng nhất ảnh hưởng xu hướng 1-2 tuần tới."
+    ? `\n6. **Đối chiếu tin tức kinh tế với phân tích kỹ thuật**: tin tức macro (Fed/CPI/yields/DXY/inflation/jobs) trên có củng cố hay mâu thuẫn bias kỹ thuật không? Chỉ ra 1-2 catalyst quan trọng nhất ảnh hưởng xu hướng ${horizonText} tới.`
     : "";
 
   const user = `DỮ LIỆU XAU/USD KHUNG ${timeframe}:
