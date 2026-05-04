@@ -1,5 +1,5 @@
 // ============================================================
-// Data fetcher — TwelveData primary, Stooq fallback (free, no key)
+// Data fetcher — Stooq primary (free, no key), TwelveData optional add-on
 // ============================================================
 import { CONFIG, hasTwelveData } from "./config.js";
 import { fetchStooq, resample4h } from "./data-stooq.js";
@@ -15,10 +15,11 @@ export const TF_TO_TD = {
 };
 
 /**
- * Spot price — chỉ TwelveData (Stooq không có endpoint spot riêng).
+ * Spot price — chỉ TwelveData có endpoint spot.
+ * Không có key → return null (không throw, để UI fallback dùng close của nến mới nhất).
  */
 export async function fetchSpot() {
-  if (!hasTwelveData()) throw new Error("Chưa có TwelveData key — vào Settings để nhập.");
+  if (!hasTwelveData()) return null;
   const url = `${BASE}/price?symbol=${encodeURIComponent(CONFIG.SYMBOL)}&apikey=${CONFIG.TWELVEDATA_API_KEY}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`TwelveData spot HTTP ${r.status}`);
@@ -63,32 +64,34 @@ async function fetchTwelveData(tdInterval, outputsize = CONFIG.OUTPUT_SIZE) {
 }
 
 /**
- * Fetch OHLCV — auto fallback.
- * 1. Thử TwelveData (nếu có key)
- * 2. Nếu fail (no key / quota / network) → Stooq (free)
+ * Fetch OHLCV — Stooq primary (free, no key).
+ * 1. Thử Stooq trước (free, không cần key)
+ * 2. Nếu fail (network / CORS / empty) VÀ có TwelveData key → fallback TwelveData
  *
  * @param {string} tf - '5m' | '15m' | '1h' | '4h' | '1d'
  * @returns {Promise<{candles, source}>}
  */
 export async function fetchOHLCV(tf) {
-  // Bước 1: thử TwelveData
-  if (hasTwelveData()) {
-    try {
-      const tdInterval = TF_TO_TD[tf];
-      const candles = await fetchTwelveData(tdInterval);
-      if (candles.length > 0) return { candles, source: "twelvedata" };
-    } catch (e) {
-      console.warn(`TwelveData fail for ${tf} (${e.message}), fallback to Stooq...`);
+  // Bước 1: thử Stooq (primary)
+  try {
+    let candles;
+    if (tf === "4h") {
+      // Stooq không có 4h native → resample từ 1h
+      const candles1h = await fetchStooq("1h", 60);
+      candles = resample4h(candles1h);
+    } else {
+      const days = tf === "1d" ? 365 : (tf === "1h" ? 60 : 7);
+      candles = await fetchStooq(tf, days);
     }
+    if (candles.length > 0) return { candles, source: "stooq" };
+    throw new Error("Stooq trả empty");
+  } catch (e) {
+    console.warn(`Stooq fail for ${tf} (${e.message})${hasTwelveData() ? ", fallback TwelveData..." : ""}`);
+    if (!hasTwelveData()) throw e;
   }
 
-  // Bước 2: Stooq fallback
-  // Stooq không có 4h → resample từ 1h
-  if (tf === "4h") {
-    const candles1h = await fetchStooq("1h", 60);
-    return { candles: resample4h(candles1h), source: "stooq" };
-  }
-  const days = tf === "1d" ? 365 : (tf === "1h" ? 60 : 7);
-  const candles = await fetchStooq(tf, days);
-  return { candles, source: "stooq" };
+  // Bước 2: TwelveData fallback (chỉ chạy nếu user có key)
+  const tdInterval = TF_TO_TD[tf];
+  const candles = await fetchTwelveData(tdInterval);
+  return { candles, source: "twelvedata" };
 }

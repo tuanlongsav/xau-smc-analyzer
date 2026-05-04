@@ -32,6 +32,10 @@ const _baseConfig = {
   GEMINI_MODEL: "gemini-2.5-flash",
   GEMINI_FALLBACK_MODEL: "gemini-2.5-flash-lite",
 
+  // URL của Cloudflare Worker proxy (giấu Gemini key).
+  // Worker code: ./worker/src/index.js. Set key: cd worker && wrangler secret put GEMINI_API_KEY
+  GEMINI_PROXY_URL: "https://xau-gemini-proxy.tuanlong-sav.workers.dev",
+
   SYMBOL: "XAU/USD",
   OUTPUT_SIZE: 1000,
 
@@ -47,8 +51,8 @@ const _baseConfig = {
   // Default TF khi mở app
   DEFAULT_TF: "15m",
 
-  // Data source priority: 'twelvedata' (chính), 'stooq' (fallback free, no key)
-  DATA_SOURCES: ["twelvedata", "stooq"],
+  // Data source priority: 'stooq' (chính, free no-key), 'twelvedata' (optional, fallback khi Stooq lỗi)
+  DATA_SOURCES: ["stooq", "twelvedata"],
 };
 
 export const CONFIG = new Proxy(_baseConfig, {
@@ -74,7 +78,11 @@ export function getApiKey(name) {
 }
 
 export function hasGemini() {
-  return !!loadKeys().gemini;
+  return !!loadKeys().gemini || !!_baseConfig.GEMINI_PROXY_URL;
+}
+
+export function hasGeminiProxy() {
+  return !!_baseConfig.GEMINI_PROXY_URL;
 }
 
 export function hasTwelveData() {

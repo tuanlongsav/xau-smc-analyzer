@@ -2,15 +2,17 @@
 // Gemini API client — REST trực tiếp (không cần SDK build)
 // ============================================================
 //
-// Dùng REST endpoint của Generative Language API thay vì SDK
-// để tránh phải import bare specifier qua import map.
+// Hai chế độ:
+// 1. Proxy mode (default): gọi Cloudflare Worker (CONFIG.GEMINI_PROXY_URL),
+//    Worker chèn key. Frontend không bao giờ chạm key.
+// 2. Direct mode (override): nếu user nhập key trong Settings, gọi thẳng Google
+//    với key đó (bỏ qua proxy).
 //
-// Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}
 // Body: { contents, systemInstruction, generationConfig }
 import { CONFIG, hasGemini } from "./config.js";
 import { buildSmcPrompt, buildQuickPrompt } from "./prompts.js";
 
-const BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const GOOGLE_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /**
  * Trích JSON object từ text. Gemini hay wrap trong ```json...```
@@ -37,9 +39,22 @@ function extractJSON(text) {
  * @param {object} body
  * @param {object} opts - { maxRetries, fallbackModel }
  */
+function buildGeminiUrl(model) {
+  // Direct mode: user nhập key trong Settings → ưu tiên (override)
+  const userKey = CONFIG.GEMINI_API_KEY;
+  if (userKey) {
+    return `${GOOGLE_BASE}/${model}:generateContent?key=${userKey}`;
+  }
+  // Proxy mode: gọi Worker, Worker chèn key
+  if (CONFIG.GEMINI_PROXY_URL) {
+    return `${CONFIG.GEMINI_PROXY_URL.replace(/\/$/, "")}/v1beta/models/${model}:generateContent`;
+  }
+  return null;
+}
+
 async function callGemini(model, body, { maxRetries = 3, fallbackModel = null } = {}) {
-  if (!hasGemini()) throw new Error("no_gemini_key");
-  const url = `${BASE}/${model}:generateContent?key=${CONFIG.GEMINI_API_KEY}`;
+  const url = buildGeminiUrl(model);
+  if (!url) throw new Error("no_gemini_key");
   let lastErr;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {

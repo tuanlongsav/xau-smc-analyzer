@@ -1,0 +1,8 @@
+name = "xau-gemini-proxy"
+main = "src/index.js"
+compatibility_date = "2025-05-01"
+
+# Secret cần set bằng tay sau khi deploy:
+#   npx wrangler secret put GEMINI_API_KEY
+#
+# KHÔNG để key trong file này (file này commit lên Git).
