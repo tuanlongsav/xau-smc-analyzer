@@ -1246,18 +1246,64 @@ const HIGH_IMPACT_KEYWORDS = [
   "ECB decision", "BOJ", "BOE",
 ];
 
+/**
+ * Parse RSS XML đơn giản — extract <item> với title/link/pubDate/description.
+ * Dùng vì rss2json proxy block Cloudflare DC IPs.
+ */
+function parseRssXml(xml) {
+  const items = [];
+  const itemRegex = /<item[\s\S]*?<\/item>/g;
+  const itemMatches = xml.match(itemRegex) || [];
+  for (const itemXml of itemMatches) {
+    const get = (tag) => {
+      // Match <tag>...</tag> hoặc <tag><![CDATA[...]]></tag>
+      const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i");
+      const m = itemXml.match(re);
+      if (!m) return "";
+      let val = m[1].trim();
+      // Strip CDATA
+      val = val.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+      // Decode HTML entities cơ bản
+      val = val.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+               .replace(/&quot;/g, '"').replace(/&#039;/g, "'");
+      // Strip HTML tags
+      val = val.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+      return val;
+    };
+    const title = get("title");
+    const link = get("link") || get("guid");
+    const pubDate = get("pubDate") || get("pubdate") || get("dc:date");
+    const description = get("description") || get("content:encoded") || get("summary");
+    if (title && link) {
+      items.push({ title, link, pubDate, description });
+    }
+  }
+  return items;
+}
+
 async function fetchNewsFromRSS(env) {
-  const PROXY = "https://api.rss2json.com/v1/api.json";
   const results = await Promise.allSettled(
     NEWS_FEEDS.map(async ({ url, source }) => {
       try {
-        const r = await fetch(`${PROXY}?rss_url=${encodeURIComponent(url)}`);
-        const d = await r.json();
-        if (d.status !== "ok" || !Array.isArray(d.items)) return [];
-        return d.items.map(it => ({
-          ts: new Date(it.pubDate).getTime(),
-          title: (it.title || "").trim(),
-          summary: (it.description || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().slice(0, 300),
+        // Fetch RSS trực tiếp (Worker server-side, không cần proxy CORS)
+        const r = await fetch(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; xau-bot/1.0; +https://xau-smc-analyzer.pages.dev)",
+            "Accept": "application/rss+xml, application/xml, text/xml",
+          },
+          // Cache edge 5 phút để giảm tải feed
+          cf: { cacheEverything: true, cacheTtl: 300 },
+        });
+        if (!r.ok) {
+          console.log(`[news] ${source} HTTP ${r.status}`);
+          return [];
+        }
+        const xml = await r.text();
+        const items = parseRssXml(xml);
+        return items.map(it => ({
+          ts: new Date(it.pubDate || Date.now()).getTime(),
+          title: (it.title || "").slice(0, 300),
+          summary: (it.description || "").slice(0, 300),
           url: it.link || "",
           source,
         }));
@@ -1267,7 +1313,6 @@ async function fetchNewsFromRSS(env) {
       }
     })
   );
-  // Flatten + dedupe theo URL
   const flat = results.flatMap(r => r.status === "fulfilled" ? r.value : []);
   const seen = new Set();
   return flat.filter(it => {
@@ -2532,6 +2577,30 @@ export default {
     if (url.pathname === "/run-alert-check") {
       await runAlertCheck(env);
       return jsonResponse(200, { ok: true, message: "Alert check chạy xong, xem console log" }, origin);
+    }
+
+    // Debug news fetching
+    if (url.pathname === "/test-news") {
+      try {
+        const all = await fetchNewsFromRSS(env);
+        const byFeed = {};
+        for (const it of all) {
+          byFeed[it.source] = (byFeed[it.source] || 0) + 1;
+        }
+        const recent = all.filter(n => n.ts >= Date.now() - 7 * 24 * 3600 * 1000);
+        const goldRel = recent.filter(isGoldRelevant);
+        const highImp = goldRel.filter(isHighImpact);
+        return jsonResponse(200, {
+          totalFetched: all.length,
+          byFeed,
+          last7Days: recent.length,
+          goldRelevant: goldRel.length,
+          highImpact: highImp.length,
+          sampleTitles: goldRel.slice(0, 5).map(n => `[${n.source}] ${n.title}`),
+        }, origin);
+      } catch (e) {
+        return jsonResponse(500, { error: e.message, stack: e.stack?.slice(0, 500) }, origin);
+      }
     }
 
     // Test full alert pipeline với fake data — verify Telegram delivery + format
