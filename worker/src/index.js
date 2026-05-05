@@ -593,39 +593,48 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
       ? `R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
       : "không có";
 
-    const prompt = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC. Phân tích khung ${tf}, horizon ${horizon}.
+    const prompt = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC với 15 năm kinh nghiệm. Phân tích khung ${tf}, horizon ${horizon}.
 
 DỮ LIỆU:
 - Giá: $${l.close.toFixed(2)} | RSI(14): ${l.rsi?.toFixed(1)}
 - EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}
-- SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(golden)" : "(death)"}
+- SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(golden alignment)" : "(death alignment)"}
 - BB(20): ${l.bbLower?.toFixed(2)} - ${l.bbUpper?.toFixed(2)}
-- Pivots: ${pivotStr}
-- 10 nến: ${last10}
+- Pivots (daily): ${pivotStr}
+- 10 nến gần nhất: ${last10}
 
-Trả lời tiếng Việt format Markdown:
+Trả lời tiếng Việt CHI TIẾT, đầy đủ 4 mục dưới đây. Mỗi mục 3-5 dòng phân tích thực chất, không sơ sài.
 
-📊 *Cấu trúc & Động lượng*
-• Phe kiểm soát: ...
-• BOS/CHOCH: ...
-• RSI/MACD: ... (phân kỳ/kiệt sức/bình thường)
+📊 Cấu trúc & Động lượng
+- Phe kiểm soát hiện tại (mua/bán/trung lập) + 1-2 câu giải thích dựa vào EMA alignment, biên độ, RSI/MACD
+- BOS hoặc CHOCH gần nhất ở mốc giá nào? Giá đang trong giai đoạn nào (impulse/correction/consolidation)?
+- RSI/MACD có phân kỳ với price không? Có dấu hiệu kiệt sức không? Mô tả rõ ràng.
+- Order Block / FVG còn fresh không? Vị trí?
 
-🎯 *Vùng cản quan trọng*
-• Kháng cự: 2 mức + lý do
-• Hỗ trợ: 2 mức + lý do
+🎯 Vùng cản quan trọng
+- 2-3 mức KHÁNG CỰ gần nhất (theo thứ tự gần→xa): mức giá + ghi chú confluence (vd "swing high + EMA50 + Fib 0.5")
+- 2-3 mức HỖ TRỢ gần nhất: tương tự
+- Nếu giá vừa có sóng đẩy → Fib retracement đang active ở mức nào?
 
-💡 *Kế hoạch ${horizon}*
-LONG: Entry=$X, SL=$Y, TP=$Z, R:R=N (lý do ngắn) — hoặc "không khả thi"
-SHORT: Entry=$X, SL=$Y, TP=$Z, R:R=N (lý do ngắn) — hoặc "không khả thi"
+💡 Kế hoạch giao dịch (horizon ${horizon})
+- Kịch bản chính (long/short/sideways) + lý do tại sao
+- Setup LONG: nếu khả thi → Entry $X, SL $Y, TP $Z, R:R=N + 1-2 câu lý do confluence + điều kiện confirm. Nếu không khả thi: ghi rõ "không khả thi" + lý do.
+- Setup SHORT: tương tự.
+- Nguyên tắc SL: đặt NGOÀI vùng nhiễu (>1×ATR cách swing low/high) tránh liquidity sweep
+- R:R tối thiểu 1:1.5, ưu tiên 1:2+
 
-⚠️ *Rủi ro*
-• 2-3 điểm
+⚠️ Rủi ro chính
+- 2-3 rủi ro cụ thể trong horizon ${horizon}
+- Catalyst sắp tới có thể tác động (nếu biết)
 
-NGUYÊN TẮC: SL ngoài vùng nhiễu (>1×ATR cách swing) tránh liquidity sweep. R:R tối thiểu 1:1.5. Mọi mức giá phải là số cụ thể. KHÔNG khuyến nghị "mua/bán ngay".`;
+QUAN TRỌNG:
+- Mọi mức giá phải là SỐ CỤ THỂ (không "khoảng 2350")
+- KHÔNG khuyến nghị "mua/bán ngay"
+- Trả lời ĐẦY ĐỦ các mục, không cắt bớt`;
 
     const body = {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 1500, temperature: 0.5 },
+      generationConfig: { maxOutputTokens: 3500, temperature: 0.5 },
     };
     const resp = await callGeminiSmart(env, body);
     const text = extractText(resp);
@@ -633,13 +642,41 @@ NGUYÊN TẮC: SL ngoài vùng nhiễu (>1×ATR cách swing) tránh liquidity sw
       await sendTelegramTo(env, chatId, "❌ AI unavailable", replyTo);
       return;
     }
-    // Telegram limit 4096 chars
-    const safe = text.length > 3800 ? text.slice(0, 3800) + "\n…(cắt bớt)" : text;
-    // Plain text vì AI output có Markdown không cân (vd "EMA 21 → bắt đầu *uptrend")
-    await sendTelegramTo(env, chatId, `🧠 SMC ${tf}\n\n${safe}`, replyTo, null);
+
+    // Split nếu vượt Telegram limit 4096 chars — không cắt bớt nội dung
+    const fullText = `🧠 SMC ${tf}\n\n${text}`;
+    const parts = splitForTelegram(fullText, 3900);
+    for (let i = 0; i < parts.length; i++) {
+      const suffix = parts.length > 1 ? `\n\n[${i + 1}/${parts.length}]` : "";
+      await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, null);
+    }
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
+}
+
+/**
+ * Split text thành nhiều part fit Telegram 4096 char limit.
+ * Cố gắng break ở paragraph boundary để giữ readability.
+ */
+function splitForTelegram(text, maxLen = 3900) {
+  if (text.length <= maxLen) return [text];
+  const parts = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      parts.push(remaining);
+      break;
+    }
+    // Ưu tiên break ở \n\n (paragraph), fallback \n (line), cuối cùng cứng
+    let cut = remaining.lastIndexOf("\n\n", maxLen);
+    if (cut === -1 || cut < maxLen / 2) cut = remaining.lastIndexOf("\n", maxLen);
+    if (cut === -1 || cut < maxLen / 2) cut = remaining.lastIndexOf(" ", maxLen);
+    if (cut === -1) cut = maxLen;
+    parts.push(remaining.slice(0, cut).trimEnd());
+    remaining = remaining.slice(cut).trimStart();
+  }
+  return parts;
 }
 
 async function handleTelegramUpdate(env, update) {
