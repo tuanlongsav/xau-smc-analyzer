@@ -2198,8 +2198,7 @@ BB(20): ${latest.bbLower?.toFixed(2)} - ${latest.bbUpper?.toFixed(2)}
       : "";
 
     const tfsLabel = valid.map(v => v.tf).join(" + ");
-    // TF lớn nhất = HTF cho horizon
-    const tfOrder = ["5m", "15m", "1h", "4h", "1d"];
+    // Reuse tfOrder đã khai báo trên cho htfForAux
     const sortedByTime = [...valid].sort((a, b) => tfOrder.indexOf(a.tf) - tfOrder.indexOf(b.tf));
     const htf = sortedByTime[sortedByTime.length - 1].tf;
     const ltf = sortedByTime[0].tf;
