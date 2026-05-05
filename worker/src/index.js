@@ -2147,23 +2147,30 @@ function splitForTelegram(text, maxLen = 3900) {
  * Multi-TF top-down analysis — 1 AI call, 1 unified reply.
  * Khác với loop: cho AI xem data nhiều khung và tự tổng hợp consensus.
  */
-async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh) {
+async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs = []) {
   await sendChatAction(env, chatId, "typing");
   try {
-    // Fetch tất cả TFs parallel
-    const dataArrays = await Promise.all(tfs.map(async tf => {
-      const tdInterval = TF_TO_TD[tf];
-      if (!tdInterval) return null;
-      try {
-        const candles = await fetchTdCandles(env, tdInterval, 220);
-        if (candles.length < 50) return null;
-        const enriched = enrichIndicators(candles);
-        return { tf, latest: enriched[enriched.length - 1], candles };
-      } catch (e) {
-        console.log(`[multi-tf] fetch ${tf} fail: ${e.message}`);
-        return null;
-      }
-    }));
+    // HTF (khung lớn nhất) cho aux interval
+    const tfOrder = ["5m", "15m", "1h", "4h", "1d"];
+    const htfForAux = [...tfs].sort((a, b) => tfOrder.indexOf(a) - tfOrder.indexOf(b))[tfs.length - 1];
+
+    // Fetch tất cả TFs + aux parallel
+    const [dataArrays, auxCtx] = await Promise.all([
+      Promise.all(tfs.map(async tf => {
+        const tdInterval = TF_TO_TD[tf];
+        if (!tdInterval) return null;
+        try {
+          const candles = await fetchTdCandles(env, tdInterval, 220);
+          if (candles.length < 50) return null;
+          const enriched = enrichIndicators(candles);
+          return { tf, latest: enriched[enriched.length - 1], candles };
+        } catch (e) {
+          console.log(`[multi-tf] fetch ${tf} fail: ${e.message}`);
+          return null;
+        }
+      })),
+      getAuxContext(env, auxArgs, htfForAux),
+    ]);
     const valid = dataArrays.filter(Boolean);
     if (valid.length < 2) {
       await sendTelegramTo(env, chatId, "❌ Không fetch đủ data cho combo", replyTo);
@@ -2222,13 +2229,21 @@ QUY TẮC:
 - SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
 - R:R tối thiểu 1:1.5.`;
 
+    const auxBlock = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT (khung ${htfForAux}):
+${formatAuxBlock(auxCtx)}
+
+LƯU Ý: Trong tom_tat / phan_tich_top_down PHẢI nhắc đến tác động DXY/OIL:
+- DXY ↑ → áp lực giảm XAU (correlation nghịch ~-0.7)
+- OIL ↑ → đồng pha tăng XAU (cùng inflation hedge)
+Mâu thuẫn inter-market với consensus → giảm độ tin cậy + thêm vào rui_ro_chinh.` : "";
+
     const userText = `Phân tích TOP-DOWN XAU/USD ${valid.length} khung: ${tfsLabel}.
 Horizon dự báo: ${horizon} (theo HTF ${htf})
 
 DỮ LIỆU TỪNG KHUNG:
 ${tfDataLines}
 
-${pivotStr}
+${pivotStr}${auxBlock}
 
 Trả JSON:
 {
@@ -2272,7 +2287,15 @@ ${valid.map(v => `    "${v.tf}": { "bias": "LONG|SHORT|NEUTRAL", "key_level": <f
       return;
     }
 
-    const html = formatMultiTfHTML(d, valid, horizon, isNhanh);
+    let html = formatMultiTfHTML(d, valid, horizon, isNhanh);
+    if (auxCtx) {
+      const auxLines = formatAuxBlock(auxCtx).split("\n").map(l => htmlEsc(l)).join("\n");
+      html = html.replace(/(<i>[^<]*<\/i>\n)?\n(━━━ <b>📊 Bias)/, `$1${auxLines}\n\n$2`);
+      // Fallback nếu regex không match: prepend
+      if (!html.includes(auxLines)) {
+        html = `${auxLines}\n\n${html}`;
+      }
+    }
     const parts = splitForTelegram(html, 3900);
     for (let i = 0; i < parts.length; i++) {
       const suffix = parts.length > 1 ? `\n\n<i>[${i + 1}/${parts.length}]</i>` : "";
@@ -2421,10 +2444,11 @@ async function handleTelegramUpdate(env, update) {
     return;
   }
   // Combo: /5p15p1h hoặc /nhanh5p15p1h → phân tích TOP-DOWN tổng hợp 1 reply
+  // Optional aux args: oil/dxy/all (vd /5p15p1h all)
   const multi = parseMultiTfCommand(cmd);
   if (multi) {
-    console.log(`[bot] multi-tf ${multi.isNhanh ? "scan" : "analyze"}: ${multi.tfs.join(",")}`);
-    await handleMultiTfAnalyze(env, chatId, replyTo, multi.tfs, multi.isNhanh);
+    console.log(`[bot] multi-tf ${multi.isNhanh ? "scan" : "analyze"}: ${multi.tfs.join(",")} | args=${args.join(",")}`);
+    await handleMultiTfAnalyze(env, chatId, replyTo, multi.tfs, multi.isNhanh, args);
     return;
   }
   // Backward compat: /analyze [tf] hoặc /smc [tf]
