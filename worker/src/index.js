@@ -256,6 +256,39 @@ function computePivots(candle) {
   };
 }
 
+/**
+ * Lấy daily pivots — cache KV theo ngày UTC, auto-rotate khi qua nửa đêm.
+ * Tiết kiệm TwelveData calls (yesterday's daily candle ổn định trong ngày).
+ *
+ * Cron 5p × 288 runs/ngày × 0 TD daily fetch (cache hit) = chỉ 1 TD daily/ngày.
+ */
+async function getCachedDailyPivots(env) {
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, ""); // "20260105"
+  const cacheKey = `daily_pivots:${today}`;
+
+  if (env.CACHE) {
+    const cached = await env.CACHE.get(cacheKey);
+    if (cached) {
+      try { return JSON.parse(cached); } catch {}
+    }
+  }
+
+  // Cache miss → fetch và lưu
+  try {
+    const c1d = await fetchTdCandles(env, "1day", 5);
+    if (c1d.length < 2) return null;
+    const pivots = computePivots(c1d[c1d.length - 2]);
+    if (pivots && env.CACHE) {
+      // TTL 2 ngày — key tự rotate theo date nên không lo leak
+      await env.CACHE.put(cacheKey, JSON.stringify(pivots), { expirationTtl: 172800 });
+    }
+    return pivots;
+  } catch (e) {
+    console.log(`[pivots] daily fetch fail: ${e.message}`);
+    return null;
+  }
+}
+
 // ──────────────────────────────────────────────────────────
 // TwelveData fetch (cron context — direct call, không qua /twelvedata route)
 // ──────────────────────────────────────────────────────────
@@ -719,11 +752,7 @@ async function handlePriceCmd(env, chatId, replyTo) {
     }
     const e = enrichIndicators(c15);
     const l = e[e.length - 1];
-    let pivots = null;
-    try {
-      const c1d = await fetchTdCandles(env, "1day", 5);
-      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
-    } catch {}
+    const pivots = await getCachedDailyPivots(env);
 
     const c = l.close;
 
@@ -798,11 +827,7 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m") {
     }
     const e = enrichIndicators(candles);
     const l = e[e.length - 1];
-    let pivots = null;
-    try {
-      const c1d = await fetchTdCandles(env, "1day", 5);
-      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
-    } catch {}
+    const pivots = await getCachedDailyPivots(env);
 
     const pivotStr = pivots
       ? `Pivots: R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
@@ -907,11 +932,7 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
     const e = enrichIndicators(candles);
     const l = e[e.length - 1];
 
-    let pivots = null;
-    try {
-      const c1d = await fetchTdCandles(env, "1day", 5);
-      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
-    } catch {}
+    const pivots = await getCachedDailyPivots(env);
 
     const last10 = candles.slice(-10).map(c =>
       `O=${c.open.toFixed(2)} H=${c.high.toFixed(2)} L=${c.low.toFixed(2)} C=${c.close.toFixed(2)}`
@@ -1126,11 +1147,7 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh) {
     }
 
     // Pivots từ daily
-    let pivots = null;
-    try {
-      const c1d = await fetchTdCandles(env, "1day", 5);
-      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
-    } catch {}
+    const pivots = await getCachedDailyPivots(env);
 
     // Build prompt với data từng TF
     const tfDataLines = valid.map(({ tf, latest, candles }) => {
@@ -1382,13 +1399,7 @@ async function runAlertCheck(env) {
     const latest = enriched[enriched.length - 1];
     const prev = enriched[enriched.length - 2];
 
-    let pivots = null;
-    try {
-      const c1d = await fetchTdCandles(env, "1day", 5);
-      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
-    } catch (e) {
-      console.log(`[cron] daily fetch failed: ${e.message}`);
-    }
+    const pivots = await getCachedDailyPivots(env);
 
     const alerts = await detectFreshAlerts(env, latest, prev, pivots, enriched);
     if (alerts.length === 0) {

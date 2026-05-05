@@ -17,9 +17,9 @@ id = "124855cf2b474b6fba71e1fc4d08681a"
 [ai]
 binding = "AI"
 
-# Cron Trigger — mỗi 15 phút check kỹ thuật + gửi Telegram alert nếu có
+# Cron Trigger — mỗi 5 phút check kỹ thuật + gửi Telegram alert nếu có
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["*/5 * * * *"]
 
 # Secret cần set bằng tay sau khi deploy:
 #   npx wrangler secret put GEMINI_API_KEY
