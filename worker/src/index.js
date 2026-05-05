@@ -968,6 +968,215 @@ function splitForTelegram(text, maxLen = 3900) {
   return parts;
 }
 
+/**
+ * Multi-TF top-down analysis — 1 AI call, 1 unified reply.
+ * Khác với loop: cho AI xem data nhiều khung và tự tổng hợp consensus.
+ */
+async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh) {
+  await sendChatAction(env, chatId, "typing");
+  try {
+    // Fetch tất cả TFs parallel
+    const dataArrays = await Promise.all(tfs.map(async tf => {
+      const tdInterval = TF_TO_TD[tf];
+      if (!tdInterval) return null;
+      try {
+        const candles = await fetchTdCandles(env, tdInterval, 220);
+        if (candles.length < 50) return null;
+        const enriched = enrichIndicators(candles);
+        return { tf, latest: enriched[enriched.length - 1], candles };
+      } catch (e) {
+        console.log(`[multi-tf] fetch ${tf} fail: ${e.message}`);
+        return null;
+      }
+    }));
+    const valid = dataArrays.filter(Boolean);
+    if (valid.length < 2) {
+      await sendTelegramTo(env, chatId, "❌ Không fetch đủ data cho combo", replyTo);
+      return;
+    }
+
+    // Pivots từ daily
+    let pivots = null;
+    try {
+      const c1d = await fetchTdCandles(env, "1day", 5);
+      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
+    } catch {}
+
+    // Build prompt với data từng TF
+    const tfDataLines = valid.map(({ tf, latest, candles }) => {
+      const last5 = candles.slice(-5).map(c =>
+        `O=${c.open.toFixed(2)} H=${c.high.toFixed(2)} L=${c.low.toFixed(2)} C=${c.close.toFixed(2)}`
+      ).join(" | ");
+      return `--- ${tf.toUpperCase()} ---
+Giá: $${latest.close.toFixed(2)} | RSI: ${latest.rsi?.toFixed(1)}
+EMA 21/50/200: ${latest.ema21?.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}
+SMA 50/200: ${latest.sma50?.toFixed(2)} / ${latest.sma200?.toFixed(2)} ${latest.sma50 > latest.sma200 ? "(golden)" : "(death)"}
+BB(20): ${latest.bbLower?.toFixed(2)} - ${latest.bbUpper?.toFixed(2)}
+5 nến gần: ${last5}`;
+    }).join("\n\n");
+
+    const pivotStr = pivots
+      ? `Pivots (daily): R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
+      : "";
+
+    const tfsLabel = valid.map(v => v.tf).join(" + ");
+    // TF lớn nhất = HTF cho horizon
+    const tfOrder = ["5m", "15m", "1h", "4h", "1d"];
+    const sortedByTime = [...valid].sort((a, b) => tfOrder.indexOf(a.tf) - tfOrder.indexOf(b.tf));
+    const htf = sortedByTime[sortedByTime.length - 1].tf;
+    const ltf = sortedByTime[0].tf;
+    const horizon = TF_HORIZON[htf] || "ngắn-trung hạn";
+
+    const systemText = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC, chuyên top-down multi-timeframe.
+
+NGUYÊN TẮC TOP-DOWN:
+- HTF (khung lớn nhất ${htf}) → định BIAS chính (xu hướng tổng).
+- MTF (khung giữa) → định SETUP (vùng entry/cản).
+- LTF (khung nhỏ ${ltf}) → định ENTRY TIMING + confirm.
+- Khuyến nghị PHẢI dựa trên hợp lực 3 khung. Nếu các khung mâu thuẫn → ghi rõ ở 'alignment' và giảm độ tin cậy.
+
+QUY TẮC:
+- Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
+- BẮT BUỘC điền field 'by_tf' cho TẤT CẢ ${valid.length} khung — không bỏ sót.
+- Mọi mức giá là số cụ thể (float).
+- SL ngoài vùng nhiễu (>1×ATR cách swing).
+- R:R tối thiểu 1:1.5.`;
+
+    const userText = `Phân tích TOP-DOWN XAU/USD ${valid.length} khung: ${tfsLabel}.
+Horizon dự báo: ${horizon} (theo HTF ${htf})
+
+DỮ LIỆU TỪNG KHUNG:
+${tfDataLines}
+
+${pivotStr}
+
+Trả JSON:
+{
+  "consensus_bias": "LONG | SHORT | NEUTRAL",
+  "alignment": "all_align | majority | divergent",
+  "do_tin_cay": "thấp | trung bình | cao",
+  "tom_tat": "1-2 câu summary top-down (vd '1d bullish, 4h consolidate, 1h pullback về EMA21')",
+  "by_tf": {
+${valid.map(v => `    "${v.tf}": { "bias": "LONG|SHORT|NEUTRAL", "key_level": <float>, "ghi_chu": "1 câu" }`).join(",\n")}
+  },
+  "long": {
+    "kha_thi": true | false,
+    "entry": <float>, "sl": <float>, "tp": <float>, "rr": <float>,
+    "ly_do": "lý do confluence top-down",
+    "dieu_kien_confirm": "..."
+  },
+  "short": { ...same... },
+  "khang_cu": [{"gia": <float>, "ghi_chu": "vd 'HTF resistance + Fib 0.5'"}, ... 2-3 mức],
+  "ho_tro": [{"gia": <float>, "ghi_chu": "..."}, ... 2-3 mức],
+  "phan_tich_top_down": "1-2 đoạn giải thích cách 3 khung bổ trợ hoặc mâu thuẫn nhau, vai trò mỗi khung trong setup",
+  "rui_ro_chinh": ["...", "...", "..."]
+}`;
+
+    const body = {
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: "user", parts: [{ text: userText }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        maxOutputTokens: isNhanh ? 3000 : 4500,
+        temperature: 0.4,
+        thinkingConfig: { thinkingBudget: isNhanh ? 0 : 1500 },
+      },
+    };
+
+    const resp = await callGeminiSmart(env, body);
+    const text = extractText(resp);
+    const d = extractJSON(text);
+    if (!d) {
+      console.log(`[bot] multi-tf parse fail (text len=${(text||"").length}), tail: ${(text||"").slice(-200)}`);
+      await sendTelegramTo(env, chatId, "❌ AI response không hợp lệ. Thử lại.", replyTo);
+      return;
+    }
+
+    const html = formatMultiTfHTML(d, valid, horizon, isNhanh);
+    const parts = splitForTelegram(html, 3900);
+    for (let i = 0; i < parts.length; i++) {
+      const suffix = parts.length > 1 ? `\n\n<i>[${i + 1}/${parts.length}]</i>` : "";
+      await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "HTML");
+    }
+  } catch (e) {
+    await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
+  }
+}
+
+function formatMultiTfHTML(d, valid, horizon, isNhanh) {
+  const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
+  const consensus = (d.consensus_bias || "NEUTRAL").toUpperCase();
+  const consensusIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[consensus] || "❓";
+  const alignment = {
+    "all_align": "✅ Đồng thuận",
+    "majority":  "⚠️ Đa số",
+    "divergent": "❌ Phân vân",
+  }[d.alignment] || htmlEsc(d.alignment || "?");
+
+  const tfsLabel = valid.map(v => v.tf).join(" + ");
+  const prefix = isNhanh ? "Quick" : "SMC";
+
+  let m = `<b>🥇 ${prefix} Top-Down: ${tfsLabel}</b> (horizon ${horizon})\n`;
+  m += `${consensusIcon} Consensus: <b>${consensus}</b> | Tin cậy: <b>${htmlEsc(d.do_tin_cay || "?")}</b> | ${alignment}\n`;
+  if (d.tom_tat) m += `<i>${htmlEsc(d.tom_tat)}</i>\n`;
+
+  // Bias từng TF — luôn show TẤT CẢ valid TFs (dù AI có miss thì hiện "chưa rõ")
+  m += `\n<b>📊 Bias từng khung:</b>\n`;
+  const byTf = d.by_tf || {};
+  for (const v of valid) {
+    // Try multiple key variants AI có thể dùng
+    const b = byTf[v.tf] || byTf[v.tf.replace("m", "p")] || byTf[v.tf.toUpperCase()];
+    if (!b) {
+      m += `• <b>${v.tf}</b>: <i>chưa có (AI thiếu data)</i>\n`;
+      continue;
+    }
+    const bIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[String(b.bias || "").toUpperCase()] || "•";
+    m += `${bIcon} <b>${v.tf}</b>: ${htmlEsc(b.bias || "?")}`;
+    if (b.key_level) m += ` | $${fmt2(b.key_level)}`;
+    if (b.ghi_chu) m += ` <i>— ${htmlEsc(b.ghi_chu)}</i>`;
+    m += `\n`;
+  }
+
+  m += `\n━━━ <b>🎯 KHUYẾN NGHỊ</b> ━━━\n\n`;
+
+  const scenarioBlock = (sc, label, icon) => {
+    if (!sc?.kha_thi) {
+      return `${icon} <b>${label}</b>: ❌ không khả thi\n<i>${htmlEsc(sc?.ly_do || "Chưa thuận")}</i>`;
+    }
+    let s = `${icon} <b>${label}</b> ✅`;
+    if (sc.rr != null) s += ` | R:R: <b>${Number(sc.rr).toFixed(1)}</b>`;
+    s += `\nEntry: <b>$${fmt2(sc.entry)}</b>\n`;
+    s += `SL: <b>$${fmt2(sc.sl)}</b> | TP: <b>$${fmt2(sc.tp)}</b>\n`;
+    if (sc.dieu_kien_confirm) s += `Confirm: ${htmlEsc(sc.dieu_kien_confirm)}\n`;
+    if (sc.ly_do) s += `<i>${htmlEsc(sc.ly_do)}</i>`;
+    return s;
+  };
+
+  m += scenarioBlock(d.long, "LONG", "📈") + "\n\n";
+  m += scenarioBlock(d.short, "SHORT", "📉") + "\n\n";
+
+  if ((Array.isArray(d.khang_cu) && d.khang_cu.length) || (Array.isArray(d.ho_tro) && d.ho_tro.length)) {
+    m += `<b>📍 Mức giá quan trọng:</b>\n`;
+    for (const k of (d.khang_cu || [])) {
+      m += `▲ <b>$${fmt2(k.gia)}</b>${k.ghi_chu ? ` <i>— ${htmlEsc(k.ghi_chu)}</i>` : ""}\n`;
+    }
+    for (const h of (d.ho_tro || [])) {
+      m += `▼ <b>$${fmt2(h.gia)}</b>${h.ghi_chu ? ` <i>— ${htmlEsc(h.ghi_chu)}</i>` : ""}\n`;
+    }
+    m += `\n`;
+  }
+
+  m += `━━━ <b>📊 PHÂN TÍCH TOP-DOWN</b> ━━━\n`;
+  if (d.phan_tich_top_down) m += htmlEsc(d.phan_tich_top_down) + "\n\n";
+
+  if (Array.isArray(d.rui_ro_chinh) && d.rui_ro_chinh.length) {
+    m += `<b>⚠️ Rủi ro:</b>\n`;
+    for (const r of d.rui_ro_chinh) m += `• ${htmlEsc(r)}\n`;
+  }
+
+  return m;
+}
+
 async function handleTelegramUpdate(env, update) {
   const msg = update.message || update.channel_post;
   if (!msg?.text) return;
@@ -1008,20 +1217,11 @@ async function handleTelegramUpdate(env, update) {
     await handleAnalyzeCmd(env, chatId, replyTo, VN_CMD_TO_TF[cmd]);
     return;
   }
-  // Combo: /5p15p1h (chi tiết 3 khung) hoặc /nhanh5p15p1h (nhanh 3 khung)
+  // Combo: /5p15p1h hoặc /nhanh5p15p1h → phân tích TOP-DOWN tổng hợp 1 reply
   const multi = parseMultiTfCommand(cmd);
   if (multi) {
     console.log(`[bot] multi-tf ${multi.isNhanh ? "scan" : "analyze"}: ${multi.tfs.join(",")}`);
-    // Header thông báo bot bắt đầu
-    await sendTelegramTo(env, chatId, `⏳ ${multi.isNhanh ? "Quick scan" : "Phân tích SMC"} ${multi.tfs.length} khung: ${multi.tfs.join(", ")}`, replyTo);
-    // Sequential — tránh hit Gemini RPM + giúp user theo dõi từng kết quả
-    for (const tf of multi.tfs) {
-      if (multi.isNhanh) {
-        await handleScanCmd(env, chatId, null, tf);  // không reply quote (group nhiều TF rối)
-      } else {
-        await handleAnalyzeCmd(env, chatId, null, tf);
-      }
-    }
+    await handleMultiTfAnalyze(env, chatId, replyTo, multi.tfs, multi.isNhanh);
     return;
   }
   // Backward compat: /analyze [tf] hoặc /smc [tf]
