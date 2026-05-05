@@ -549,23 +549,137 @@ async function sendTelegram(env, text) {
   }
 }
 
+// Helper: trend assessment từ EMA alignment + price position
+function getTrendAssessment(latest) {
+  if (!latest.ema200 || !latest.ema50 || !latest.ema21) return null;
+  const c = latest.close;
+  if (c > latest.ema200 && latest.ema21 > latest.ema50 && latest.ema50 > latest.ema200)
+    return { label: "Tăng mạnh", emoji: "🚀", note: "EMA21>50>200, giá trên EMA200" };
+  if (c > latest.ema50 && c > latest.ema200)
+    return { label: "Tăng", emoji: "🟢", note: "Giá trên EMA50 và EMA200" };
+  if (c < latest.ema200 && latest.ema21 < latest.ema50 && latest.ema50 < latest.ema200)
+    return { label: "Giảm mạnh", emoji: "🔻", note: "EMA21<50<200, giá dưới EMA200" };
+  if (c < latest.ema50 && c < latest.ema200)
+    return { label: "Giảm", emoji: "🔴", note: "Giá dưới EMA50 và EMA200" };
+  return { label: "Sideways", emoji: "↔️", note: "Giá giữa các EMA, chưa rõ trend" };
+}
+
+// Helper: collect key levels around current price
+function getKeyLevelsAround(latest, pivots, currentPrice) {
+  const levels = [];
+  const add = (price, label) => {
+    if (price != null && !isNaN(price)) levels.push({ price, label });
+  };
+  add(latest.bbUpper, "BB upper");
+  add(latest.bbLower, "BB lower");
+  add(latest.ema21, "EMA 21");
+  add(latest.ema50, "EMA 50");
+  add(latest.ema200, "EMA 200");
+  add(latest.recentHigh, "High 50 nến");
+  add(latest.recentLow, "Low 50 nến");
+  if (pivots) {
+    add(pivots.r2, "Pivot R2"); add(pivots.r1, "Pivot R1");
+    add(pivots.s1, "Pivot S1"); add(pivots.s2, "Pivot S2");
+  }
+  return {
+    above: levels.filter(l => l.price > currentPrice).sort((a, b) => a.price - b.price).slice(0, 3),
+    below: levels.filter(l => l.price < currentPrice).sort((a, b) => b.price - a.price).slice(0, 3),
+  };
+}
+
+// Helper: tạo 2-3 kịch bản dựa trên alert types + trend + levels
+function generateScenarios(alerts, trend, lv, latest) {
+  const scenarios = [];
+  const c = latest.close;
+  const isUptrend = trend?.label.includes("Tăng");
+  const isDowntrend = trend?.label.includes("Giảm");
+
+  const hasRsiExt = alerts.some(a => /RSI quá/.test(a.text));
+  const hasBbBreak = alerts.some(a => /BB upper|BB lower/.test(a.text));
+  const hasLiqSweep = alerts.some(a => /sweep/i.test(a.text));
+  const hasPivotBreak = alerts.some(a => /pivot/i.test(a.text));
+  const hasCross = alerts.some(a => /Cross|cắt/.test(a.text));
+
+  // 1. Tiếp diễn theo trend
+  if (isUptrend && lv.above[0]) {
+    scenarios.push(`Tiếp diễn *TĂNG*: phá ${lv.above[0].label} *$${lv.above[0].price.toFixed(2)}* → target ${lv.above[1] ? `*$${lv.above[1].price.toFixed(2)}*` : "mức cao kế tiếp"}`);
+  }
+  if (isDowntrend && lv.below[0]) {
+    scenarios.push(`Tiếp diễn *GIẢM*: phá ${lv.below[0].label} *$${lv.below[0].price.toFixed(2)}* → target ${lv.below[1] ? `*$${lv.below[1].price.toFixed(2)}*` : "mức thấp kế tiếp"}`);
+  }
+
+  // 2. Pullback (RSI extreme hoặc BB break trong trend)
+  if (hasRsiExt || hasBbBreak) {
+    if (isUptrend && lv.below[0]) {
+      scenarios.push(`Pullback nhẹ về ${lv.below[0].label} *$${lv.below[0].price.toFixed(2)}* → bounce continue trend`);
+    } else if (isDowntrend && lv.above[0]) {
+      scenarios.push(`Bounce nhẹ về ${lv.above[0].label} *$${lv.above[0].price.toFixed(2)}* → reject continue down`);
+    }
+  }
+
+  // 3. Reversal (liquidity sweep)
+  if (hasLiqSweep) {
+    const isUpSweep = alerts.some(a => /sweep TRÊN/.test(a.text));
+    if (isUpSweep && lv.below[1]) {
+      scenarios.push(`Đảo chiều *BEARISH* (smart money quét stop trên) → đẩy xuống *$${lv.below[1].price.toFixed(2)}*`);
+    } else if (!isUpSweep && lv.above[1]) {
+      scenarios.push(`Đảo chiều *BULLISH* (smart money quét stop dưới) → đẩy lên *$${lv.above[1].price.toFixed(2)}*`);
+    }
+  }
+
+  // 4. Cross signal — trend change scenarios
+  if (hasCross && scenarios.length < 3) {
+    if (lv.above[0] && lv.below[0]) {
+      scenarios.push(`Cross báo trend đổi → watch close ${isUptrend ? "trên" : "dưới"} *$${(isUptrend ? lv.above[0] : lv.below[0]).price.toFixed(2)}* để confirm`);
+    }
+  }
+
+  // Default fallback
+  if (scenarios.length === 0 && lv.above[0] && lv.below[0]) {
+    scenarios.push(`Sideways trong vùng *$${lv.below[0].price.toFixed(2)}* – *$${lv.above[0].price.toFixed(2)}*`);
+    scenarios.push(`Break ra ngoài vùng → đi theo hướng break (>1×ATR ${latest.atr?.toFixed(1)})`);
+  }
+
+  return scenarios.slice(0, 3);
+}
+
 function formatAlertMessage(latest, alerts, pivots) {
   const t = new Date().toISOString().slice(0, 16).replace("T", " ");
   let m = `🥇 *XAU/USD Alert* (15m)\n`;
   m += `Giá: *$${latest.close.toFixed(2)}* — ${t} UTC\n\n`;
+
   m += `*Setups vừa kích hoạt:*\n`;
   for (const a of alerts) {
     m += `${a.icon} ${a.text}\n`;
     if (a.suggestion) m += `   💡 _${a.suggestion}_\n`;
   }
-  m += `\n*Indicators:*\n`;
-  if (latest.rsi != null) m += `• RSI(14): ${latest.rsi.toFixed(1)} | ATR: ${latest.atr?.toFixed(2)}\n`;
-  if (latest.ema21 != null) m += `• EMA 21/50/200: ${latest.ema21.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}\n`;
-  if (latest.bbUpper != null) m += `• BB(20): ${latest.bbLower.toFixed(2)} - ${latest.bbUpper.toFixed(2)}\n`;
+
+  // Trend assessment
+  const trend = getTrendAssessment(latest);
+  if (trend) {
+    m += `\n📈 *Xu hướng:* ${trend.emoji} ${trend.label}\n`;
+    m += `   _${trend.note}_\n`;
+  }
+
+  // Mức cần quan sát
+  const lv = getKeyLevelsAround(latest, pivots, latest.close);
+  if (lv.above.length || lv.below.length) {
+    m += `\n📍 *Mức cần quan sát:*\n`;
+    for (const l of lv.above) m += `▲ *$${l.price.toFixed(2)}* ${l.label} _(+${(l.price - latest.close).toFixed(2)})_\n`;
+    for (const l of lv.below) m += `▼ *$${l.price.toFixed(2)}* ${l.label} _(-${(latest.close - l.price).toFixed(2)})_\n`;
+  }
+
+  // Kịch bản có thể
+  const scenarios = generateScenarios(alerts, trend, lv, latest);
+  if (scenarios.length) {
+    m += `\n🔮 *Kịch bản có thể:*\n`;
+    scenarios.forEach((s, i) => { m += `${i + 1}. ${s}\n`; });
+  }
+
+  // Indicators compact
+  m += `\n_RSI ${latest.rsi?.toFixed(1)} | ATR ${latest.atr?.toFixed(2)} | EMA ${latest.ema21?.toFixed(0)}/${latest.ema50?.toFixed(0)}/${latest.ema200?.toFixed(0)}_\n`;
   if (pivots) {
-    m += `\n*Pivots (daily):*\n`;
-    m += `R2 $${pivots.r2.toFixed(2)} | R1 $${pivots.r1.toFixed(2)} | PP $${pivots.pp.toFixed(2)}\n`;
-    m += `S1 $${pivots.s1.toFixed(2)} | S2 $${pivots.s2.toFixed(2)}\n`;
+    m += `_Pivots: R2 ${pivots.r2.toFixed(1)} | R1 ${pivots.r1.toFixed(1)} | PP ${pivots.pp.toFixed(1)} | S1 ${pivots.s1.toFixed(1)} | S2 ${pivots.s2.toFixed(1)}_\n`;
   }
   m += `\n[Mở app](https://xau-smc-analyzer.pages.dev/)`;
   return m;
