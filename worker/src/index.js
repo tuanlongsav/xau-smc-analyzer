@@ -60,6 +60,31 @@ function collectGeminiKeys(env) {
     .filter(s => !!s.key);
 }
 
+// ──────────────────────────────────────────────────────────
+// Smart rotation: track key state per Worker isolate
+// 429 (rate limit/quota) → cooldown 60s
+// 400/500/etc → cooldown 2 phút (có thể do Worker DC hiện tại không support;
+//   sau 2 phút DC có thể đã đổi → retry)
+// 200 success → reset state
+// ──────────────────────────────────────────────────────────
+const keyState = new Map();
+const COOLDOWN_429_MS  = 60_000;
+const COOLDOWN_OTHER_MS = 120_000;
+
+function isKeyOnCooldown(label) {
+  const s = keyState.get(label);
+  return s && Date.now() < s.until;
+}
+
+function markKeyCooldown(label, status) {
+  const dur = status === 429 ? COOLDOWN_429_MS : COOLDOWN_OTHER_MS;
+  keyState.set(label, { until: Date.now() + dur, lastStatus: status });
+}
+
+function clearKeyCooldown(label) {
+  keyState.delete(label);
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
@@ -72,10 +97,20 @@ export default {
 
     // Health check + diagnostic location (debug Smart Placement)
     if (url.pathname === "/" || url.pathname === "/health") {
+      const allKeys = collectGeminiKeys(env);
+      const cooldownState = {};
+      for (const k of allKeys) {
+        const s = keyState.get(k.label);
+        const remaining = s ? Math.max(0, Math.floor((s.until - Date.now()) / 1000)) : 0;
+        cooldownState[k.label] = remaining > 0
+          ? `cooldown ${remaining}s (last status ${s.lastStatus})`
+          : "active";
+      }
       return jsonResponse(200, {
         ok: true,
         service: "xau-gemini-proxy",
-        gemini_keys_count: collectGeminiKeys(env).length,
+        gemini_keys_count: allKeys.length,
+        gemini_keys_state: cooldownState,
         hasTwelveDataKey: !!env.TWELVEDATA_API_KEY,
         worker_dc: request.cf?.colo || "unknown",
         worker_country: request.cf?.country || "unknown",
@@ -84,6 +119,7 @@ export default {
           "/v1beta/models/{model}:generateContent",
           "/twelvedata/time_series",
           "/twelvedata/price",
+          "/probe",
         ],
       }, origin);
     }
@@ -92,6 +128,39 @@ export default {
     // (preflight already handled; this catches direct curl-like calls without origin too)
     if (!isAllowedOrigin(origin)) {
       return jsonResponse(403, { error: "Origin không được phép" }, origin);
+    }
+
+    // Diagnostic endpoint: probe từng Gemini key, trả status + error message ngắn
+    // (Allow cả khi không có Origin để dễ curl debug — nhưng không leak key)
+    if (url.pathname === "/probe" || (url.pathname === "/probe-public" && true)) {
+      const keys = collectGeminiKeys(env);
+      const results = [];
+      for (const { key, label } of keys) {
+        try {
+          const r = await fetch(`${GOOGLE_BASE}/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: "hi" }] }],
+              generationConfig: { maxOutputTokens: 1 },
+            }),
+          });
+          const text = await r.text();
+          let errMsg = "";
+          try { errMsg = JSON.parse(text).error?.message || ""; } catch {}
+          results.push({
+            label,
+            status: r.status,
+            ok: r.ok,
+            // Mask key, chỉ giữ 4 ký tự cuối
+            key_suffix: "..." + key.slice(-6),
+            error: errMsg.slice(0, 180),
+          });
+        } catch (e) {
+          results.push({ label, status: 0, error: e.message });
+        }
+      }
+      return jsonResponse(200, { worker_dc: request.cf?.colo, results }, origin);
     }
 
     // ──────────────────────────────────────────────────────────
@@ -154,19 +223,28 @@ export default {
     }
     const model = match[1];
 
-    // Multi-key rotation: thử primary → backup → key_3 → key_4 → key_5
-    const keys = collectGeminiKeys(env);
-    if (keys.length === 0) {
+    // Multi-key rotation: smart skip keys đang cooldown.
+    const allKeys = collectGeminiKeys(env);
+    if (allKeys.length === 0) {
       return jsonResponse(500, {
         error: "Worker chưa cấu hình GEMINI_API_KEY. Chạy: wrangler secret put GEMINI_API_KEY",
       }, origin);
+    }
+
+    // Filter: bỏ qua keys đang cooldown. Nếu tất cả đều cooldown → fallback try all.
+    const activeKeys = allKeys.filter(k => !isKeyOnCooldown(k.label));
+    const tryKeys = activeKeys.length > 0 ? activeKeys : allKeys;
+    if (activeKeys.length === 0) {
+      console.log("[gemini] all keys on cooldown, trying all anyway");
+      // Reset cooldown nếu fallback (mọi key đều bị block thì có thể tình trạng đã thay đổi)
+      keyState.clear();
     }
 
     const body = await request.text();
     let upstream = null;
     let lastError = null;
 
-    for (const { key, label } of keys) {
+    for (const { key, label } of tryKeys) {
       const targetUrl = `${GOOGLE_BASE}/v1beta/models/${model}:generateContent?key=${key}`;
       try {
         upstream = await fetch(targetUrl, {
@@ -177,12 +255,17 @@ export default {
       } catch (e) {
         lastError = e;
         upstream = null;
+        console.log(`[gemini] ${label} fetch error: ${e.message}`);
         continue;
       }
-      // Bất kỳ 429 nào (quota daily, RPM, concurrency...) → rotate sang key tiếp theo.
-      // Mỗi key có quota/rate-limit độc lập nên rotate luôn an toàn, không cần phân biệt.
-      if (upstream.status !== 429) break;
-      console.log(`[gemini] ${label} key 429, rotating to next key`);
+      console.log(`[gemini] ${label} status=${upstream.status}`);
+      if (upstream.status === 200) {
+        clearKeyCooldown(label);  // success → reset state
+        break;
+      }
+      // Bất kỳ non-200 → mark cooldown + thử key tiếp theo
+      // (429 = rate limit, 400 = location/setup khác key, 503 = overload)
+      markKeyCooldown(label, upstream.status);
     }
 
     if (!upstream) {
