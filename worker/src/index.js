@@ -193,8 +193,35 @@ function bollinger(closes, period = 20, mult = 2) {
   return { upper: u, lower: l };
 }
 
+function atr(highs, lows, closes, period = 14) {
+  const trs = closes.map((c, i) => {
+    if (i === 0) return highs[i] - lows[i];
+    return Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1])
+    );
+  });
+  return wilder(trs, period);
+}
+
+function rollingMax(values, period) {
+  return values.map((_, i) => {
+    if (i < period - 1) return null;
+    return Math.max(...values.slice(i - period + 1, i + 1));
+  });
+}
+function rollingMin(values, period) {
+  return values.map((_, i) => {
+    if (i < period - 1) return null;
+    return Math.min(...values.slice(i - period + 1, i + 1));
+  });
+}
+
 function enrichIndicators(candles) {
   const closes = candles.map(c => c.close);
+  const highs = candles.map(c => c.high);
+  const lows = candles.map(c => c.low);
   const e21 = ema(closes, 21);
   const e50 = ema(closes, 50);
   const e200 = ema(closes, 200);
@@ -202,12 +229,18 @@ function enrichIndicators(candles) {
   const s200 = sma(closes, 200);
   const r14 = rsi(closes, 14);
   const { upper: bu, lower: bl } = bollinger(closes, 20, 2);
+  const atr14 = atr(highs, lows, closes, 14);
+  const rh50 = rollingMax(highs, 50);
+  const rl50 = rollingMin(lows, 50);
   return candles.map((c, i) => ({
     ...c,
     ema21: e21[i], ema50: e50[i], ema200: e200[i],
     sma50: s50[i], sma200: s200[i],
     rsi: r14[i],
     bbUpper: bu[i], bbLower: bl[i],
+    atr: atr14[i],
+    recentHigh: rh50[i],
+    recentLow: rl50[i],
   }));
 }
 
@@ -259,46 +292,56 @@ async function markAlerted(env, key) {
   await env.CACHE.put(`alert:${key}`, String(Date.now()), { expirationTtl: 7200 });
 }
 
-async function detectFreshAlerts(env, latest, prev, pivots) {
+async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
   const out = [];
-  const push = async (key, icon, text) => {
+  const push = async (key, icon, text, suggestion = null) => {
     if (await alertCooldownOk(env, key)) {
-      out.push({ icon, text });
+      out.push({ icon, text, suggestion });
       await markAlerted(env, key);
     }
   };
 
-  // RSI extreme (state-based, dedup 1h)
+  // ── 1. RSI extreme ──
   if (latest.rsi != null) {
-    if (latest.rsi > 75) await push("rsi_overbought", "🔴", `RSI quá mua *${latest.rsi.toFixed(1)}* — coi chừng điều chỉnh`);
-    if (latest.rsi < 25) await push("rsi_oversold", "🟢", `RSI quá bán *${latest.rsi.toFixed(1)}* — khả năng hồi phục`);
+    if (latest.rsi > 75)
+      await push("rsi_overbought", "🔴", `RSI quá mua *${latest.rsi.toFixed(1)}* — coi chừng điều chỉnh`,
+        "Watch BB upper / Pivot R1 cho rejection. Không chase long.");
+    if (latest.rsi < 25)
+      await push("rsi_oversold", "🟢", `RSI quá bán *${latest.rsi.toFixed(1)}* — khả năng hồi phục`,
+        "Watch hỗ trợ S1/Recent Low cho bounce. Đợi confirm trước khi long.");
   }
 
-  // BB breakout (event-based, vừa cross)
+  // ── 2. Bollinger breakout ──
   if (latest.bbUpper != null && prev.bbUpper != null) {
     if (latest.close > latest.bbUpper && prev.close <= prev.bbUpper)
-      await push("bb_up", "📈", `Vượt BB upper *$${latest.bbUpper.toFixed(2)}* — momentum tăng mạnh`);
+      await push("bb_up", "📈", `Vượt BB upper *$${latest.bbUpper.toFixed(2)}* — momentum tăng mạnh`,
+        "BB break thường tiếp diễn 3-5 nến. Watch retest BB upper làm hỗ trợ.");
     if (latest.close < latest.bbLower && prev.close >= prev.bbLower)
-      await push("bb_dn", "📉", `Phá BB lower *$${latest.bbLower.toFixed(2)}* — momentum giảm mạnh`);
+      await push("bb_dn", "📉", `Phá BB lower *$${latest.bbLower.toFixed(2)}* — momentum giảm mạnh`,
+        "BB break thường tiếp diễn. Watch retest BB lower làm kháng cự.");
   }
 
-  // Golden / Death Cross (SMA 50/200)
+  // ── 3. Golden/Death Cross ──
   if (prev.sma50 != null && prev.sma200 != null && latest.sma50 != null && latest.sma200 != null) {
     if (prev.sma50 <= prev.sma200 && latest.sma50 > latest.sma200)
-      await push("golden", "⭐", `*Golden Cross* (SMA50 cắt lên SMA200) — bull trend dài hạn`);
+      await push("golden", "⭐", `*Golden Cross* (SMA50 cắt lên SMA200) — bull trend dài hạn`,
+        "Tín hiệu trend reversal mạnh. Ưu tiên buy-the-dip về EMA21/50.");
     if (prev.sma50 >= prev.sma200 && latest.sma50 < latest.sma200)
-      await push("death", "💀", `*Death Cross* (SMA50 cắt xuống SMA200) — bear trend dài hạn`);
+      await push("death", "💀", `*Death Cross* (SMA50 cắt xuống SMA200) — bear trend dài hạn`,
+        "Tín hiệu trend reversal mạnh. Ưu tiên sell-the-rally về EMA21/50.");
   }
 
-  // EMA 21/50 cross (short-term)
+  // ── 4. EMA 21/50 cross ──
   if (prev.ema21 != null && prev.ema50 != null && latest.ema21 != null && latest.ema50 != null) {
     if (prev.ema21 <= prev.ema50 && latest.ema21 > latest.ema50)
-      await push("ema_up", "📊", "EMA21 cắt lên EMA50 — short-term bullish");
+      await push("ema_up", "📊", "EMA21 cắt lên EMA50 — short-term bullish",
+        "Momentum chuyển sang tăng. Watch close trên EMA50 confirm.");
     if (prev.ema21 >= prev.ema50 && latest.ema21 < latest.ema50)
-      await push("ema_dn", "📊", "EMA21 cắt xuống EMA50 — short-term bearish");
+      await push("ema_dn", "📊", "EMA21 cắt xuống EMA50 — short-term bearish",
+        "Momentum chuyển sang giảm. Watch close dưới EMA50 confirm.");
   }
 
-  // Pivot levels break
+  // ── 5. Pivot break ──
   if (pivots) {
     const levels = [
       { key: "r2", label: "R2", price: pivots.r2 },
@@ -308,9 +351,54 @@ async function detectFreshAlerts(env, latest, prev, pivots) {
     ];
     for (const { key, label, price } of levels) {
       if (prev.close <= price && latest.close > price)
-        await push(`piv_up_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* lên`);
+        await push(`piv_up_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* lên`,
+          `Watch retest ${label} làm hỗ trợ. Mục tiêu mở rộng tới mốc trên.`);
       if (prev.close >= price && latest.close < price)
-        await push(`piv_dn_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* xuống`);
+        await push(`piv_dn_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* xuống`,
+          `Watch retest ${label} làm kháng cự. Mục tiêu mở rộng tới mốc dưới.`);
+    }
+  }
+
+  // ── 6. Biến động giá mạnh trong nến gần nhất (% move) ──
+  if (latest.open && latest.close) {
+    const change = latest.close - latest.open;
+    const changePct = Math.abs(change / latest.open) * 100;
+    if (changePct > 0.4) {  // 0.4% trong 1 nến 15m là đáng kể với XAU
+      const direction = change > 0 ? "TĂNG" : "GIẢM";
+      const icon = change > 0 ? "🚀" : "💥";
+      await push(`big_move_${change > 0 ? "up" : "dn"}`, icon,
+        `Biến động mạnh: ${direction} *${changePct.toFixed(2)}%* nến gần nhất ($${prev.close.toFixed(2)} → $${latest.close.toFixed(2)})`,
+        change > 0
+          ? "Watch follow-through 1-2 nến tới. Có thể continue hoặc retrace 50%."
+          : "Watch hỗ trợ nearest. Có thể oversold bounce hoặc continue down.");
+    }
+  }
+
+  // ── 7. Volatility spike (ATR > 1.5x avg gần đây) ──
+  if (latest.atr != null && Array.isArray(candlesEnriched) && candlesEnriched.length >= 30) {
+    const recentAtrs = candlesEnriched.slice(-30, -1).map(c => c.atr).filter(a => a != null);
+    if (recentAtrs.length > 10) {
+      const avgAtr = recentAtrs.reduce((s, a) => s + a, 0) / recentAtrs.length;
+      if (latest.atr > avgAtr * 1.5) {
+        await push("vol_spike", "⚡",
+          `ATR spike: *${latest.atr.toFixed(2)}* (${(latest.atr / avgAtr).toFixed(1)}x avg)`,
+          "Volatility cao bất thường — đợi candle close trước khi entry, mở rộng SL.");
+      }
+    }
+  }
+
+  // ── 8. Liquidity sweep (wick break recent high/low rồi close back) ──
+  if (prev.recentHigh != null && prev.recentLow != null) {
+    // Sweep above: high vượt prev's recent high, close lại < prev's recent high
+    if (latest.high > prev.recentHigh && latest.close < prev.recentHigh) {
+      await push("liq_sweep_up", "🎣",
+        `Liquidity sweep TRÊN — wick $${latest.high.toFixed(2)} vượt $${prev.recentHigh.toFixed(2)} rồi close lại trong`,
+        "Tín hiệu reversal bearish phổ biến (smart money quét stop). Watch RSI divergence + close dưới EMA21.");
+    }
+    if (latest.low < prev.recentLow && latest.close > prev.recentLow) {
+      await push("liq_sweep_dn", "🎣",
+        `Liquidity sweep DƯỚI — wick $${latest.low.toFixed(2)} phá $${prev.recentLow.toFixed(2)} rồi close lại trong`,
+        "Tín hiệu reversal bullish (stop hunt). Watch close trên EMA21 + RSI confirm.");
     }
   }
 
@@ -350,9 +438,12 @@ function formatAlertMessage(latest, alerts, pivots) {
   let m = `🥇 *XAU/USD Alert* (15m)\n`;
   m += `Giá: *$${latest.close.toFixed(2)}* — ${t} UTC\n\n`;
   m += `*Setups vừa kích hoạt:*\n`;
-  for (const a of alerts) m += `${a.icon} ${a.text}\n`;
+  for (const a of alerts) {
+    m += `${a.icon} ${a.text}\n`;
+    if (a.suggestion) m += `   💡 _${a.suggestion}_\n`;
+  }
   m += `\n*Indicators:*\n`;
-  if (latest.rsi != null) m += `• RSI(14): ${latest.rsi.toFixed(1)}\n`;
+  if (latest.rsi != null) m += `• RSI(14): ${latest.rsi.toFixed(1)} | ATR: ${latest.atr?.toFixed(2)}\n`;
   if (latest.ema21 != null) m += `• EMA 21/50/200: ${latest.ema21.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}\n`;
   if (latest.bbUpper != null) m += `• BB(20): ${latest.bbLower.toFixed(2)} - ${latest.bbUpper.toFixed(2)}\n`;
   if (pivots) {
@@ -1299,9 +1390,9 @@ async function runAlertCheck(env) {
       console.log(`[cron] daily fetch failed: ${e.message}`);
     }
 
-    const alerts = await detectFreshAlerts(env, latest, prev, pivots);
+    const alerts = await detectFreshAlerts(env, latest, prev, pivots, enriched);
     if (alerts.length === 0) {
-      console.log(`[cron] no fresh alerts, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)}`);
+      console.log(`[cron] no fresh alerts, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)}`);
       return;
     }
     const msg = formatAlertMessage(latest, alerts, pivots);
