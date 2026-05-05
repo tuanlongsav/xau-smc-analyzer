@@ -526,14 +526,19 @@ function helpMessage() {
 
 \`/gia\` — giá hiện tại + indicators (instant)
 
-*Quick scan (ngắn, ~5s):*
-\`/nhanh\` — mặc định 15p
-\`/nhanh5p\` \`/nhanh15p\` \`/nhanh1h\` \`/nhanh4h\` \`/nhanh1d\`
+*Quick scan (~5s/khung):*
+\`/nhanh\` (15p mặc định) | \`/nhanh5p\` \`/nhanh15p\` \`/nhanh1h\` \`/nhanh4h\` \`/nhanh1d\`
 
-*Phân tích SMC chi tiết (~15s):*
+*Phân tích SMC chi tiết (~15s/khung):*
 \`/5p\` \`/15p\` \`/1h\` \`/4h\` \`/1d\`
 
-Ví dụ: \`/nhanh1h\` để quick scan khung 1 giờ.
+*Combo nhiều khung (top-down):*
+\`/5p15p1h\` — chi tiết 3 khung intraday
+\`/1h4h1d\` — chi tiết 3 khung HTF
+\`/nhanh5p15p1h\` — quick scan 3 khung
+\`/nhanh1h4h1d\` — quick scan HTF
+
+Combo theo bất kỳ thứ tự: \`/15p1h4h\`, \`/nhanh4h1d\`, ...
 
 App đầy đủ: [xau-smc-analyzer.pages.dev](https://xau-smc-analyzer.pages.dev)`;
 }
@@ -557,6 +562,41 @@ const VN_SCAN_CMD_TO_TF = {
   "/nhanh1d": "1d",
   "/scan": "15m", "/quick": "15m", // backward compat
 };
+
+/**
+ * Parse combo TF command như /5p15p1h hoặc /nhanh5p15p1h.
+ * Trả null nếu không match pattern combo.
+ * @returns {null | { isNhanh: boolean, tfs: string[] }}
+ */
+function parseMultiTfCommand(cmd) {
+  if (!cmd.startsWith("/")) return null;
+  let body = cmd.slice(1).toLowerCase();
+  let isNhanh = false;
+  if (body.startsWith("nhanh")) {
+    isNhanh = true;
+    body = body.slice("nhanh".length);
+  }
+  if (!body) return null;
+  // TF tokens: 5p, 15p, 1h, 4h, 1d (longest match first để 15p không bị parse là 1+5p)
+  const tfMap = { "15p": "15m", "5p": "5m", "1h": "1h", "4h": "4h", "1d": "1d" };
+  const tfTokens = Object.keys(tfMap).sort((a, b) => b.length - a.length); // longest first
+  const tfs = [];
+  let i = 0;
+  while (i < body.length) {
+    let matched = false;
+    for (const tk of tfTokens) {
+      if (body.startsWith(tk, i)) {
+        tfs.push(tfMap[tk]);
+        i += tk.length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) return null;  // có ký tự lạ → không phải combo
+  }
+  if (tfs.length < 2) return null;  // single TF đã có handler riêng
+  return { isNhanh, tfs };
+}
 
 async function handlePriceCmd(env, chatId, replyTo) {
   try {
@@ -968,6 +1008,22 @@ async function handleTelegramUpdate(env, update) {
     await handleAnalyzeCmd(env, chatId, replyTo, VN_CMD_TO_TF[cmd]);
     return;
   }
+  // Combo: /5p15p1h (chi tiết 3 khung) hoặc /nhanh5p15p1h (nhanh 3 khung)
+  const multi = parseMultiTfCommand(cmd);
+  if (multi) {
+    console.log(`[bot] multi-tf ${multi.isNhanh ? "scan" : "analyze"}: ${multi.tfs.join(",")}`);
+    // Header thông báo bot bắt đầu
+    await sendTelegramTo(env, chatId, `⏳ ${multi.isNhanh ? "Quick scan" : "Phân tích SMC"} ${multi.tfs.length} khung: ${multi.tfs.join(", ")}`, replyTo);
+    // Sequential — tránh hit Gemini RPM + giúp user theo dõi từng kết quả
+    for (const tf of multi.tfs) {
+      if (multi.isNhanh) {
+        await handleScanCmd(env, chatId, null, tf);  // không reply quote (group nhiều TF rối)
+      } else {
+        await handleAnalyzeCmd(env, chatId, null, tf);
+      }
+    }
+    return;
+  }
   // Backward compat: /analyze [tf] hoặc /smc [tf]
   if (cmd === "/analyze" || cmd === "/smc" || cmd === "/phantich") {
     await handleAnalyzeCmd(env, chatId, replyTo, args[0] || "15m");
@@ -1141,17 +1197,22 @@ export default {
       }
       const commands = [
         { command: "gia",      description: "Giá XAU + indicators" },
-        { command: "nhanh",    description: "Quick scan AI (15p mặc định)" },
+        { command: "nhanh",    description: "Quick scan (15p mặc định)" },
         { command: "nhanh5p",  description: "Quick scan 5 phút" },
         { command: "nhanh15p", description: "Quick scan 15 phút" },
         { command: "nhanh1h",  description: "Quick scan 1 giờ" },
         { command: "nhanh4h",  description: "Quick scan 4 giờ" },
         { command: "nhanh1d",  description: "Quick scan 1 ngày" },
-        { command: "5p",       description: "SMC chi tiết khung 5 phút" },
-        { command: "15p",      description: "SMC chi tiết khung 15 phút" },
-        { command: "1h",       description: "SMC chi tiết khung 1 giờ" },
-        { command: "4h",       description: "SMC chi tiết khung 4 giờ" },
-        { command: "1d",       description: "SMC chi tiết khung 1 ngày" },
+        { command: "5p",       description: "SMC chi tiết 5 phút" },
+        { command: "15p",      description: "SMC chi tiết 15 phút" },
+        { command: "1h",       description: "SMC chi tiết 1 giờ" },
+        { command: "4h",       description: "SMC chi tiết 4 giờ" },
+        { command: "1d",       description: "SMC chi tiết 1 ngày" },
+        // Combo phổ biến (top-down analysis)
+        { command: "5p15p1h",       description: "SMC 3 khung intraday" },
+        { command: "1h4h1d",        description: "SMC 3 khung HTF" },
+        { command: "nhanh5p15p1h",  description: "Scan 3 khung intraday" },
+        { command: "nhanh1h4h1d",   description: "Scan 3 khung HTF" },
         { command: "help",     description: "Hướng dẫn lệnh" },
       ];
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
