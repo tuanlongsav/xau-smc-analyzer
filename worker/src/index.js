@@ -516,15 +516,15 @@ function interpretAuxImpact(auxCtx) {
   const lines = [];
   if (auxCtx.dxy) {
     const p = auxCtx.dxy.pct24h;
-    if (p > 0.3) lines.push("USD mạnh lên → áp lực GIẢM cho XAU (correlation nghịch)");
-    else if (p < -0.3) lines.push("USD yếu đi → ỦNG HỘ cho XAU");
-    else lines.push("USD đi ngang → ít tác động lên XAU");
+    if (p > 0.3) lines.push("USD mạnh lên → áp lực GIẢM giá (bearish) cho XAU (correlation nghịch ~-0.7)");
+    else if (p < -0.3) lines.push("USD yếu đi → ủng hộ TĂNG giá (bullish) cho XAU");
+    else lines.push("USD đi ngang (sideways) → ít tác động lên XAU");
   }
   if (auxCtx.oil) {
     const p = auxCtx.oil.pct24h;
-    if (p > 0.5) lines.push("Dầu tăng → ĐỒNG PHA bullish với XAU (cùng hedge inflation)");
-    else if (p < -0.5) lines.push("Dầu giảm → áp lực giảm cho XAU");
-    else lines.push("Dầu đi ngang → trung tính với XAU");
+    if (p > 0.5) lines.push("Dầu tăng → đồng pha TĂNG giá (bullish) với XAU (cùng hedge lạm phát)");
+    else if (p < -0.5) lines.push("Dầu giảm → áp lực GIẢM giá (bearish) cho XAU");
+    else lines.push("Dầu đi ngang (sideways) → trung tính với XAU");
   }
   return lines.join(". ") + ".";
 }
@@ -691,14 +691,14 @@ function getTrendAssessment(latest) {
   if (!latest.ema200 || !latest.ema50 || !latest.ema21) return null;
   const c = latest.close;
   if (c > latest.ema200 && latest.ema21 > latest.ema50 && latest.ema50 > latest.ema200)
-    return { label: "Tăng mạnh", emoji: "🚀", note: "EMA21>50>200, giá trên EMA200" };
+    return { label: "Tăng mạnh (Strong Bullish)", emoji: "🚀", note: "EMA21>50>200, giá trên EMA200" };
   if (c > latest.ema50 && c > latest.ema200)
-    return { label: "Tăng", emoji: "🟢", note: "Giá trên EMA50 và EMA200" };
+    return { label: "Tăng (Bullish)", emoji: "🟢", note: "Giá trên EMA50 và EMA200" };
   if (c < latest.ema200 && latest.ema21 < latest.ema50 && latest.ema50 < latest.ema200)
-    return { label: "Giảm mạnh", emoji: "🔻", note: "EMA21<50<200, giá dưới EMA200" };
+    return { label: "Giảm mạnh (Strong Bearish)", emoji: "🔻", note: "EMA21<50<200, giá dưới EMA200" };
   if (c < latest.ema50 && c < latest.ema200)
-    return { label: "Giảm", emoji: "🔴", note: "Giá dưới EMA50 và EMA200" };
-  return { label: "Sideways", emoji: "↔️", note: "Giá giữa các EMA, chưa rõ trend" };
+    return { label: "Giảm (Bearish)", emoji: "🔴", note: "Giá dưới EMA50 và EMA200" };
+  return { label: "Đi ngang (Sideways)", emoji: "↔️", note: "Giá giữa các EMA, chưa rõ xu hướng" };
 }
 
 // Helper: collect key levels around current price (label tiếng Việt)
@@ -1032,8 +1032,16 @@ function glossaryMessage() {
 • Golden Cross — Giao cắt vàng (SMA50 cắt lên SMA200)
 • Death Cross — Giao cắt tử thần (SMA50 cắt xuống SMA200)
 • Divergence — Phân kỳ (RSI/MACD đi ngược price)
-• Overbought/Oversold — Quá mua / Quá bán
-• Breakout — Phá vỡ (cản)
+• Overbought / Oversold — Quá mua / Quá bán
+• Breakout / Breakdown — Phá vỡ kháng cự / Vỡ đáy hỗ trợ
+• Bullish / Bearish — Tăng giá / Giảm giá
+• Sideways / Consolidation — Đi ngang / Tích lũy
+• Reversal / Continuation — Đảo chiều / Tiếp diễn
+• Pullback / Retest — Hồi giá ngược trend / Kiểm tra lại
+• Rejection — Phản ứng từ chối tại cản
+• Exhaustion — Kiệt sức (đà yếu dần)
+• Impulse / Correction — Sóng đẩy / Sóng điều chỉnh
+• Momentum / Volatility — Động lượng / Biến động
 
 *Trading:*
 • Long / Short — Lệnh mua / bán
@@ -1438,7 +1446,12 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m", auxArgs = []) {
     const systemText = `Bạn là chuyên gia TA XAU/USD. Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
 
 NGÔN NGỮ — bilingual cho thuật ngữ:
-- Tiếng Việt trước, tiếng Anh trong ngoặc. VD: "Quá mua (Overbought)", "Phân kỳ (Divergence)", "Đường EMA (Exponential MA)".
+- Tiếng Việt trước, tiếng Anh trong ngoặc. VD:
+  • "tăng giá (bullish)" / "giảm giá (bearish)" / "đi ngang (sideways)"
+  • "phá vỡ (breakout)" / "đảo chiều (reversal)" / "hồi giá (pullback)"
+  • "phân kỳ (divergence)" / "kiệt sức (exhaustion)"
+  • "Quá mua (Overbought)" / "Quá bán (Oversold)"
+  • "Đường EMA" / "Dải Bollinger (BB)"
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
@@ -1580,22 +1593,43 @@ NHIỆM VỤ:
 - Sau đó GIẢI THÍCH bằng tiếng Việt đời thường, dễ hiểu cho người mới.
 
 NGÔN NGỮ — BẮT BUỘC bilingual cho thuật ngữ kỹ thuật:
-- Viết tiếng Việt TRƯỚC, tiếng Anh trong NGOẶC sau. Ví dụ:
+- Viết tiếng Việt TRƯỚC, tiếng Anh trong NGOẶC sau.
+
+Từ vựng common:
+  • bullish → "tăng giá (bullish)"
+  • bearish → "giảm giá (bearish)"
+  • sideways → "đi ngang (sideways)"
+  • consolidation → "tích lũy (consolidation)"
+  • breakout → "phá vỡ (breakout)"
+  • breakdown → "vỡ đáy (breakdown)"
+  • pullback → "hồi giá (pullback)"
+  • retest → "kiểm tra lại (retest)"
+  • rejection → "phản ứng từ chối (rejection)"
+  • reversal → "đảo chiều (reversal)"
+  • continuation → "tiếp diễn (continuation)"
+  • divergence → "phân kỳ (divergence)"
+  • exhaustion → "kiệt sức (exhaustion)"
+  • momentum → "động lượng (momentum)"
+  • volatility → "biến động (volatility)"
+  • impulse → "sóng đẩy (impulse)"
+  • correction → "sóng điều chỉnh (correction)"
+  • swing high/low → "đỉnh/đáy swing"
+
+Từ SMC + indicators:
   • "Phá vỡ cấu trúc (BOS — Break of Structure)"
   • "Đổi tính chất (CHOCH — Change of Character)"
   • "Khối lệnh (OB — Order Block)"
   • "Khoảng trống công bằng (FVG — Fair Value Gap)"
   • "Quét thanh khoản (Liquidity Sweep)"
-  • "Phân kỳ tăng/giảm (Bullish/Bearish Divergence)"
-  • "Giao cắt vàng (Golden Cross)" / "Giao cắt tử thần (Death Cross)"
+  • "Giao cắt vàng/tử thần (Golden/Death Cross)"
   • "Nến rút râu đáy (Hammer)" / "Nến nhấn chìm (Engulfing)"
   • "Đường trung bình động hàm mũ (EMA)"
   • "Dải Bollinger (BB)"
   • "Biên độ thực trung bình (ATR)"
   • "Điểm xoay (Pivot Point)"
-  • "Khung lớn / Khung trung / Khung nhỏ (HTF/MTF/LTF)"
+  • "Khung lớn/trung/nhỏ (HTF/MTF/LTF)"
   • "Mua / Bán / Đứng ngoài (Long / Short / Wait)"
-  • "Điểm vào lệnh / Cắt lỗ / Chốt lời (Entry / SL / TP)"
+  • "Điểm vào / Cắt lỗ / Chốt lời (Entry / SL / TP)"
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
@@ -1854,8 +1888,12 @@ NGUYÊN TẮC TOP-DOWN:
 
 NGÔN NGỮ — bilingual cho thuật ngữ:
 - Tiếng Việt trước, tiếng Anh trong ngoặc. VD:
-  "Phá vỡ cấu trúc (BOS)", "Khối lệnh (OB)", "Quét thanh khoản (Liquidity Sweep)",
-  "Phân kỳ (Divergence)", "Đường trung bình EMA", "Dải Bollinger (BB)".
+  • "tăng giá (bullish)" / "giảm giá (bearish)" / "đi ngang (sideways)"
+  • "Phá vỡ cấu trúc (BOS)" / "Đổi tính chất (CHOCH)"
+  • "Khối lệnh (OB)" / "Khoảng trống công bằng (FVG)"
+  • "Quét thanh khoản (Liquidity Sweep)" / "Phân kỳ (Divergence)"
+  • "Đường trung bình EMA" / "Dải Bollinger (BB)" / "Biên độ ATR"
+  • "Khung lớn/trung/nhỏ (HTF/MTF/LTF)"
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
