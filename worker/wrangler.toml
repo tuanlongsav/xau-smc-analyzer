@@ -8,6 +8,15 @@ compatibility_date = "2025-05-01"
 [placement]
 mode = "smart"
 
+# KV namespace cho cache phản hồi Gemini (dedup requests cùng nội dung)
+[[kv_namespaces]]
+binding = "CACHE"
+id = "124855cf2b474b6fba71e1fc4d08681a"
+
+# Workers AI binding — fallback khi tất cả Gemini keys fail
+[ai]
+binding = "AI"
+
 # Secret cần set bằng tay sau khi deploy:
 #   npx wrangler secret put GEMINI_API_KEY
 #   npx wrangler secret put GEMINI_API_KEY_BACKUP

@@ -85,6 +85,84 @@ function clearKeyCooldown(label) {
   keyState.delete(label);
 }
 
+// ──────────────────────────────────────────────────────────
+// KV cache helpers
+// ──────────────────────────────────────────────────────────
+const CACHE_TTL_S = 300; // 5 phút
+
+async function hashBody(body) {
+  const data = new TextEncoder().encode(body);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
+}
+
+async function cacheGet(env, key) {
+  if (!env.CACHE) return null;
+  try { return await env.CACHE.get(key); } catch { return null; }
+}
+
+async function cachePut(env, key, value) {
+  if (!env.CACHE) return;
+  try { await env.CACHE.put(key, value, { expirationTtl: CACHE_TTL_S }); } catch {}
+}
+
+// ──────────────────────────────────────────────────────────
+// Workers AI fallback (Llama 3.3 70B)
+// Chạy khi tất cả Gemini keys fail. Convert format Gemini ↔ AI.
+// ──────────────────────────────────────────────────────────
+async function tryWorkersAI(env, body) {
+  if (!env.AI) return null;
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return null; }
+
+  const messages = [];
+  if (parsed.systemInstruction?.parts) {
+    messages.push({
+      role: "system",
+      content: parsed.systemInstruction.parts.map(p => p.text || "").join("\n"),
+    });
+  }
+  for (const c of parsed.contents || []) {
+    messages.push({
+      role: c.role === "model" ? "assistant" : "user",
+      content: (c.parts || []).map(p => p.text || "").join("\n"),
+    });
+  }
+
+  const opts = {
+    messages,
+    max_tokens: parsed.generationConfig?.maxOutputTokens || 2048,
+    temperature: parsed.generationConfig?.temperature ?? 0.5,
+  };
+  // Nếu Gemini yêu cầu JSON, hint AI cũng trả JSON
+  if (parsed.generationConfig?.responseMimeType === "application/json") {
+    opts.response_format = { type: "json_object" };
+  }
+
+  let aiResp;
+  try {
+    aiResp = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", opts);
+  } catch (e) {
+    console.log(`[gemini→AI fallback] error: ${e.message}`);
+    return null;
+  }
+
+  const text = aiResp?.response || "";
+  if (!text) return null;
+
+  // Wrap thành format Gemini cho frontend không cần biết
+  return {
+    candidates: [{
+      content: { parts: [{ text }] },
+      finishReason: "STOP",
+    }],
+    usageMetadata: { source: "workers-ai-llama-3.3" },
+  };
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
@@ -231,18 +309,32 @@ export default {
       }, origin);
     }
 
-    // Filter: bỏ qua keys đang cooldown. Nếu tất cả đều cooldown → fallback try all.
+    const body = await request.text();
+
+    // ── Step 0: KV cache lookup ──
+    // Hash body → cache key. Nếu hit → trả ngay, không tốn Gemini quota.
+    const bodyHash = await hashBody(body);
+    const cacheKey = `gemini:${model}:${bodyHash}`;
+    const cached = await cacheGet(env, cacheKey);
+    if (cached) {
+      console.log(`[cache] HIT ${cacheKey}`);
+      const respHeaders = new Headers(corsHeaders(origin));
+      respHeaders.set("Content-Type", "application/json");
+      respHeaders.set("X-Cache", "HIT");
+      return new Response(cached, { status: 200, headers: respHeaders });
+    }
+
+    // ── Step 1: thử Gemini keys (smart rotation, skip cooldown) ──
     const activeKeys = allKeys.filter(k => !isKeyOnCooldown(k.label));
     const tryKeys = activeKeys.length > 0 ? activeKeys : allKeys;
     if (activeKeys.length === 0) {
       console.log("[gemini] all keys on cooldown, trying all anyway");
-      // Reset cooldown nếu fallback (mọi key đều bị block thì có thể tình trạng đã thay đổi)
       keyState.clear();
     }
 
-    const body = await request.text();
     let upstream = null;
     let lastError = null;
+    let success = false;
 
     for (const { key, label } of tryKeys) {
       const targetUrl = `${GOOGLE_BASE}/v1beta/models/${model}:generateContent?key=${key}`;
@@ -260,19 +352,41 @@ export default {
       }
       console.log(`[gemini] ${label} status=${upstream.status}`);
       if (upstream.status === 200) {
-        clearKeyCooldown(label);  // success → reset state
+        clearKeyCooldown(label);
+        success = true;
         break;
       }
-      // Bất kỳ non-200 → mark cooldown + thử key tiếp theo
-      // (429 = rate limit, 400 = location/setup khác key, 503 = overload)
       markKeyCooldown(label, upstream.status);
     }
 
+    // ── Step 2: nếu Gemini success → cache response và trả ──
+    if (success && upstream) {
+      const respText = await upstream.text();
+      await cachePut(env, cacheKey, respText);
+      const respHeaders = new Headers(corsHeaders(origin));
+      respHeaders.set("Content-Type", upstream.headers.get("Content-Type") || "application/json");
+      respHeaders.set("X-Cache", "MISS");
+      return new Response(respText, { status: 200, headers: respHeaders });
+    }
+
+    // ── Step 3: tất cả Gemini fail → fallback Workers AI (Llama 3.3 70B) ──
+    console.log("[gemini] all keys failed, fallback to Workers AI");
+    const aiResult = await tryWorkersAI(env, body);
+    if (aiResult) {
+      console.log("[ai-fallback] success");
+      const aiBody = JSON.stringify(aiResult);
+      await cachePut(env, cacheKey, aiBody);
+      const respHeaders = new Headers(corsHeaders(origin));
+      respHeaders.set("Content-Type", "application/json");
+      respHeaders.set("X-Cache", "MISS");
+      respHeaders.set("X-Source", "workers-ai");
+      return new Response(aiBody, { status: 200, headers: respHeaders });
+    }
+
+    // ── Step 4: tất cả đều fail → trả response cuối từ Gemini cho client ──
     if (!upstream) {
       return jsonResponse(502, { error: `Không gọi được Google API: ${lastError?.message || "unknown"}` }, origin);
     }
-
-    // Stream response back, preserve status code
     const respHeaders = new Headers(corsHeaders(origin));
     respHeaders.set("Content-Type", upstream.headers.get("Content-Type") || "application/json");
     return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
