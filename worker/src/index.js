@@ -593,7 +593,16 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
       ? `R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
       : "không có";
 
-    const prompt = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC với 15 năm kinh nghiệm. Phân tích khung ${tf}, horizon ${horizon}.
+    const systemText = `Bạn là chuyên gia TA XAU/USD chuyên scalping/day trading + Smart Money Concepts.
+
+NGUYÊN TẮC:
+- Trả lời thẳng vào vấn đề, KHÔNG giới thiệu bản thân, KHÔNG preamble.
+- Mọi mức giá là số cụ thể (vd $2350.45), không "khoảng".
+- KHÔNG khuyến nghị "mua/bán ngay".
+- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) tránh liquidity sweep.
+- R:R tối thiểu 1:1.5, ưu tiên 1:2+.`;
+
+    const userText = `Phân tích XAU/USD khung ${tf}, horizon ${horizon}.
 
 DỮ LIỆU:
 - Giá: $${l.close.toFixed(2)} | RSI(14): ${l.rsi?.toFixed(1)}
@@ -603,38 +612,38 @@ DỮ LIỆU:
 - Pivots (daily): ${pivotStr}
 - 10 nến gần nhất: ${last10}
 
-Trả lời tiếng Việt CHI TIẾT, đầy đủ 4 mục dưới đây. Mỗi mục 3-5 dòng phân tích thực chất, không sơ sài.
+Trả lời CHI TIẾT đầy đủ 4 mục, mỗi mục 3-5 dòng phân tích thực chất.
+
+BẮT ĐẦU NGAY BẰNG "📊 Cấu trúc & Động lượng" — KHÔNG thêm câu mở đầu.
 
 📊 Cấu trúc & Động lượng
-- Phe kiểm soát hiện tại (mua/bán/trung lập) + 1-2 câu giải thích dựa vào EMA alignment, biên độ, RSI/MACD
-- BOS hoặc CHOCH gần nhất ở mốc giá nào? Giá đang trong giai đoạn nào (impulse/correction/consolidation)?
-- RSI/MACD có phân kỳ với price không? Có dấu hiệu kiệt sức không? Mô tả rõ ràng.
+- Phe kiểm soát (mua/bán/trung lập) + lý do (EMA alignment, biên độ, RSI/MACD)
+- BOS/CHOCH gần nhất ở mốc nào? Giai đoạn (impulse/correction/consolidation)?
+- RSI/MACD: phân kỳ? kiệt sức? bình thường?
 - Order Block / FVG còn fresh không? Vị trí?
 
 🎯 Vùng cản quan trọng
-- 2-3 mức KHÁNG CỰ gần nhất (theo thứ tự gần→xa): mức giá + ghi chú confluence (vd "swing high + EMA50 + Fib 0.5")
-- 2-3 mức HỖ TRỢ gần nhất: tương tự
-- Nếu giá vừa có sóng đẩy → Fib retracement đang active ở mức nào?
+- 2-3 mức KHÁNG CỰ gần→xa: giá + confluence (swing/EMA/Fib/Pivot)
+- 2-3 mức HỖ TRỢ gần→xa: tương tự
+- Fib retracement đang active ở mức nào (nếu vừa có sóng đẩy)?
 
 💡 Kế hoạch giao dịch (horizon ${horizon})
-- Kịch bản chính (long/short/sideways) + lý do tại sao
-- Setup LONG: nếu khả thi → Entry $X, SL $Y, TP $Z, R:R=N + 1-2 câu lý do confluence + điều kiện confirm. Nếu không khả thi: ghi rõ "không khả thi" + lý do.
+- Kịch bản chính (long/short/sideways) + lý do
+- Setup LONG: Entry $X, SL $Y, TP $Z, R:R=N + lý do confluence + điều kiện confirm. Hoặc "không khả thi" + lý do.
 - Setup SHORT: tương tự.
-- Nguyên tắc SL: đặt NGOÀI vùng nhiễu (>1×ATR cách swing low/high) tránh liquidity sweep
-- R:R tối thiểu 1:1.5, ưu tiên 1:2+
 
 ⚠️ Rủi ro chính
 - 2-3 rủi ro cụ thể trong horizon ${horizon}
-- Catalyst sắp tới có thể tác động (nếu biết)
-
-QUAN TRỌNG:
-- Mọi mức giá phải là SỐ CỤ THỂ (không "khoảng 2350")
-- KHÔNG khuyến nghị "mua/bán ngay"
-- Trả lời ĐẦY ĐỦ các mục, không cắt bớt`;
+- Catalyst sắp tới (nếu có)`;
 
     const body = {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 3500, temperature: 0.5 },
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: "user", parts: [{ text: userText }] }],
+      generationConfig: {
+        maxOutputTokens: 4096,
+        temperature: 0.5,
+        thinkingConfig: { thinkingBudget: 1024 },
+      },
     };
     const resp = await callGeminiSmart(env, body);
     const text = extractText(resp);
@@ -646,9 +655,11 @@ QUAN TRỌNG:
     // Split nếu vượt Telegram limit 4096 chars — không cắt bớt nội dung
     const fullText = `🧠 SMC ${tf}\n\n${text}`;
     const parts = splitForTelegram(fullText, 3900);
+    console.log(`[bot] /analyze ${tf} text=${text.length}c, fullText=${fullText.length}c, parts=${parts.length}`);
     for (let i = 0; i < parts.length; i++) {
       const suffix = parts.length > 1 ? `\n\n[${i + 1}/${parts.length}]` : "";
-      await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, null);
+      const ok = await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, null);
+      console.log(`[bot] sent part ${i + 1}/${parts.length} (${(parts[i] + suffix).length}c) ok=${ok}`);
     }
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
