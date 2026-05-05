@@ -1075,7 +1075,7 @@ function helpMessage() {
 *Tin tức (AI tổng hợp + dự đoán):*
 \`/tin\` — tổng hợp tin XAU 7 ngày + catalyst sắp tới
 \`/tin NFP\` — deep-dive 1 event (3 kịch bản + chiến lược trước/trong/sau)
-\`/tin CPI\` \`/tin FOMC\` \`/tin Fed\` \`/tin Powell\` …
+\`/tin CPI\` \`/tin FOMC\` \`/tin Fed\` \`/tin rate\` \`/tin GDP\` …
 
 *Tư vấn cá nhân (AI):*
 \`/ai <câu hỏi>\` — risk management + position sizing
@@ -1242,7 +1242,7 @@ const GOLD_NEWS_KEYWORDS = [
 
 const HIGH_IMPACT_KEYWORDS = [
   "NFP", "non-farm", "non farm", "FOMC", "Fed decision", "Fed meeting",
-  "Powell", "rate decision", "rate hike", "rate cut",
+  "Fed Chair", "Fed speech", "rate decision", "rate hike", "rate cut",
   "CPI", "PPI", "PCE", "core inflation",
   "GDP", "unemployment claims", "jobless claims",
   "ECB decision", "BOJ", "BOE",
@@ -1399,7 +1399,7 @@ NGUYÊN TẮC CORRELATION:
 KIẾN THỨC SẴN VỀ MAJOR EVENTS:
 - NFP (Non-Farm Payrolls): Thứ 6 đầu tháng 19:30 GMT+7. Forecast 150-250K. Tác động ±$30-100/oz cho XAU.
 - CPI (Consumer Price Index): giữa tháng 19:30 GMT+7. Forecast YoY ~2-4%. Tác động ±$20-80. Core CPI quan trọng nhất.
-- FOMC Decision: 8 lần/năm 02:00 GMT+7 + Powell press conf. Tác động lớn nhất ±$50-150.
+- FOMC Decision: 8 lần/năm 02:00 GMT+7 + press conference của Fed Chair. Tác động lớn nhất ±$50-150.
 - PPI: cuối tháng 19:30. Tác động vừa.
 - GDP: hàng quý 19:30. Tác động vừa-thấp.
 - Unemployment Claims: Thứ 5 hàng tuần 19:30. Tác động thấp.
