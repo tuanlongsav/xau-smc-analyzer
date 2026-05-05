@@ -415,31 +415,45 @@ function renderSmcCard(r, tf) {
     }).join("");
   };
 
+  // Scenario card với entry/SL/TP/RR BOLD và size lớn cho dễ đọc
   const scenarioCard = (sc, label, icon) => {
     const ok = sc.kha_thi;
-    const okBadge = ok ? "✅" : "❌";
     if (!ok) {
-      return `<div class="border border-slate-300 dark:border-slate-700 rounded p-3">
-        <div class="font-semibold">${icon} ${label} ${okBadge}</div>
+      return `<div class="border-2 border-slate-300 dark:border-slate-700 rounded p-3 opacity-60">
+        <div class="font-bold">${icon} ${label} ❌ không khả thi</div>
         <div class="text-xs italic mt-1 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do || "Chưa thuận")}</div>
       </div>`;
     }
-    const entry = sc.entry ?? sc.vung_vao_lenh ?? "";  // backward compat
+    const entry = sc.entry ?? sc.vung_vao_lenh ?? "";
     const tp = sc.take_profit ?? sc.target;
     const rr = sc.risk_reward;
-    return `<div class="border border-slate-300 dark:border-slate-700 rounded p-3">
-      <div class="flex items-center justify-between">
-        <span class="font-semibold">${icon} ${label} ${okBadge}</span>
-        ${rr != null ? `<span class="text-xs px-2 py-0.5 rounded bg-blue-500/20 text-blue-600 dark:text-blue-300 font-mono">R:R ${Number(rr).toFixed(2)}</span>` : ""}
+    const cardBorder = label === "LONG" ? "border-green-500" : "border-red-500";
+    return `<div class="border-2 ${cardBorder} rounded-lg p-3 bg-white dark:bg-slate-900">
+      <div class="flex items-center justify-between mb-2">
+        <span class="font-bold text-base">${icon} ${label} ✅</span>
+        ${rr != null ? `<span class="text-sm px-2 py-0.5 rounded bg-blue-500/20 text-blue-700 dark:text-blue-300 font-bold font-mono">R:R ${Number(rr).toFixed(2)}</span>` : ""}
       </div>
-      <div class="text-xs mt-2"><strong>Entry:</strong> ${typeof entry === "number" ? `$${fmt(entry)}` : escapeHtml(String(entry))}</div>
-      <div class="grid grid-cols-2 gap-2 mt-1 text-sm">
-        <div class="text-red-500">SL: <strong>$${fmt(sc.stop_loss)}</strong></div>
-        <div class="text-green-500">TP: <strong>$${fmt(tp)}</strong></div>
+      <div class="space-y-1 font-mono text-base">
+        <div>Entry: <strong class="text-lg">${typeof entry === "number" ? `$${fmt(entry)}` : escapeHtml(String(entry))}</strong></div>
+        <div class="text-red-600 dark:text-red-400">SL: <strong class="text-lg">$${fmt(sc.stop_loss)}</strong></div>
+        <div class="text-green-600 dark:text-green-400">TP: <strong class="text-lg">$${fmt(tp)}</strong></div>
       </div>
       ${sc.dieu_kien_xac_nhan ? `<div class="text-xs mt-2"><strong>Confirm:</strong> ${escapeHtml(sc.dieu_kien_xac_nhan)}</div>` : ""}
       <div class="text-xs italic mt-2 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do || "")}</div>
     </div>`;
+  };
+
+  // Levels với giá BOLD lớn
+  const renderLevelsBold = (arr, color) => {
+    if (!Array.isArray(arr) || arr.length === 0) return `<div class="text-xs text-slate-500 italic">—</div>`;
+    return arr.map(lv => {
+      const gia = typeof lv === "object" ? lv.gia : lv;
+      const note = typeof lv === "object" ? lv.ghi_chu : "";
+      return `<div class="text-sm flex items-baseline gap-2">
+        <span class="${color} font-bold text-base font-mono">$${fmt(gia)}</span>
+        ${note ? `<span class="text-xs text-slate-500">— ${escapeHtml(note)}</span>` : ""}
+      </div>`;
+    }).join("");
   };
 
   return `
@@ -452,48 +466,47 @@ function renderSmcCard(r, tf) {
       <strong>📋 Tóm tắt:</strong> ${escapeHtml(r.tom_tat || "")}
     </div>
 
-    <!-- Task 1: Cấu trúc & Động lượng -->
-    <div class="border border-slate-300 dark:border-slate-700 rounded p-3 mb-3">
-      <div class="font-semibold mb-2">1️⃣ Cấu trúc & Động lượng</div>
-      ${phe ? `<div class="text-sm mb-2">Phe kiểm soát: <strong class="${pheColor}">${escapeHtml(phe.toUpperCase())}</strong>${t1.ly_do_kiem_soat ? ` — <span class="text-slate-600 dark:text-slate-400">${escapeHtml(t1.ly_do_kiem_soat)}</span>` : ""}</div>` : ""}
-      ${bosChoch.loai ? `<div class="text-xs mb-1">${escapeHtml(bosChoch.loai)} ${escapeHtml(bosChoch.huong || "")} tại <strong>$${fmt(bosChoch.muc_gia)}</strong></div>` : ""}
-      ${t1.order_block_fvg ? `<div class="text-xs mb-1"><strong>OB/FVG:</strong> ${escapeHtml(t1.order_block_fvg)}</div>` : ""}
-      ${t1.rsi_macd_signal ? `<div class="text-xs mb-1"><strong>RSI/MACD:</strong> ${escapeHtml(t1.rsi_macd_signal)}</div>` : ""}
-      ${t1.phan_tich_dong_luong ? `<div class="text-xs italic text-slate-600 dark:text-slate-400">${escapeHtml(t1.phan_tich_dong_luong)}</div>` : ""}
-    </div>
-
-    <!-- Task 2: Vùng cản -->
-    <div class="border border-slate-300 dark:border-slate-700 rounded p-3 mb-3">
-      <div class="font-semibold mb-2">2️⃣ Vùng cản quan trọng</div>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm mb-2">
-        <div>
-          <div class="text-red-500 font-semibold mb-1">▲ Kháng cự</div>
-          ${renderLevels(t2.khang_cu, "Kháng cự", "text-slate-700 dark:text-slate-300")}
-        </div>
-        <div>
-          <div class="text-green-500 font-semibold mb-1">▼ Hỗ trợ</div>
-          ${renderLevels(t2.ho_tro, "Hỗ trợ", "text-slate-700 dark:text-slate-300")}
-        </div>
-      </div>
-      ${t2.fib_active ? `<div class="text-xs italic mt-2"><strong>Fib:</strong> ${escapeHtml(t2.fib_active)}</div>` : ""}
-    </div>
-
-    <!-- Task 3: Kế hoạch -->
-    <div class="border border-slate-300 dark:border-slate-700 rounded p-3 mb-3">
-      <div class="font-semibold mb-2">3️⃣ Kế hoạch giao dịch ${t3.horizon ? `<span class="text-xs font-normal text-slate-500">(horizon ${escapeHtml(t3.horizon)})</span>` : ""}</div>
-      ${t3.kich_ban_chinh ? `<div class="text-sm mb-2">Kịch bản chính: <strong class="uppercase">${escapeHtml(t3.kich_ban_chinh)}</strong>${t3.ly_do_kich_ban ? ` — <span class="text-slate-600 dark:text-slate-400">${escapeHtml(t3.ly_do_kich_ban)}</span>` : ""}</div>` : ""}
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+    <!-- ━━━ KHUYẾN NGHỊ GIAO DỊCH (prominent) ━━━ -->
+    <div class="bg-amber-500/10 border-2 border-amber-500 rounded-lg p-4 mb-4">
+      <div class="font-bold text-lg mb-3 text-amber-700 dark:text-amber-300">🎯 KHUYẾN NGHỊ GIAO DỊCH${t3.horizon ? ` <span class="text-sm font-normal text-slate-500">(horizon ${escapeHtml(t3.horizon)})</span>` : ""}</div>
+      ${t3.kich_ban_chinh ? `<div class="text-sm mb-3">Kịch bản chính: <strong class="uppercase text-base">${escapeHtml(t3.kich_ban_chinh)}</strong>${t3.ly_do_kich_ban ? ` — <span class="text-slate-700 dark:text-slate-300">${escapeHtml(t3.ly_do_kich_ban)}</span>` : ""}</div>` : ""}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
         ${scenarioCard(sl, "LONG", "📈")}
         ${scenarioCard(ss, "SHORT", "📉")}
       </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 pt-3 border-t border-amber-500/30">
+        <div>
+          <div class="text-red-600 dark:text-red-400 font-bold mb-1 text-sm">▲ Kháng cự</div>
+          ${renderLevelsBold(t2.khang_cu, "text-red-600 dark:text-red-400")}
+        </div>
+        <div>
+          <div class="text-green-600 dark:text-green-400 font-bold mb-1 text-sm">▼ Hỗ trợ</div>
+          ${renderLevelsBold(t2.ho_tro, "text-green-600 dark:text-green-400")}
+        </div>
+      </div>
+      ${t2.fib_active ? `<div class="text-xs italic mt-3"><strong>Fib:</strong> ${escapeHtml(t2.fib_active)}</div>` : ""}
     </div>
 
-    ${risks.length > 0 ? `
-      <div class="text-sm mb-2">
-        <div class="font-semibold mb-1">⚠️ Rủi ro chính</div>
-        <ul class="list-disc list-inside text-xs space-y-1">${risks.map(rk => `<li>${escapeHtml(rk)}</li>`).join("")}</ul>
-      </div>` : ""}
-    ${r.ghi_chu ? `<div class="text-xs italic mt-2 text-slate-500">📌 ${escapeHtml(r.ghi_chu)}</div>` : ""}
+    <!-- ━━━ PHÂN TÍCH CHI TIẾT ━━━ -->
+    <div class="bg-slate-100 dark:bg-slate-800 rounded-lg p-4 mb-3">
+      <div class="font-bold text-base mb-3 text-slate-700 dark:text-slate-300">📊 PHÂN TÍCH CHI TIẾT</div>
+
+      <div class="space-y-3 text-sm">
+        ${phe ? `<div>Phe kiểm soát: <strong class="${pheColor}">${escapeHtml(phe.toUpperCase())}</strong>${t1.ly_do_kiem_soat ? ` — <span class="text-slate-600 dark:text-slate-400">${escapeHtml(t1.ly_do_kiem_soat)}</span>` : ""}</div>` : ""}
+        ${bosChoch.loai ? `<div><strong>Cấu trúc:</strong> ${escapeHtml(bosChoch.loai)} ${escapeHtml(bosChoch.huong || "")} tại <strong>$${fmt(bosChoch.muc_gia)}</strong>${bosChoch.ghi_chu ? ` (${escapeHtml(bosChoch.ghi_chu)})` : ""}</div>` : ""}
+        ${t1.order_block_fvg ? `<div><strong>OB/FVG:</strong> ${escapeHtml(t1.order_block_fvg)}</div>` : ""}
+        ${t1.rsi_macd_signal ? `<div><strong>RSI/MACD:</strong> ${escapeHtml(t1.rsi_macd_signal)}</div>` : ""}
+        ${t1.phan_tich_dong_luong ? `<div class="italic text-slate-600 dark:text-slate-400">${escapeHtml(t1.phan_tich_dong_luong)}</div>` : ""}
+      </div>
+
+      ${risks.length > 0 ? `
+        <div class="text-sm mt-4 pt-3 border-t border-slate-300 dark:border-slate-700">
+          <div class="font-bold mb-1">⚠️ Rủi ro chính</div>
+          <ul class="list-disc list-inside text-xs space-y-1">${risks.map(rk => `<li>${escapeHtml(rk)}</li>`).join("")}</ul>
+        </div>` : ""}
+    </div>
+
+    ${r.ghi_chu ? `<div class="text-xs italic text-slate-500">📌 ${escapeHtml(r.ghi_chu)}</div>` : ""}
   `;
 }
 

@@ -443,11 +443,11 @@ async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseM
   };
   try {
     let r = await post(parseMode);
-    // Nếu Markdown parse fail → retry plain text (auto-fallback)
-    if (!r.ok && parseMode === "Markdown") {
+    // Nếu parse mode fail (Markdown/HTML) → retry plain text
+    if (!r.ok && (parseMode === "Markdown" || parseMode === "HTML")) {
       const errText = await r.text();
       if (errText.includes("can't parse entities") || errText.includes("parse_mode")) {
-        console.log(`[tg-reply] markdown fail, retry plain`);
+        console.log(`[tg-reply] ${parseMode} fail, retry plain. Err: ${errText.slice(0, 150)}`);
         r = await post(null);
       } else {
         console.log(`[tg-reply] ${r.status}: ${errText.slice(0, 200)}`);
@@ -464,6 +464,24 @@ async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseM
 
 const TF_TO_TD = { "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day" };
 const TF_HORIZON = { "5m": "30-60 phút", "15m": "2-4 giờ", "1h": "1-2 ngày", "4h": "2-3 ngày", "1d": "1-2 tuần" };
+
+// HTML escape cho Telegram parse_mode=HTML (chỉ cần escape <, >, &)
+function htmlEsc(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Extract JSON từ AI response (Gemini hay wrap trong ```json...```)
+function extractJSON(text) {
+  if (!text) return null;
+  try { return JSON.parse(text); } catch {}
+  const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (m) { try { return JSON.parse(m[1]); } catch {} }
+  const start = text.indexOf("{"), end = text.lastIndexOf("}");
+  if (start !== -1 && end > start) {
+    try { return JSON.parse(text.slice(start, end + 1)); } catch {}
+  }
+  return null;
+}
 
 function helpMessage() {
   return `🥇 *XAU Bot — Lệnh*
@@ -507,16 +525,62 @@ async function handlePriceCmd(env, chatId, replyTo) {
       if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
     } catch {}
 
-    let m = `🥇 *XAU/USD* — 15m\n`;
-    m += `Giá: *$${l.close.toFixed(2)}*\n\n`;
-    m += `RSI(14): *${l.rsi?.toFixed(1)}*\n`;
-    m += `EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}\n`;
-    m += `SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)}\n`;
-    m += `BB(20): ${l.bbLower?.toFixed(2)} – ${l.bbUpper?.toFixed(2)}`;
-    if (pivots) {
-      m += `\n\n*Pivots (daily):*\nR2 ${pivots.r2.toFixed(2)} | R1 ${pivots.r1.toFixed(2)} | PP ${pivots.pp.toFixed(2)}\nS1 ${pivots.s1.toFixed(2)} | S2 ${pivots.s2.toFixed(2)}`;
+    const c = l.close;
+
+    // Trend determination từ EMA alignment
+    let trend = "—", trendIcon = "❓", trendColor = "";
+    if (l.ema200 != null && l.ema50 != null && l.ema21 != null) {
+      if (c > l.ema200 && l.ema21 > l.ema50 && l.ema50 > l.ema200) { trend = "Tăng mạnh"; trendIcon = "🚀"; }
+      else if (c > l.ema50 && c > l.ema200) { trend = "Tăng"; trendIcon = "📈"; }
+      else if (c < l.ema200 && l.ema21 < l.ema50 && l.ema50 < l.ema200) { trend = "Giảm mạnh"; trendIcon = "🔻"; }
+      else if (c < l.ema50 && c < l.ema200) { trend = "Giảm"; trendIcon = "📉"; }
+      else { trend = "Sideways"; trendIcon = "↔️"; }
     }
-    await sendTelegramTo(env, chatId, m, replyTo);
+
+    // RSI status
+    const rsiVal = l.rsi;
+    let rsiTag = "trung tính";
+    if (rsiVal > 75) rsiTag = "QUÁ MUA";
+    else if (rsiVal > 70) rsiTag = "cao";
+    else if (rsiVal < 25) rsiTag = "QUÁ BÁN";
+    else if (rsiVal < 30) rsiTag = "thấp";
+
+    // Collect tất cả mức giá
+    const levels = [];
+    const add = (price, label) => {
+      if (price != null && !isNaN(price)) levels.push({ price, label });
+    };
+    if (l.bbUpper) add(l.bbUpper, "BB Upper");
+    if (l.bbLower) add(l.bbLower, "BB Lower");
+    if (l.ema21) add(l.ema21, "EMA 21");
+    if (l.ema50) add(l.ema50, "EMA 50");
+    if (l.ema200) add(l.ema200, "EMA 200");
+    if (pivots) {
+      add(pivots.r2, "Pivot R2"); add(pivots.r1, "Pivot R1"); add(pivots.pp, "Pivot PP");
+      add(pivots.s1, "Pivot S1"); add(pivots.s2, "Pivot S2");
+    }
+    const above = levels.filter(lv => lv.price > c).sort((a, b) => a.price - b.price).slice(0, 4);
+    const below = levels.filter(lv => lv.price < c).sort((a, b) => b.price - a.price).slice(0, 4);
+
+    let m = `<b>🥇 XAU/USD</b> — 15m\n`;
+    m += `Giá: <b>$${c.toFixed(2)}</b>\n\n`;
+    m += `${trendIcon} Trend: <b>${trend}</b>\n`;
+    m += `RSI(14): <b>${rsiVal?.toFixed(1)}</b> (${rsiTag})\n`;
+    m += `EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}\n`;
+    m += `SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(golden)" : "(death)"}\n`;
+    m += `BB(20): ${l.bbLower?.toFixed(2)} – ${l.bbUpper?.toFixed(2)}\n`;
+
+    if (above.length || below.length) {
+      m += `\n<b>📍 Mức giá quan trọng:</b>\n`;
+      for (const lv of above) {
+        m += `▲ <b>$${lv.price.toFixed(2)}</b> — ${htmlEsc(lv.label)} <i>(+${(lv.price - c).toFixed(2)})</i>\n`;
+      }
+      for (const lv of below) {
+        m += `▼ <b>$${lv.price.toFixed(2)}</b> — ${htmlEsc(lv.label)} <i>(-${(c - lv.price).toFixed(2)})</i>\n`;
+      }
+    }
+
+    await sendTelegramTo(env, chatId, m, replyTo, "HTML");
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
@@ -532,31 +596,82 @@ async function handleScanCmd(env, chatId, replyTo) {
     }
     const e = enrichIndicators(c15);
     const l = e[e.length - 1];
+    let pivots = null;
+    try {
+      const c1d = await fetchTdCandles(env, "1day", 5);
+      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
+    } catch {}
 
-    const prompt = `Giá XAU/USD: $${l.close.toFixed(2)} (khung 15m)
-RSI(14): ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}
-SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)}
-BB(20): ${l.bbLower?.toFixed(2)} – ${l.bbUpper?.toFixed(2)}
+    const pivotStr = pivots
+      ? `Pivots: R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
+      : "";
 
-Trả lời tiếng Việt 3-5 dòng:
-1. Phe mua/bán đang kiểm soát?
-2. Mốc S/R cần watch?
-3. Setup đáng quan tâm 2-4h tới?
+    const systemText = `Bạn là chuyên gia TA XAU/USD. Trả lời JSON ngắn gọn cho quick scan, KHÔNG preamble. Mức giá là số cụ thể.`;
+    const userText = `XAU/USD 15m, giá $${l.close.toFixed(2)}.
+RSI: ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
+SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
+${pivotStr}
 
-KHÔNG khuyến nghị mua/bán cụ thể.`;
+Trả JSON:
+{
+  "huong": "LONG|SHORT|NEUTRAL",
+  "tom_tat": "1-2 câu phe nào kiểm soát + lý do ngắn",
+  "entry_goi_y": <float|null>,
+  "sl_goi_y": <float|null>,
+  "tp_goi_y": <float|null>,
+  "ly_do_setup": "1 câu lý do nếu có entry, hoặc 'chưa có setup rõ' nếu null",
+  "khang_cu_gan": <float>,
+  "ho_tro_gan": <float>,
+  "canh_bao": "vd: 'RSI quá mua, coi chừng pullback' hoặc null nếu không có"
+}`;
 
     const body = {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 500, temperature: 0.5 },
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: "user", parts: [{ text: userText }] }],
+      generationConfig: {
+        responseMimeType: "application/json",
+        maxOutputTokens: 1500,
+        temperature: 0.5,
+      },
     };
     const resp = await callGeminiSmart(env, body);
     const text = extractText(resp);
-    if (text) {
-      // Plain text — AI output có thể có ký tự Markdown không cân
-      await sendTelegramTo(env, chatId, `🥇 Quick Scan\n\n${text}`, replyTo, null);
-    } else {
-      await sendTelegramTo(env, chatId, "❌ AI unavailable", replyTo);
+    const d = extractJSON(text);
+    if (!d) {
+      // Fallback: send raw text plain
+      await sendTelegramTo(env, chatId, `🥇 Quick Scan\n\n${text || "❌ parse error"}`, replyTo, null);
+      return;
     }
+
+    const huong = (d.huong || "NEUTRAL").toUpperCase();
+    const huongIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[huong] || "❓";
+
+    let m = `<b>🥇 Quick Scan</b> — XAU/USD 15m\n`;
+    m += `Giá: <b>$${l.close.toFixed(2)}</b> | ${huongIcon} <b>${huong}</b>\n\n`;
+
+    if (d.tom_tat) m += `${htmlEsc(d.tom_tat)}\n\n`;
+
+    // Setup gợi ý
+    if (d.entry_goi_y != null && d.sl_goi_y != null && d.tp_goi_y != null) {
+      const rr = Math.abs((d.tp_goi_y - d.entry_goi_y) / (d.entry_goi_y - d.sl_goi_y));
+      m += `<b>🎯 Setup gợi ý (${huong}):</b>\n`;
+      m += `Entry: <b>$${d.entry_goi_y.toFixed(2)}</b> | SL: <b>$${d.sl_goi_y.toFixed(2)}</b> | TP: <b>$${d.tp_goi_y.toFixed(2)}</b> | R:R: <b>${rr.toFixed(1)}</b>\n`;
+      if (d.ly_do_setup) m += `<i>${htmlEsc(d.ly_do_setup)}</i>\n`;
+    } else if (d.ly_do_setup) {
+      m += `<b>🎯 Setup:</b> ${htmlEsc(d.ly_do_setup)}\n`;
+    }
+
+    if (d.khang_cu_gan || d.ho_tro_gan) {
+      m += `\n<b>📍 Mức cần watch:</b>\n`;
+      if (d.khang_cu_gan) m += `▲ <b>$${Number(d.khang_cu_gan).toFixed(2)}</b> kháng cự\n`;
+      if (d.ho_tro_gan) m += `▼ <b>$${Number(d.ho_tro_gan).toFixed(2)}</b> hỗ trợ\n`;
+    }
+
+    if (d.canh_bao) {
+      m += `\n⚠️ <b>Cảnh báo:</b> ${htmlEsc(d.canh_bao)}`;
+    }
+
+    await sendTelegramTo(env, chatId, m, replyTo, "HTML");
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
@@ -593,14 +708,14 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
       ? `R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
       : "không có";
 
-    const systemText = `Bạn là chuyên gia TA XAU/USD chuyên scalping/day trading + Smart Money Concepts.
+    const systemText = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC.
 
 NGUYÊN TẮC:
-- Trả lời thẳng vào vấn đề, KHÔNG giới thiệu bản thân, KHÔNG preamble.
-- Mọi mức giá là số cụ thể (vd $2350.45), không "khoảng".
-- KHÔNG khuyến nghị "mua/bán ngay".
+- Trả lời JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
+- Mọi mức giá là số cụ thể (float).
 - SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) tránh liquidity sweep.
-- R:R tối thiểu 1:1.5, ưu tiên 1:2+.`;
+- R:R tối thiểu 1:1.5, ưu tiên 1:2+.
+- KHÔNG khuyến nghị "mua/bán ngay".`;
 
     const userText = `Phân tích XAU/USD khung ${tf}, horizon ${horizon}.
 
@@ -612,34 +727,42 @@ DỮ LIỆU:
 - Pivots (daily): ${pivotStr}
 - 10 nến gần nhất: ${last10}
 
-Trả lời CHI TIẾT đầy đủ 4 mục, mỗi mục 3-5 dòng phân tích thực chất.
-
-BẮT ĐẦU NGAY BẰNG "📊 Cấu trúc & Động lượng" — KHÔNG thêm câu mở đầu.
-
-📊 Cấu trúc & Động lượng
-- Phe kiểm soát (mua/bán/trung lập) + lý do (EMA alignment, biên độ, RSI/MACD)
-- BOS/CHOCH gần nhất ở mốc nào? Giai đoạn (impulse/correction/consolidation)?
-- RSI/MACD: phân kỳ? kiệt sức? bình thường?
-- Order Block / FVG còn fresh không? Vị trí?
-
-🎯 Vùng cản quan trọng
-- 2-3 mức KHÁNG CỰ gần→xa: giá + confluence (swing/EMA/Fib/Pivot)
-- 2-3 mức HỖ TRỢ gần→xa: tương tự
-- Fib retracement đang active ở mức nào (nếu vừa có sóng đẩy)?
-
-💡 Kế hoạch giao dịch (horizon ${horizon})
-- Kịch bản chính (long/short/sideways) + lý do
-- Setup LONG: Entry $X, SL $Y, TP $Z, R:R=N + lý do confluence + điều kiện confirm. Hoặc "không khả thi" + lý do.
-- Setup SHORT: tương tự.
-
-⚠️ Rủi ro chính
-- 2-3 rủi ro cụ thể trong horizon ${horizon}
-- Catalyst sắp tới (nếu có)`;
+Trả JSON theo schema:
+{
+  "huong_chinh": "LONG | SHORT | NEUTRAL",
+  "do_tin_cay": "thấp | trung bình | cao",
+  "tom_tat": "1-2 câu summary phe nào kiểm soát + horizon",
+  "long": {
+    "kha_thi": true | false,
+    "entry": <float>,
+    "sl": <float>,
+    "tp": <float>,
+    "rr": <float>,
+    "ly_do": "1-2 câu confluence/lý do",
+    "dieu_kien_confirm": "điều kiện trigger (vd 'close M15 trên $X + RSI > 50')"
+  },
+  "short": { ... same fields ... },
+  "khang_cu": [
+    {"gia": <float>, "ghi_chu": "vd 'swing high + EMA50 + Fib 0.5'"},
+    {"gia": <float>, "ghi_chu": "..."},
+    {"gia": <float>, "ghi_chu": "..."}
+  ],
+  "ho_tro": [...same...],
+  "phan_tich": {
+    "phe_kiem_soat": "phe mua | phe bán | trung lập",
+    "ly_do_kiem_soat": "1-2 câu giải thích",
+    "bos_choch": "BOS hoặc CHOCH gần nhất ở $X (tăng/giảm)",
+    "rsi_macd_signal": "phân kỳ bullish | phân kỳ bearish | kiệt sức quá mua | kiệt sức quá bán | bình thường",
+    "order_block_fvg": "OB/FVG còn fresh ở vùng $X-$Y, hoặc 'không có'"
+  },
+  "rui_ro_chinh": ["...", "...", "..."]
+}`;
 
     const body = {
       systemInstruction: { parts: [{ text: systemText }] },
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
+        responseMimeType: "application/json",
         maxOutputTokens: 4096,
         temperature: 0.5,
         thinkingConfig: { thinkingBudget: 1024 },
@@ -647,23 +770,89 @@ BẮT ĐẦU NGAY BẰNG "📊 Cấu trúc & Động lượng" — KHÔNG thêm 
     };
     const resp = await callGeminiSmart(env, body);
     const text = extractText(resp);
-    if (!text) {
-      await sendTelegramTo(env, chatId, "❌ AI unavailable", replyTo);
+    const d = extractJSON(text);
+    if (!d) {
+      // Fallback: send raw text
+      await sendTelegramTo(env, chatId, `🧠 SMC ${tf}\n\n${text || "❌ parse error"}`, replyTo, null);
       return;
     }
 
-    // Split nếu vượt Telegram limit 4096 chars — không cắt bớt nội dung
-    const fullText = `🧠 SMC ${tf}\n\n${text}`;
-    const parts = splitForTelegram(fullText, 3900);
-    console.log(`[bot] /analyze ${tf} text=${text.length}c, fullText=${fullText.length}c, parts=${parts.length}`);
+    const html = formatAnalysisHTML(d, tf, horizon);
+    const parts = splitForTelegram(html, 3900);
+    console.log(`[bot] /analyze ${tf} text=${text?.length}c, html=${html.length}c, parts=${parts.length}`);
     for (let i = 0; i < parts.length; i++) {
-      const suffix = parts.length > 1 ? `\n\n[${i + 1}/${parts.length}]` : "";
-      const ok = await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, null);
+      const suffix = parts.length > 1 ? `\n\n<i>[${i + 1}/${parts.length}]</i>` : "";
+      const ok = await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "HTML");
       console.log(`[bot] sent part ${i + 1}/${parts.length} (${(parts[i] + suffix).length}c) ok=${ok}`);
     }
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
+}
+
+/**
+ * Format JSON từ Gemini → Telegram HTML.
+ * Recommendation (entry/SL/TP/levels BOLD) hiện trước, phân tích chi tiết sau.
+ */
+function formatAnalysisHTML(d, tf, horizon) {
+  const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
+  const huong = (d.huong_chinh || "NEUTRAL").toUpperCase();
+  const huongIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[huong] || "❓";
+
+  let m = `<b>🥇 SMC ${tf}</b> — Horizon ${horizon}\n`;
+  m += `${huongIcon} Hướng chính: <b>${huong}</b> | Tin cậy: <b>${htmlEsc(d.do_tin_cay || "?")}</b>\n`;
+  if (d.tom_tat) m += `<i>${htmlEsc(d.tom_tat)}</i>\n`;
+  m += `\n━━━ <b>🎯 KHUYẾN NGHỊ</b> ━━━\n\n`;
+
+  const scenarioBlock = (sc, label, icon) => {
+    if (!sc?.kha_thi) {
+      return `${icon} <b>${label}</b>: ❌ không khả thi\n<i>${htmlEsc(sc?.ly_do || "Chưa thuận")}</i>`;
+    }
+    let s = `${icon} <b>${label}</b> ✅`;
+    if (sc.rr != null) s += ` | R:R: <b>${Number(sc.rr).toFixed(1)}</b>`;
+    s += `\n`;
+    s += `Entry: <b>$${fmt2(sc.entry)}</b>\n`;
+    s += `SL: <b>$${fmt2(sc.sl)}</b> | TP: <b>$${fmt2(sc.tp)}</b>\n`;
+    if (sc.dieu_kien_confirm) s += `Confirm: ${htmlEsc(sc.dieu_kien_confirm)}\n`;
+    if (sc.ly_do) s += `<i>${htmlEsc(sc.ly_do)}</i>`;
+    return s;
+  };
+
+  m += scenarioBlock(d.long, "LONG", "📈") + "\n\n";
+  m += scenarioBlock(d.short, "SHORT", "📉") + "\n\n";
+
+  // Mức giá quan trọng
+  if ((Array.isArray(d.khang_cu) && d.khang_cu.length) || (Array.isArray(d.ho_tro) && d.ho_tro.length)) {
+    m += `<b>📍 Mức giá quan trọng:</b>\n`;
+    for (const k of (d.khang_cu || [])) {
+      m += `▲ <b>$${fmt2(k.gia)}</b>${k.ghi_chu ? ` — <i>${htmlEsc(k.ghi_chu)}</i>` : ""}\n`;
+    }
+    for (const h of (d.ho_tro || [])) {
+      m += `▼ <b>$${fmt2(h.gia)}</b>${h.ghi_chu ? ` — <i>${htmlEsc(h.ghi_chu)}</i>` : ""}\n`;
+    }
+    m += `\n`;
+  }
+
+  // PHÂN TÍCH chi tiết
+  m += `━━━ <b>📊 PHÂN TÍCH</b> ━━━\n\n`;
+  const p = d.phan_tich || {};
+  if (p.phe_kiem_soat) {
+    m += `Phe kiểm soát: <b>${htmlEsc(String(p.phe_kiem_soat).toUpperCase())}</b>\n`;
+  }
+  if (p.ly_do_kiem_soat) m += `<i>${htmlEsc(p.ly_do_kiem_soat)}</i>\n`;
+  if (p.bos_choch) m += `Cấu trúc: ${htmlEsc(p.bos_choch)}\n`;
+  if (p.rsi_macd_signal) m += `RSI/MACD: <b>${htmlEsc(p.rsi_macd_signal)}</b>\n`;
+  if (p.order_block_fvg) m += `OB/FVG: ${htmlEsc(p.order_block_fvg)}\n`;
+
+  // Rủi ro
+  if (Array.isArray(d.rui_ro_chinh) && d.rui_ro_chinh.length) {
+    m += `\n<b>⚠️ Rủi ro:</b>\n`;
+    for (const r of d.rui_ro_chinh) {
+      m += `• ${htmlEsc(r)}\n`;
+    }
+  }
+
+  return m;
 }
 
 /**
