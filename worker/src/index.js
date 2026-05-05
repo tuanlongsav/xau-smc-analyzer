@@ -450,11 +450,11 @@ function formatAuxBlock(auxCtx) {
   const lines = [];
   if (auxCtx.oil) {
     const sign = auxCtx.oil.pct24h >= 0 ? "+" : "";
-    lines.push(`🛢️ OIL (WTI): $${auxCtx.oil.price.toFixed(2)} | ${auxCtx.oil.trendEmoji} ${auxCtx.oil.trendLabel} (24h ${sign}${auxCtx.oil.pct24h.toFixed(2)}%)`);
+    lines.push(`🛢️ OIL (USO ETF): $${auxCtx.oil.price.toFixed(2)} | ${auxCtx.oil.trendEmoji} ${auxCtx.oil.trendLabel} (24h ${sign}${auxCtx.oil.pct24h.toFixed(2)}%)`);
   }
   if (auxCtx.dxy) {
     const sign = auxCtx.dxy.pct24h >= 0 ? "+" : "";
-    lines.push(`💵 DXY: ${auxCtx.dxy.price.toFixed(2)} | ${auxCtx.dxy.trendEmoji} ${auxCtx.dxy.trendLabel} (24h ${sign}${auxCtx.dxy.pct24h.toFixed(2)}%)`);
+    lines.push(`💵 DXY (USDX): ${auxCtx.dxy.price.toFixed(2)} | ${auxCtx.dxy.trendEmoji} ${auxCtx.dxy.trendLabel} (24h ${sign}${auxCtx.dxy.pct24h.toFixed(2)}%)`);
   }
   return lines.join("\n");
 }
@@ -467,8 +467,11 @@ async function getAuxContext(env, args) {
   if (!wantsOil && !wantsDxy) return null;
   const ctx = {};
   const tasks = [];
-  if (wantsOil) tasks.push(getCachedAuxData(env, "WTI/USD", "OIL").then(d => { if (d) ctx.oil = d; }));
-  if (wantsDxy) tasks.push(getCachedAuxData(env, "DXY", "DXY").then(d => { if (d) ctx.dxy = d; }));
+  // TwelveData free tier:
+  // - WTI/USD requires paid → dùng USO (US Oil Fund ETF) làm proxy
+  // - DXY symbol invalid → dùng USDX (US Dollar Index, direct)
+  if (wantsOil) tasks.push(getCachedAuxData(env, "USO", "OIL (USO ETF)").then(d => { if (d) ctx.oil = d; }));
+  if (wantsDxy) tasks.push(getCachedAuxData(env, "USDX", "DXY").then(d => { if (d) ctx.dxy = d; }));
   await Promise.all(tasks);
   return Object.keys(ctx).length > 0 ? ctx : null;
 }
