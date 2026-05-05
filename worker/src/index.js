@@ -1581,10 +1581,53 @@ export default {
       }
     }
 
-    // Trigger alert check thủ công (debug — bypass cron schedule)
+    // Trigger alert check thủ công (real data — bypass cron schedule)
     if (url.pathname === "/run-alert-check") {
       await runAlertCheck(env);
       return jsonResponse(200, { ok: true, message: "Alert check chạy xong, xem console log" }, origin);
+    }
+
+    // Test full alert pipeline với fake data — verify Telegram delivery + format
+    if (url.pathname === "/test-cron-alert") {
+      const fakeLatest = {
+        close: 4520.50, rsi: 78.5, atr: 12.3,
+        ema21: 4515.20, ema50: 4505.10, ema200: 4480.50,
+        bbUpper: 4540, bbLower: 4500,
+      };
+      const fakePivots = { pp: 4510, r1: 4525, r2: 4540, s1: 4495, s2: 4480 };
+      const fakeAlerts = [
+        { icon: "🔴", text: `RSI quá mua *78.5* — coi chừng điều chỉnh`, suggestion: "Watch BB upper rejection. Không chase long." },
+        { icon: "🎯", text: `Phá pivot R1 *$4525* lên`, suggestion: "Watch retest R1 làm hỗ trợ. Mục tiêu R2 $4540." },
+        { icon: "⚡", text: `ATR spike: *12.30* (1.7x avg)`, suggestion: "Volatility cao bất thường — đợi candle close trước khi entry." },
+      ];
+      const msg = formatAlertMessage(fakeLatest, fakeAlerts, fakePivots);
+      const ok = await sendTelegram(env, msg);
+      return jsonResponse(200, {
+        ok,
+        message: ok ? "✅ Test alert đã gửi vào group" : "❌ Gửi thất bại — check TELEGRAM_BOT_TOKEN/CHAT_ID",
+        previewMessage: msg,
+      }, origin);
+    }
+
+    // Clear alert cooldowns (KV) — để re-test cùng alert ngay không phải đợi 1h
+    if (url.pathname === "/clear-alert-cooldowns") {
+      if (!env.CACHE) return jsonResponse(500, { error: "KV not configured" }, origin);
+      // Note: KV không list keys dễ dàng từ Worker. Manual delete known alert keys.
+      const knownKeys = [
+        "alert:rsi_overbought", "alert:rsi_oversold",
+        "alert:bb_up", "alert:bb_dn",
+        "alert:golden", "alert:death",
+        "alert:ema_up", "alert:ema_dn",
+        "alert:piv_up_r1", "alert:piv_up_r2", "alert:piv_dn_s1", "alert:piv_dn_s2",
+        "alert:big_move_up", "alert:big_move_dn",
+        "alert:vol_spike",
+        "alert:liq_sweep_up", "alert:liq_sweep_dn",
+      ];
+      let cleared = 0;
+      for (const k of knownKeys) {
+        try { await env.CACHE.delete(k); cleared++; } catch {}
+      }
+      return jsonResponse(200, { cleared, message: `Đã xóa ${cleared} alert cooldown keys` }, origin);
     }
 
     // Block non-allowed origins for actual API calls
