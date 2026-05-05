@@ -927,11 +927,11 @@ function helpMessage() {
 \`/nhanh1h4h1d\` — scan HTF
 
 *Tư vấn cá nhân (AI):*
-\`/ask <câu hỏi>\` — risk management + position sizing
+\`/ai <câu hỏi>\` — risk management + position sizing
 Vd:
-• \`/ask vốn 5tr lệnh 0.05 lot SL TP thế nào\`
-• \`/ask đã mua giá 4520 hiện lỗ xử lý ra sao\`
-• \`/ask muốn risk 2% với SL 8 điểm thì bao nhiêu lot\`
+• \`/ai vốn 5tr lệnh 0.05 lot SL TP thế nào\`
+• \`/ai đã mua giá 4520 hiện lỗ xử lý ra sao\`
+• \`/ai muốn risk 2% với SL 8 điểm thì bao nhiêu lot\`
 
 *Khác:*
 \`/tudien\` — Từ điển thuật ngữ Việt-Anh
@@ -1839,9 +1839,8 @@ async function handleTelegramUpdate(env, update) {
     await sendTelegramTo(env, chatId, glossaryMessage(), replyTo);
     return;
   }
-  // /ask <question> — tư vấn position sizing / risk management
-  if (cmd === "/ask" || cmd === "/hoi") {
-    // Lấy tất cả text sau lệnh đầu tiên
+  // /ai (hoặc /AI), /ask, /hoi — tư vấn position sizing / risk management
+  if (cmd === "/ai" || cmd === "/ask" || cmd === "/hoi") {
     const question = text.replace(/^\S+\s*/, "").trim();
     await handleAskCmd(env, chatId, replyTo, question);
     return;
@@ -2056,7 +2055,7 @@ export default {
         { command: "1h4h1d",        description: "SMC 3 khung HTF" },
         { command: "nhanh5p15p1h",  description: "Scan 3 khung intraday" },
         { command: "nhanh1h4h1d",   description: "Scan 3 khung HTF" },
-        { command: "ask",      description: "Tư vấn risk + lot size + TP/SL" },
+        { command: "ai",       description: "Tư vấn risk + lot size + TP/SL" },
         { command: "tudien",   description: "Từ điển thuật ngữ Việt-Anh" },
         { command: "help",     description: "Hướng dẫn lệnh" },
       ];
