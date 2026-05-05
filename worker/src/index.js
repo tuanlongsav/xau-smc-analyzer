@@ -426,6 +426,21 @@ function extractText(geminiResp) {
  * có ký tự Markdown không cân: ** lẻ, _ trong tên biến, ngoặc...).
  * Auto-fallback sang plain text khi 400.
  */
+/**
+ * Telegram "typing..." indicator — hiện ~5s rồi tự biến mất.
+ * Tốt hơn gửi message "Đang scan..." rồi để lại trong chat.
+ */
+async function sendChatAction(env, chatId, action = "typing") {
+  if (!env.TELEGRAM_BOT_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action }),
+    });
+  } catch {}
+}
+
 async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseMode = "Markdown") {
   if (!env.TELEGRAM_BOT_TOKEN) return false;
   const buildBody = (mode) => {
@@ -587,7 +602,7 @@ async function handlePriceCmd(env, chatId, replyTo) {
 }
 
 async function handleScanCmd(env, chatId, replyTo) {
-  await sendTelegramTo(env, chatId, "⏳ Đang scan...", replyTo);
+  await sendChatAction(env, chatId, "typing");
   try {
     const c15 = await fetchTdCandles(env, "15min", 220);
     if (c15.length < 50) {
@@ -630,7 +645,7 @@ Trả JSON:
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         responseMimeType: "application/json",
-        maxOutputTokens: 1500,
+        maxOutputTokens: 2500,
         temperature: 0.5,
       },
     };
@@ -638,8 +653,9 @@ Trả JSON:
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
-      // Fallback: send raw text plain
-      await sendTelegramTo(env, chatId, `🥇 Quick Scan\n\n${text || "❌ parse error"}`, replyTo, null);
+      // JSON parse fail (thường do AI bị cut giữa chừng) — báo lỗi sạch sẽ
+      await sendTelegramTo(env, chatId, "❌ AI response không hợp lệ (bị truncate). Thử <code>/nhanh</code> lại.", replyTo, "HTML");
+      console.log(`[bot] /nhanh JSON parse fail, raw: ${(text || "").slice(0, 200)}`);
       return;
     }
 
@@ -683,8 +699,7 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
     await sendTelegramTo(env, chatId, `❌ TF không hợp lệ. Dùng: ${Object.keys(TF_TO_TD).join(", ")}`, replyTo);
     return;
   }
-  await sendTelegramTo(env, chatId, `⏳ Phân tích SMC khung ${tf}...`, replyTo);
-
+  await sendChatAction(env, chatId, "typing");
   try {
     const candles = await fetchTdCandles(env, TF_TO_TD[tf], 220);
     if (candles.length < 50) {
@@ -772,8 +787,8 @@ Trả JSON theo schema:
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
-      // Fallback: send raw text
-      await sendTelegramTo(env, chatId, `🧠 SMC ${tf}\n\n${text || "❌ parse error"}`, replyTo, null);
+      await sendTelegramTo(env, chatId, `❌ AI response không hợp lệ (bị truncate). Thử <code>/${tf.replace("m", "p")}</code> lại.`, replyTo, "HTML");
+      console.log(`[bot] /analyze ${tf} JSON parse fail, raw: ${(text || "").slice(0, 200)}`);
       return;
     }
 
