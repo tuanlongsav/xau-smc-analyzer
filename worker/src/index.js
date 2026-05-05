@@ -450,11 +450,11 @@ function formatAuxBlock(auxCtx) {
   const lines = [];
   if (auxCtx.oil) {
     const sign = auxCtx.oil.pct24h >= 0 ? "+" : "";
-    lines.push(`🛢️ OIL (USO ETF): $${auxCtx.oil.price.toFixed(2)} | ${auxCtx.oil.trendEmoji} ${auxCtx.oil.trendLabel} (24h ${sign}${auxCtx.oil.pct24h.toFixed(2)}%)`);
+    lines.push(`🛢️ Dầu (USO ETF): $${auxCtx.oil.price.toFixed(2)} | ${auxCtx.oil.trendEmoji} ${auxCtx.oil.trendLabel} (24h ${sign}${auxCtx.oil.pct24h.toFixed(2)}%)`);
   }
   if (auxCtx.dxy) {
     const sign = auxCtx.dxy.pct24h >= 0 ? "+" : "";
-    lines.push(`💵 DXY (USDX): ${auxCtx.dxy.price.toFixed(2)} | ${auxCtx.dxy.trendEmoji} ${auxCtx.dxy.trendLabel} (24h ${sign}${auxCtx.dxy.pct24h.toFixed(2)}%)`);
+    lines.push(`💵 USD Index (qua EUR/USD ${auxCtx.dxy.eurusdPrice?.toFixed(4) || "?"}): ${auxCtx.dxy.trendEmoji} ${auxCtx.dxy.trendLabel} (DXY 24h ≈ ${sign}${auxCtx.dxy.pct24h.toFixed(2)}%)`);
   }
   return lines.join("\n");
 }
@@ -467,11 +467,27 @@ async function getAuxContext(env, args) {
   if (!wantsOil && !wantsDxy) return null;
   const ctx = {};
   const tasks = [];
-  // TwelveData free tier:
-  // - WTI/USD requires paid → dùng USO (US Oil Fund ETF) làm proxy
-  // - DXY symbol invalid → dùng USDX (US Dollar Index, direct)
+  // TwelveData free tier không có DXY/WTI direct:
+  // - DXY: dùng EUR/USD inverse (EUR là 57% weight của DXY, correlation -0.76 với DXY)
+  // - OIL: dùng USO ETF (proxy WTI, correlation ~99% với WTI direction)
   if (wantsOil) tasks.push(getCachedAuxData(env, "USO", "OIL (USO ETF)").then(d => { if (d) ctx.oil = d; }));
-  if (wantsDxy) tasks.push(getCachedAuxData(env, "USDX", "DXY").then(d => { if (d) ctx.dxy = d; }));
+  if (wantsDxy) tasks.push(
+    getCachedAuxData(env, "EUR/USD", "EUR/USD").then(d => {
+      if (d) {
+        // Invert để mô phỏng DXY direction
+        const inverted = {
+          ...d,
+          symbol: "DXY (proxy)",
+          label: "DXY (qua EUR/USD inverse)",
+          eurusdPrice: d.price,
+          pct24h: -d.pct24h,  // inverse correlation
+          trendLabel: { "Tăng mạnh": "Giảm mạnh", "Tăng": "Giảm", "Sideways": "Sideways", "Giảm": "Tăng", "Giảm mạnh": "Tăng mạnh" }[d.trendLabel] || "?",
+          trendEmoji: { "🚀": "🔻", "🟢": "🔴", "↔️": "↔️", "🔴": "🟢", "🔻": "🚀" }[d.trendEmoji] || "❓",
+        };
+        ctx.dxy = inverted;
+      }
+    })
+  );
   await Promise.all(tasks);
   return Object.keys(ctx).length > 0 ? ctx : null;
 }
