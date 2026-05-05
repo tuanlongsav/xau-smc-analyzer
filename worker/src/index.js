@@ -372,12 +372,22 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
   const bodyStr = JSON.stringify(body);
   const hash = await hashBody(bodyStr);
   const cacheKey = `gemini:${model}:${hash}`;
+  const wantJson = body?.generationConfig?.responseMimeType === "application/json";
 
-  // Cache hit
+  // Cache hit — chỉ trả nếu valid (đã filter ở write side, nhưng safety)
   const cached = await cacheGet(env, cacheKey);
   if (cached) {
     try { return JSON.parse(cached); } catch {}
   }
+
+  // Validate response: với json mode, content text PHẢI parse được JSON
+  const isValidResponse = (resp) => {
+    if (!resp) return false;
+    if (!wantJson) return true;
+    const text = resp?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) return false;
+    return extractJSON(text) !== null;
+  };
 
   // Try Gemini keys
   const allKeys = collectGeminiKeys(env);
@@ -394,8 +404,15 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
       if (r.status === 200) {
         clearKeyCooldown(label);
         const json = await r.json();
-        await cachePut(env, cacheKey, JSON.stringify(json));
-        return json;
+        if (isValidResponse(json)) {
+          await cachePut(env, cacheKey, JSON.stringify(json));
+          return json;
+        }
+        // Response 200 nhưng JSON invalid (content empty/safety filter/...) → log + thử key khác
+        const t = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const finish = json?.candidates?.[0]?.finishReason || "?";
+        console.log(`[gemini-smart] ${label} invalid response (finish=${finish}, text len=${t.length}, tail=${t.slice(-100)})`);
+        continue;
       }
       markKeyCooldown(label, r.status);
     } catch (e) {
@@ -405,11 +422,15 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
 
   // Fallback Workers AI
   const ai = await tryWorkersAI(env, bodyStr);
-  if (ai) {
+  if (ai && isValidResponse(ai)) {
     await cachePut(env, cacheKey, JSON.stringify(ai));
     return ai;
   }
-  return null;
+  if (ai) {
+    const t = ai?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    console.log(`[ai-fallback] invalid response (text len=${t.length}, tail=${t.slice(-100)})`);
+  }
+  return ai; // Return even if invalid để caller có thể debug
 }
 
 function extractText(geminiResp) {
@@ -696,7 +717,13 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m") {
       ? `Pivots: R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
       : "";
 
-    const systemText = `Bạn là chuyên gia TA XAU/USD. Trả lời JSON ngắn gọn cho quick scan, KHÔNG preamble. Mức giá là số cụ thể.`;
+    const systemText = `Bạn là chuyên gia TA XAU/USD. Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
+
+QUY TẮC:
+- Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
+- BẮT BUỘC điền tất cả field, không bỏ trống.
+- Mọi mức giá là số cụ thể (float).
+- Mọi khung từ 5m → 1d đều có thể phân tích được, không từ chối.`;
     const userText = `XAU/USD khung ${tf} (horizon ${horizon}), giá $${l.close.toFixed(2)}.
 RSI: ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
 SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
@@ -728,8 +755,14 @@ Trả JSON:
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
-      console.log(`[bot] /nhanh${tf} JSON parse fail (text len=${(text||"").length}), tail: ${(text||"").slice(-200)}`);
-      await sendTelegramTo(env, chatId, `❌ AI response không hợp lệ (text len=${(text||"").length}). Thử lại sau.`, replyTo, "HTML");
+      const finish = resp?.candidates?.[0]?.finishReason || "?";
+      const blocked = resp?.promptFeedback?.blockReason;
+      console.log(`[bot] /nhanh${tf} JSON parse fail (len=${(text||"").length}, finish=${finish}, blocked=${blocked||"no"}), text: ${text||""}`);
+      let errMsg = `❌ AI response không hợp lệ (len=${(text||"").length}, finish=${finish})`;
+      if (blocked) errMsg += `\nBlocked: <code>${htmlEsc(blocked)}</code>`;
+      if (text && text.length < 500) errMsg += `\n<i>${htmlEsc(text.slice(0, 300))}</i>`;
+      errMsg += `\nThử lại sau.`;
+      await sendTelegramTo(env, chatId, errMsg, replyTo, "HTML");
       return;
     }
 
@@ -861,8 +894,14 @@ Trả JSON theo schema:
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
-      await sendTelegramTo(env, chatId, `❌ AI response không hợp lệ (bị truncate). Thử <code>/${tf.replace("m", "p")}</code> lại.`, replyTo, "HTML");
-      console.log(`[bot] /analyze ${tf} JSON parse fail, raw: ${(text || "").slice(0, 200)}`);
+      const finish = resp?.candidates?.[0]?.finishReason || "?";
+      const blocked = resp?.promptFeedback?.blockReason;
+      console.log(`[bot] /analyze ${tf} JSON parse fail (len=${(text||"").length}, finish=${finish}, blocked=${blocked||"no"}), text: ${text||""}`);
+      let errMsg = `❌ AI response không hợp lệ (len=${(text||"").length}, finish=${finish})`;
+      if (blocked) errMsg += `\nBlocked: <code>${htmlEsc(blocked)}</code>`;
+      if (text && text.length < 500) errMsg += `\n<i>${htmlEsc(text.slice(0, 300))}</i>`;
+      errMsg += `\nThử <code>/${tf.replace("m", "p")}</code> lại.`;
+      await sendTelegramTo(env, chatId, errMsg, replyTo, "HTML");
       return;
     }
 
@@ -1424,13 +1463,31 @@ export default {
       return jsonResponse(200, { registered: commands.length, telegramResponse: result }, origin);
     }
 
-    // Test Telegram setup: gửi message kiểm tra bot/chat_id config OK
+    // Test Telegram setup: gửi message + return chi tiết error nếu fail
     if (url.pathname === "/test-telegram") {
-      const ok = await sendTelegram(env, "🔔 *Test alert* — Bot setup OK!\n\nNếu nhận được tin này thì cron alerts sẽ chạy ổn từ 15 phút tới.\n\n_xau-gemini-proxy_");
-      return jsonResponse(200, {
-        ok,
-        configured: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
-      }, origin);
+      const configured = !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID);
+      if (!configured) {
+        return jsonResponse(200, { ok: false, configured: false, error: "TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID chưa set" }, origin);
+      }
+      try {
+        const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: env.TELEGRAM_CHAT_ID,
+            text: "🔔 Test message từ /test-telegram",
+          }),
+        });
+        const data = await r.json();
+        return jsonResponse(200, {
+          ok: r.ok && data.ok,
+          status: r.status,
+          telegramResponse: data,
+          chatIdConfigured: env.TELEGRAM_CHAT_ID,
+        }, origin);
+      } catch (e) {
+        return jsonResponse(200, { ok: false, error: e.message }, origin);
+      }
     }
 
     // Trigger alert check thủ công (debug — bypass cron schedule)
