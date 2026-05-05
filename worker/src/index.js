@@ -501,28 +501,38 @@ function extractJSON(text) {
 function helpMessage() {
   return `🥇 *XAU Bot — Lệnh*
 
-\`/gia\` — giá hiện tại + indicators
-\`/nhanh\` — AI quick scan 3-5 dòng
+\`/gia\` — giá hiện tại + indicators (instant)
 
-*Phân tích SMC theo khung:*
-\`/5p\` — khung 5 phút
-\`/15p\` — khung 15 phút
-\`/1h\` — khung 1 giờ
-\`/4h\` — khung 4 giờ
-\`/1d\` — khung 1 ngày
+*Quick scan (ngắn, ~5s):*
+\`/nhanh\` — mặc định 15p
+\`/nhanh5p\` \`/nhanh15p\` \`/nhanh1h\` \`/nhanh4h\` \`/nhanh1d\`
 
-Ví dụ: gõ \`/1h\` để phân tích khung 1 giờ.
+*Phân tích SMC chi tiết (~15s):*
+\`/5p\` \`/15p\` \`/1h\` \`/4h\` \`/1d\`
+
+Ví dụ: \`/nhanh1h\` để quick scan khung 1 giờ.
 
 App đầy đủ: [xau-smc-analyzer.pages.dev](https://xau-smc-analyzer.pages.dev)`;
 }
 
-// Map lệnh tiếng Việt → TF nội bộ
+// Map lệnh tiếng Việt → TF nội bộ (cho /5p, /15p... = phân tích SMC chi tiết)
 const VN_CMD_TO_TF = {
   "/5p": "5m", "/5m": "5m",
   "/15p": "15m", "/15m": "15m",
   "/1h": "1h", "/1g": "1h", "/1gio": "1h",
   "/4h": "4h", "/4g": "4h", "/4gio": "4h",
   "/1d": "1d", "/1ngay": "1d", "/ngay": "1d",
+};
+
+// Map lệnh /nhanhXX → TF (quick scan ngắn theo khung)
+const VN_SCAN_CMD_TO_TF = {
+  "/nhanh": "15m",       // default 15m
+  "/nhanh5p": "5m",
+  "/nhanh15p": "15m",
+  "/nhanh1h": "1h",
+  "/nhanh4h": "4h",
+  "/nhanh1d": "1d",
+  "/scan": "15m", "/quick": "15m", // backward compat
 };
 
 async function handlePriceCmd(env, chatId, replyTo) {
@@ -601,15 +611,17 @@ async function handlePriceCmd(env, chatId, replyTo) {
   }
 }
 
-async function handleScanCmd(env, chatId, replyTo) {
+async function handleScanCmd(env, chatId, replyTo, tf = "15m") {
   await sendChatAction(env, chatId, "typing");
   try {
-    const c15 = await fetchTdCandles(env, "15min", 220);
-    if (c15.length < 50) {
+    const tdInterval = TF_TO_TD[tf] || "15min";
+    const horizon = TF_HORIZON[tf] || "ngắn hạn";
+    const candles = await fetchTdCandles(env, tdInterval, 220);
+    if (candles.length < 50) {
       await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
       return;
     }
-    const e = enrichIndicators(c15);
+    const e = enrichIndicators(candles);
     const l = e[e.length - 1];
     let pivots = null;
     try {
@@ -622,7 +634,7 @@ async function handleScanCmd(env, chatId, replyTo) {
       : "";
 
     const systemText = `Bạn là chuyên gia TA XAU/USD. Trả lời JSON ngắn gọn cho quick scan, KHÔNG preamble. Mức giá là số cụ thể.`;
-    const userText = `XAU/USD 15m, giá $${l.close.toFixed(2)}.
+    const userText = `XAU/USD khung ${tf} (horizon ${horizon}), giá $${l.close.toFixed(2)}.
 RSI: ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
 SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
 ${pivotStr}
@@ -662,7 +674,7 @@ Trả JSON:
     const huong = (d.huong || "NEUTRAL").toUpperCase();
     const huongIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[huong] || "❓";
 
-    let m = `<b>🥇 Quick Scan</b> — XAU/USD 15m\n`;
+    let m = `<b>🥇 Quick Scan ${tf}</b> — horizon ${horizon}\n`;
     m += `Giá: <b>$${l.close.toFixed(2)}</b> | ${huongIcon} <b>${huong}</b>\n\n`;
 
     if (d.tom_tat) m += `${htmlEsc(d.tom_tat)}\n\n`;
@@ -924,9 +936,9 @@ async function handleTelegramUpdate(env, update) {
     await handlePriceCmd(env, chatId, replyTo);
     return;
   }
-  // Quick scan AI
-  if (cmd === "/nhanh" || cmd === "/scan" || cmd === "/quick") {
-    await handleScanCmd(env, chatId, replyTo);
+  // Quick scan AI — match /nhanh, /nhanh5p, /nhanh15p, /nhanh1h, ...
+  if (VN_SCAN_CMD_TO_TF[cmd]) {
+    await handleScanCmd(env, chatId, replyTo, VN_SCAN_CMD_TO_TF[cmd]);
     return;
   }
   // Phân tích SMC theo TF — match lệnh tiếng Việt /5p, /15p, /1h, /4h, /1d, ...
