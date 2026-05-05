@@ -43,6 +43,23 @@ function jsonResponse(status, obj, origin) {
   });
 }
 
+/**
+ * Gom các Gemini key có cấu hình thành mảng theo thứ tự ưu tiên.
+ * Hỗ trợ: GEMINI_API_KEY, GEMINI_API_KEY_BACKUP, GEMINI_API_KEY_3..5
+ */
+function collectGeminiKeys(env) {
+  const slots = [
+    { name: "GEMINI_API_KEY",        label: "primary" },
+    { name: "GEMINI_API_KEY_BACKUP", label: "backup"  },
+    { name: "GEMINI_API_KEY_3",      label: "key_3"   },
+    { name: "GEMINI_API_KEY_4",      label: "key_4"   },
+    { name: "GEMINI_API_KEY_5",      label: "key_5"   },
+  ];
+  return slots
+    .map(s => ({ key: env[s.name], label: s.label }))
+    .filter(s => !!s.key);
+}
+
 export default {
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
@@ -53,14 +70,15 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(origin) });
     }
 
-    // Health check
+    // Health check + diagnostic location (debug Smart Placement)
     if (url.pathname === "/" || url.pathname === "/health") {
       return jsonResponse(200, {
         ok: true,
         service: "xau-gemini-proxy",
-        hasGeminiKey: !!env.GEMINI_API_KEY,
-        hasGeminiKeyBackup: !!env.GEMINI_API_KEY_BACKUP,
+        gemini_keys_count: collectGeminiKeys(env).length,
         hasTwelveDataKey: !!env.TWELVEDATA_API_KEY,
+        worker_dc: request.cf?.colo || "unknown",
+        worker_country: request.cf?.country || "unknown",
         endpoints: [
           "/health",
           "/v1beta/models/{model}:generateContent",
@@ -136,10 +154,8 @@ export default {
     }
     const model = match[1];
 
-    // Multi-key rotation: thử primary, hết quota → tự switch backup
-    const keys = [];
-    if (env.GEMINI_API_KEY)        keys.push({ key: env.GEMINI_API_KEY,        label: "primary" });
-    if (env.GEMINI_API_KEY_BACKUP) keys.push({ key: env.GEMINI_API_KEY_BACKUP, label: "backup"  });
+    // Multi-key rotation: thử primary → backup → key_3 → key_4 → key_5
+    const keys = collectGeminiKeys(env);
     if (keys.length === 0) {
       return jsonResponse(500, {
         error: "Worker chưa cấu hình GEMINI_API_KEY. Chạy: wrangler secret put GEMINI_API_KEY",
