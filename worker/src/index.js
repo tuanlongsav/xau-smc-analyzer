@@ -485,15 +485,38 @@ function htmlEsc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Extract JSON từ AI response (Gemini hay wrap trong ```json...```)
+// Extract JSON từ AI response — robust với multiple format quirks
 function extractJSON(text) {
   if (!text) return null;
+  text = text.trim();
+  // 1. Direct parse
   try { return JSON.parse(text); } catch {}
+  // 2. Markdown code block ```json...```
   const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (m) { try { return JSON.parse(m[1]); } catch {} }
-  const start = text.indexOf("{"), end = text.lastIndexOf("}");
-  if (start !== -1 && end > start) {
+  // 3. Tìm { ... } cuối cùng (có thể có text trước/sau)
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  const end = text.lastIndexOf("}");
+  if (end > start) {
     try { return JSON.parse(text.slice(start, end + 1)); } catch {}
+  }
+  // 4. Truncated JSON: scan đến } cuối cùng ở depth 0 từ start
+  let depth = 0, lastValidEnd = -1, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (esc) { esc = false; continue; }
+    if (ch === "\\") { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) lastValidEnd = i;
+    }
+  }
+  if (lastValidEnd > start) {
+    try { return JSON.parse(text.slice(start, lastValidEnd + 1)); } catch {}
   }
   return null;
 }
@@ -657,17 +680,16 @@ Trả JSON:
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         responseMimeType: "application/json",
-        maxOutputTokens: 2500,
-        temperature: 0.5,
+        maxOutputTokens: 3500,
+        temperature: 0.4,
       },
     };
     const resp = await callGeminiSmart(env, body);
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
-      // JSON parse fail (thường do AI bị cut giữa chừng) — báo lỗi sạch sẽ
-      await sendTelegramTo(env, chatId, "❌ AI response không hợp lệ (bị truncate). Thử <code>/nhanh</code> lại.", replyTo, "HTML");
-      console.log(`[bot] /nhanh JSON parse fail, raw: ${(text || "").slice(0, 200)}`);
+      console.log(`[bot] /nhanh${tf} JSON parse fail (text len=${(text||"").length}), tail: ${(text||"").slice(-200)}`);
+      await sendTelegramTo(env, chatId, `❌ AI response không hợp lệ (text len=${(text||"").length}). Thử lại sau.`, replyTo, "HTML");
       return;
     }
 
@@ -1110,6 +1132,35 @@ export default {
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
       const result = await r.json();
       return jsonResponse(200, { webhookUrl, telegramResponse: result }, origin);
+    }
+
+    // Register bot commands với Telegram (loại bỏ 'Unknown command' warning + autocomplete)
+    if (url.pathname === "/register-commands") {
+      if (!env.TELEGRAM_BOT_TOKEN) {
+        return jsonResponse(500, { error: "TELEGRAM_BOT_TOKEN chưa set" }, origin);
+      }
+      const commands = [
+        { command: "gia",      description: "Giá XAU + indicators" },
+        { command: "nhanh",    description: "Quick scan AI (15p mặc định)" },
+        { command: "nhanh5p",  description: "Quick scan 5 phút" },
+        { command: "nhanh15p", description: "Quick scan 15 phút" },
+        { command: "nhanh1h",  description: "Quick scan 1 giờ" },
+        { command: "nhanh4h",  description: "Quick scan 4 giờ" },
+        { command: "nhanh1d",  description: "Quick scan 1 ngày" },
+        { command: "5p",       description: "SMC chi tiết khung 5 phút" },
+        { command: "15p",      description: "SMC chi tiết khung 15 phút" },
+        { command: "1h",       description: "SMC chi tiết khung 1 giờ" },
+        { command: "4h",       description: "SMC chi tiết khung 4 giờ" },
+        { command: "1d",       description: "SMC chi tiết khung 1 ngày" },
+        { command: "help",     description: "Hướng dẫn lệnh" },
+      ];
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands }),
+      });
+      const result = await r.json();
+      return jsonResponse(200, { registered: commands.length, telegramResponse: result }, origin);
     }
 
     // Test Telegram setup: gửi message kiểm tra bot/chat_id config OK
