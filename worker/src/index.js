@@ -113,6 +113,298 @@ async function cachePut(env, key, value) {
 // Workers AI fallback (Llama 3.3 70B)
 // Chạy khi tất cả Gemini keys fail. Convert format Gemini ↔ AI.
 // ──────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────
+// Indicators (port từ js/indicators.js, minimal subset cần cho alert)
+// ──────────────────────────────────────────────────────────
+function ema(values, period) {
+  const k = 2 / (period + 1);
+  const out = new Array(values.length).fill(null);
+  let prev = null;
+  for (let i = 0; i < values.length; i++) {
+    if (i < period - 1) continue;
+    if (prev === null) {
+      let s = 0;
+      for (let j = i - period + 1; j <= i; j++) s += values[j];
+      prev = s / period;
+    } else {
+      prev = values[i] * k + prev * (1 - k);
+    }
+    out[i] = prev;
+  }
+  return out;
+}
+
+function sma(values, period) {
+  const out = new Array(values.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i >= period) sum -= values[i - period];
+    if (i >= period - 1) out[i] = sum / period;
+  }
+  return out;
+}
+
+function wilder(values, period) {
+  const out = new Array(values.length).fill(null);
+  let prev = null;
+  for (let i = 0; i < values.length; i++) {
+    if (i < period - 1) continue;
+    if (prev === null) {
+      let s = 0;
+      for (let j = i - period + 1; j <= i; j++) s += values[j];
+      prev = s / period;
+    } else {
+      prev = (prev * (period - 1) + values[i]) / period;
+    }
+    out[i] = prev;
+  }
+  return out;
+}
+
+function rsi(closes, period = 14) {
+  const gains = [], losses = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (i === 0) { gains.push(0); losses.push(0); continue; }
+    const d = closes[i] - closes[i - 1];
+    gains.push(d > 0 ? d : 0);
+    losses.push(d < 0 ? -d : 0);
+  }
+  const ag = wilder(gains, period);
+  const al = wilder(losses, period);
+  return closes.map((_, i) => {
+    if (ag[i] === null || al[i] === null) return null;
+    if (al[i] === 0) return 100;
+    return 100 - 100 / (1 + ag[i] / al[i]);
+  });
+}
+
+function bollinger(closes, period = 20, mult = 2) {
+  const u = new Array(closes.length).fill(null);
+  const l = new Array(closes.length).fill(null);
+  for (let i = period - 1; i < closes.length; i++) {
+    const sl = closes.slice(i - period + 1, i + 1);
+    const m = sl.reduce((a, b) => a + b, 0) / period;
+    const v = sl.reduce((a, b) => a + (b - m) ** 2, 0) / period;
+    const sd = Math.sqrt(v);
+    u[i] = m + mult * sd;
+    l[i] = m - mult * sd;
+  }
+  return { upper: u, lower: l };
+}
+
+function enrichIndicators(candles) {
+  const closes = candles.map(c => c.close);
+  const e21 = ema(closes, 21);
+  const e50 = ema(closes, 50);
+  const e200 = ema(closes, 200);
+  const s50 = sma(closes, 50);
+  const s200 = sma(closes, 200);
+  const r14 = rsi(closes, 14);
+  const { upper: bu, lower: bl } = bollinger(closes, 20, 2);
+  return candles.map((c, i) => ({
+    ...c,
+    ema21: e21[i], ema50: e50[i], ema200: e200[i],
+    sma50: s50[i], sma200: s200[i],
+    rsi: r14[i],
+    bbUpper: bu[i], bbLower: bl[i],
+  }));
+}
+
+function computePivots(candle) {
+  if (!candle) return null;
+  const H = candle.high, L = candle.low, C = candle.close;
+  const PP = (H + L + C) / 3;
+  const range = H - L;
+  return {
+    pp: PP,
+    r1: 2 * PP - L, r2: PP + range,
+    s1: 2 * PP - H, s2: PP - range,
+  };
+}
+
+// ──────────────────────────────────────────────────────────
+// TwelveData fetch (cron context — direct call, không qua /twelvedata route)
+// ──────────────────────────────────────────────────────────
+async function fetchTdCandles(env, interval, outputsize) {
+  const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${outputsize}&apikey=${env.TWELVEDATA_API_KEY}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`TD ${r.status}`);
+  const d = await r.json();
+  if (d.status === "error") throw new Error(`TD: ${d.message}`);
+  if (!Array.isArray(d.values)) return [];
+  return d.values.reverse().map(v => ({
+    time: Math.floor(new Date(v.datetime + "Z").getTime() / 1000),
+    open: parseFloat(v.open),
+    high: parseFloat(v.high),
+    low: parseFloat(v.low),
+    close: parseFloat(v.close),
+  }));
+}
+
+// ──────────────────────────────────────────────────────────
+// Alert detection + dedup via KV
+// ──────────────────────────────────────────────────────────
+const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1h dedup, không spam cùng alert
+
+async function alertCooldownOk(env, key) {
+  if (!env.CACHE) return true;
+  const last = await env.CACHE.get(`alert:${key}`);
+  if (!last) return true;
+  return Date.now() - parseInt(last) > ALERT_COOLDOWN_MS;
+}
+
+async function markAlerted(env, key) {
+  if (!env.CACHE) return;
+  await env.CACHE.put(`alert:${key}`, String(Date.now()), { expirationTtl: 7200 });
+}
+
+async function detectFreshAlerts(env, latest, prev, pivots) {
+  const out = [];
+  const push = async (key, icon, text) => {
+    if (await alertCooldownOk(env, key)) {
+      out.push({ icon, text });
+      await markAlerted(env, key);
+    }
+  };
+
+  // RSI extreme (state-based, dedup 1h)
+  if (latest.rsi != null) {
+    if (latest.rsi > 75) await push("rsi_overbought", "🔴", `RSI quá mua *${latest.rsi.toFixed(1)}* — coi chừng điều chỉnh`);
+    if (latest.rsi < 25) await push("rsi_oversold", "🟢", `RSI quá bán *${latest.rsi.toFixed(1)}* — khả năng hồi phục`);
+  }
+
+  // BB breakout (event-based, vừa cross)
+  if (latest.bbUpper != null && prev.bbUpper != null) {
+    if (latest.close > latest.bbUpper && prev.close <= prev.bbUpper)
+      await push("bb_up", "📈", `Vượt BB upper *$${latest.bbUpper.toFixed(2)}* — momentum tăng mạnh`);
+    if (latest.close < latest.bbLower && prev.close >= prev.bbLower)
+      await push("bb_dn", "📉", `Phá BB lower *$${latest.bbLower.toFixed(2)}* — momentum giảm mạnh`);
+  }
+
+  // Golden / Death Cross (SMA 50/200)
+  if (prev.sma50 != null && prev.sma200 != null && latest.sma50 != null && latest.sma200 != null) {
+    if (prev.sma50 <= prev.sma200 && latest.sma50 > latest.sma200)
+      await push("golden", "⭐", `*Golden Cross* (SMA50 cắt lên SMA200) — bull trend dài hạn`);
+    if (prev.sma50 >= prev.sma200 && latest.sma50 < latest.sma200)
+      await push("death", "💀", `*Death Cross* (SMA50 cắt xuống SMA200) — bear trend dài hạn`);
+  }
+
+  // EMA 21/50 cross (short-term)
+  if (prev.ema21 != null && prev.ema50 != null && latest.ema21 != null && latest.ema50 != null) {
+    if (prev.ema21 <= prev.ema50 && latest.ema21 > latest.ema50)
+      await push("ema_up", "📊", "EMA21 cắt lên EMA50 — short-term bullish");
+    if (prev.ema21 >= prev.ema50 && latest.ema21 < latest.ema50)
+      await push("ema_dn", "📊", "EMA21 cắt xuống EMA50 — short-term bearish");
+  }
+
+  // Pivot levels break
+  if (pivots) {
+    const levels = [
+      { key: "r2", label: "R2", price: pivots.r2 },
+      { key: "r1", label: "R1", price: pivots.r1 },
+      { key: "s1", label: "S1", price: pivots.s1 },
+      { key: "s2", label: "S2", price: pivots.s2 },
+    ];
+    for (const { key, label, price } of levels) {
+      if (prev.close <= price && latest.close > price)
+        await push(`piv_up_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* lên`);
+      if (prev.close >= price && latest.close < price)
+        await push(`piv_dn_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* xuống`);
+    }
+  }
+
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────
+// Telegram send
+// ──────────────────────────────────────────────────────────
+async function sendTelegram(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      }),
+    });
+    if (!r.ok) {
+      console.log(`[telegram] send failed ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.log(`[telegram] error: ${e.message}`);
+    return false;
+  }
+}
+
+function formatAlertMessage(latest, alerts, pivots) {
+  const t = new Date().toISOString().slice(0, 16).replace("T", " ");
+  let m = `🥇 *XAU/USD Alert* (15m)\n`;
+  m += `Giá: *$${latest.close.toFixed(2)}* — ${t} UTC\n\n`;
+  m += `*Setups vừa kích hoạt:*\n`;
+  for (const a of alerts) m += `${a.icon} ${a.text}\n`;
+  m += `\n*Indicators:*\n`;
+  if (latest.rsi != null) m += `• RSI(14): ${latest.rsi.toFixed(1)}\n`;
+  if (latest.ema21 != null) m += `• EMA 21/50/200: ${latest.ema21.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}\n`;
+  if (latest.bbUpper != null) m += `• BB(20): ${latest.bbLower.toFixed(2)} - ${latest.bbUpper.toFixed(2)}\n`;
+  if (pivots) {
+    m += `\n*Pivots (daily):*\n`;
+    m += `R2 $${pivots.r2.toFixed(2)} | R1 $${pivots.r1.toFixed(2)} | PP $${pivots.pp.toFixed(2)}\n`;
+    m += `S1 $${pivots.s1.toFixed(2)} | S2 $${pivots.s2.toFixed(2)}\n`;
+  }
+  m += `\n[Mở app](https://xau-smc-analyzer.pages.dev/)`;
+  return m;
+}
+
+// Main cron handler
+async function runAlertCheck(env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.log("[cron] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID chưa set, skip");
+    return;
+  }
+  if (!env.TWELVEDATA_API_KEY) {
+    console.log("[cron] TWELVEDATA_API_KEY chưa set, skip");
+    return;
+  }
+  try {
+    const c15 = await fetchTdCandles(env, "15min", 220);
+    if (c15.length < 200) {
+      console.log(`[cron] insufficient candles: ${c15.length}`);
+      return;
+    }
+    const enriched = enrichIndicators(c15);
+    const latest = enriched[enriched.length - 1];
+    const prev = enriched[enriched.length - 2];
+
+    let pivots = null;
+    try {
+      const c1d = await fetchTdCandles(env, "1day", 5);
+      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
+    } catch (e) {
+      console.log(`[cron] daily fetch failed: ${e.message}`);
+    }
+
+    const alerts = await detectFreshAlerts(env, latest, prev, pivots);
+    if (alerts.length === 0) {
+      console.log(`[cron] no fresh alerts, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)}`);
+      return;
+    }
+    const msg = formatAlertMessage(latest, alerts, pivots);
+    const ok = await sendTelegram(env, msg);
+    console.log(`[cron] sent ${alerts.length} alerts, telegram=${ok}`);
+  } catch (e) {
+    console.log(`[cron] error: ${e.message}`);
+  }
+}
+
 async function tryWorkersAI(env, body) {
   if (!env.AI) return null;
   let parsed;
@@ -164,6 +456,11 @@ async function tryWorkersAI(env, body) {
 }
 
 export default {
+  // Cron handler: chạy theo schedule trong wrangler.toml [triggers] crons
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runAlertCheck(env));
+  },
+
   async fetch(request, env) {
     const origin = request.headers.get("Origin") || "";
     const url = new URL(request.url);
@@ -200,6 +497,21 @@ export default {
           "/probe",
         ],
       }, origin);
+    }
+
+    // Test Telegram setup: gửi message kiểm tra bot/chat_id config OK
+    if (url.pathname === "/test-telegram") {
+      const ok = await sendTelegram(env, "🔔 *Test alert* — Bot setup OK!\n\nNếu nhận được tin này thì cron alerts sẽ chạy ổn từ 15 phút tới.\n\n_xau-gemini-proxy_");
+      return jsonResponse(200, {
+        ok,
+        configured: !!(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+      }, origin);
+    }
+
+    // Trigger alert check thủ công (debug — bypass cron schedule)
+    if (url.pathname === "/run-alert-check") {
+      await runAlertCheck(env);
+      return jsonResponse(200, { ok: true, message: "Alert check chạy xong, xem console log" }, origin);
     }
 
     // Block non-allowed origins for actual API calls
