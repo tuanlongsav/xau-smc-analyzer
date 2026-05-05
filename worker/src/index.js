@@ -301,12 +301,12 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     }
   };
 
-  // ── 1. RSI extreme ──
+  // ── 1. RSI extreme (chuẩn 70/30) ──
   if (latest.rsi != null) {
-    if (latest.rsi > 75)
+    if (latest.rsi > 70)
       await push("rsi_overbought", "🔴", `RSI quá mua *${latest.rsi.toFixed(1)}* — coi chừng điều chỉnh`,
         "Watch BB upper / Pivot R1 cho rejection. Không chase long.");
-    if (latest.rsi < 25)
+    if (latest.rsi < 30)
       await push("rsi_oversold", "🟢", `RSI quá bán *${latest.rsi.toFixed(1)}* — khả năng hồi phục`,
         "Watch hỗ trợ S1/Recent Low cho bounce. Đợi confirm trước khi long.");
   }
