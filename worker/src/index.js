@@ -1073,7 +1073,9 @@ function helpMessage() {
 \`/nhanh1h4h1d\` — scan HTF
 
 *Tin tức (AI tổng hợp + dự đoán):*
-\`/tin\` — tin XAU 7 ngày + dự báo phản ứng catalyst (NFP/CPI/FOMC...)
+\`/tin\` — tổng hợp tin XAU 7 ngày + catalyst sắp tới
+\`/tin NFP\` — deep-dive 1 event (3 kịch bản + chiến lược trước/trong/sau)
+\`/tin CPI\` \`/tin FOMC\` \`/tin Fed\` \`/tin Powell\` …
 
 *Tư vấn cá nhân (AI):*
 \`/ai <câu hỏi>\` — risk management + position sizing
@@ -1354,82 +1356,149 @@ function formatTimeAgo(ts) {
   return `${Math.round(h / 24)}d`;
 }
 
-async function handleTinCmd(env, chatId, replyTo) {
+async function handleTinCmd(env, chatId, replyTo, topic = null) {
   await sendChatAction(env, chatId, "typing");
   try {
     const all = await getCachedNews(env);
     if (all.length === 0) {
-      await sendTelegramTo(env, chatId, "❌ Không lấy được tin tức (RSS proxy lỗi).", replyTo);
+      await sendTelegramTo(env, chatId, "❌ Không lấy được tin tức (RSS feed lỗi).", replyTo);
       return;
     }
     const sevenDaysAgo = Date.now() - 7 * 24 * 3600 * 1000;
-    const relevant = all
-      .filter(n => n.ts >= sevenDaysAgo)
-      .filter(isGoldRelevant)
-      .sort((a, b) => b.ts - a.ts);
-
-    if (relevant.length === 0) {
-      await sendTelegramTo(env, chatId, "ℹ️ Không có tin gold-relevant nào trong 7 ngày qua.", replyTo);
-      return;
-    }
-
-    const highImpact = relevant.filter(isHighImpact);
-    const top = relevant.slice(0, 20);
-
-    const newsList = top.map((n, i) => {
-      const tag = isHighImpact(n) ? " 🚨" : "";
-      return `${i + 1}.${tag} [${n.source} ${formatTimeAgo(n.ts)}] ${n.title}${n.summary ? `\n   ${n.summary.slice(0, 180)}` : ""}`;
-    }).join("\n");
+    const recent = all.filter(n => n.ts >= sevenDaysAgo).sort((a, b) => b.ts - a.ts);
 
     const today = new Date().toISOString().slice(0, 10);
-    const systemText = `Bạn là chuyên gia phân tích tin tức macro & tác động lên XAU/USD.
+    let filtered, topicLabel = null, systemText, userText;
 
-NHIỆM VỤ:
-- Tổng hợp 3-5 chủ đề chính từ tin tức 7 ngày
-- Highlight catalysts mạnh sắp tới (NFP, CPI, FOMC, Fed speech...) trong tuần này/tới
-- Dự đoán PHẢN ỨNG có thể của XAU với mỗi catalyst (bullish/bearish, biên độ ước tính)
-- Đề xuất hướng tiếp cận: vào lệnh khi nào, tránh khi nào, position size
+    if (topic && topic.trim().length >= 2) {
+      // ── MODE: deep-dive 1 sự kiện cụ thể ──
+      topicLabel = topic.trim();
+      const tokens = topicLabel.toLowerCase().split(/\s+/);
+      filtered = recent.filter(n => {
+        const t = (n.title + " " + (n.summary || "")).toLowerCase();
+        return tokens.some(tk => t.includes(tk));
+      });
 
-NGÔN NGỮ — bilingual:
-- "tăng giá (bullish)" / "giảm giá (bearish)" / "tích cực" / "tiêu cực"
-- "Số liệu việc làm Mỹ (NFP — Non-Farm Payrolls)"
-- "Chỉ số giá tiêu dùng (CPI)" / "Chỉ số giá sản xuất (PPI)"
-- "Quyết định lãi suất (Rate Decision)"
-- "Cuộc họp FOMC" / "Phát biểu Powell"
+      const newsList = filtered.slice(0, 20).map((n, i) => {
+        const tag = isHighImpact(n) ? " 🚨" : "";
+        return `${i + 1}.${tag} [${n.source} ${formatTimeAgo(n.ts)}] ${n.title}${n.summary ? `\n   ${n.summary.slice(0, 180)}` : ""}`;
+      }).join("\n") || "(Không có tin chi tiết — dùng kiến thức general)";
 
-NGUYÊN TẮC:
-- Tin macro tích cực USD (NFP cao, CPI cao, hawkish Fed) → DXY tăng → XAU GIẢM
-- Tin macro tiêu cực USD (NFP thấp, CPI thấp, dovish Fed) → DXY giảm → XAU TĂNG
-- Bất ổn địa chính trị / risk-off → XAU TĂNG (safe-haven)
-- KHÔNG khuyến nghị mua/bán cụ thể, chỉ dự đoán phản ứng + scenario.
+      systemText = `Bạn là chuyên gia phân tích event-driven trading XAU/USD.
 
-FORMAT MARKDOWN ĐƠN GIẢN.`;
+NHIỆM VỤ: Phân tích chuyên sâu sự kiện kinh tế cụ thể user hỏi → 3 kịch bản phản ứng + chiến lược trước/trong/sau event.
 
-    const userText = `Hôm nay: ${today}
+NGÔN NGỮ — bilingual Việt-Anh: "tăng giá (bullish)", "giảm giá (bearish)", "diều hâu (hawkish)", "bồ câu (dovish)", "trên dự báo (above forecast)", "dưới dự báo (below forecast)".
 
-📰 ${relevant.length} tin gold-relevant 7 ngày qua (${highImpact.length} tin high-impact 🚨):
+NGUYÊN TẮC CORRELATION:
+- Số liệu USD tích cực (NFP cao, CPI cao, hawkish Fed) → DXY ↑ → XAU ↓ (giảm giá)
+- Số liệu USD tiêu cực (NFP thấp, CPI thấp, dovish Fed) → DXY ↓ → XAU ↑ (tăng giá)
+- Bất ổn địa chính trị / risk-off → XAU ↑ (safe-haven)
+- Tăng trưởng GDP cao → có thể XAU giảm (risk-on rotation)
+
+KIẾN THỨC SẴN VỀ MAJOR EVENTS:
+- NFP (Non-Farm Payrolls): Thứ 6 đầu tháng 19:30 GMT+7. Forecast 150-250K. Tác động ±$30-100/oz cho XAU.
+- CPI (Consumer Price Index): giữa tháng 19:30 GMT+7. Forecast YoY ~2-4%. Tác động ±$20-80. Core CPI quan trọng nhất.
+- FOMC Decision: 8 lần/năm 02:00 GMT+7 + Powell press conf. Tác động lớn nhất ±$50-150.
+- PPI: cuối tháng 19:30. Tác động vừa.
+- GDP: hàng quý 19:30. Tác động vừa-thấp.
+- Unemployment Claims: Thứ 5 hàng tuần 19:30. Tác động thấp.
+- Retail Sales: giữa tháng 19:30.
+
+FORMAT OUTPUT (Markdown):
+**📌 Bối cảnh**
+- ${topicLabel} là gì + ý nghĩa với XAU
+- Lần công bố trước (nếu suy được từ tin)
+
+**📅 Lịch trình sắp tới**
+- Ngày + giờ (GMT+7) ước tính
+- Forecast (dự báo) vs Prior (lần trước) nếu biết
+
+**🎯 3 KỊCH BẢN PHẢN ỨNG XAU**
+1. Kịch bản BULLISH (số liệu USD yếu hơn dự báo): xác suất X%, biên độ +$Y → +$Z
+   - Action: ưu tiên LONG khi giá phá vùng A, SL B, TP C
+2. Kịch bản TRUNG TÍNH (số liệu sát forecast): xác suất X%, sideways trong vùng D-E
+   - Action: đứng ngoài hoặc scalp 2 chiều
+3. Kịch bản BEARISH (số liệu USD mạnh hơn dự báo): xác suất X%, biên độ -$Y → -$Z
+   - Action: SHORT khi giá break dưới F, SL G, TP H
+
+**📋 QUẢN LÝ LỆNH**
+- Trước event 30-60p: đóng partial / dời SL về break-even / đứng ngoài hoàn toàn
+- Trong event: KHÔNG vào lệnh (spread giãn 5-10x), KHÔNG sửa SL/TP
+- Sau event 5-15p: đợi candle 1-5p đóng + retest, vào theo hướng break
+
+**⚠️ Rủi ro specific cho ${topicLabel}**
+- Stop hunt cả 2 chiều (whipsaw 5-10p đầu)
+- Spread giãn → SL bị quét sớm
+- Slippage có thể $5-20
+
+KHÔNG khuyến nghị mua/bán cụ thể, chỉ phân tích kịch bản + chiến lược.`;
+
+      userText = `Hôm nay: ${today}
+
+🎯 PHÂN TÍCH CHUYÊN SÂU: ${topicLabel}
+
+Tin liên quan đến "${topicLabel}" trong 7 ngày (${filtered.length} tin):
 
 ${newsList}
 
-Hãy tổng hợp + dự đoán theo format:
+Phân tích theo format đã quy định.`;
+    } else {
+      // ── MODE: tổng hợp tuần (như cũ) ──
+      filtered = recent.filter(isGoldRelevant);
+      if (filtered.length === 0) {
+        await sendTelegramTo(env, chatId, "ℹ️ Không có tin gold-relevant nào trong 7 ngày qua.", replyTo);
+        return;
+      }
+      const highImpact = filtered.filter(isHighImpact);
+      const top = filtered.slice(0, 20);
+      const newsList = top.map((n, i) => {
+        const tag = isHighImpact(n) ? " 🚨" : "";
+        return `${i + 1}.${tag} [${n.source} ${formatTimeAgo(n.ts)}] ${n.title}${n.summary ? `\n   ${n.summary.slice(0, 180)}` : ""}`;
+      }).join("\n");
+
+      systemText = `Bạn là chuyên gia phân tích tin tức macro & tác động lên XAU/USD.
+
+NHIỆM VỤ:
+- Tổng hợp 3-5 chủ đề chính từ tin tức 7 ngày
+- Highlight catalysts mạnh sắp tới (NFP, CPI, FOMC, Fed speech...)
+- Dự đoán phản ứng XAU + đề xuất tiếp cận
+
+NGÔN NGỮ — bilingual:
+- "tăng giá (bullish)" / "giảm giá (bearish)"
+- "Số liệu việc làm Mỹ (NFP)" / "Chỉ số giá tiêu dùng (CPI)"
+- "Quyết định lãi suất (Rate Decision)"
+- "diều hâu (hawkish)" / "bồ câu (dovish)"
+
+NGUYÊN TẮC: tin USD tích cực → DXY ↑ → XAU ↓; tin USD tiêu cực → DXY ↓ → XAU ↑.
+KHÔNG khuyến nghị mua/bán cụ thể.
+
+FORMAT MARKDOWN.`;
+
+      userText = `Hôm nay: ${today}
+
+📰 ${filtered.length} tin gold-relevant 7 ngày (${highImpact.length} tin high-impact 🚨):
+
+${newsList}
+
+Tổng hợp theo format:
 
 **📌 Chủ đề chính tuần qua**
 - Chủ đề 1: ...
-- Chủ đề 2: ...
 
-**🚨 Catalysts mạnh sắp tới** (nếu có lịch trình rõ — VD "NFP thứ 6 tuần này")
+**🚨 Catalysts mạnh sắp tới**
 - Sự kiện: ngày + giờ + dự đoán phản ứng XAU
 
 **📈 Dự báo XAU**
-- Bias chung tuần tới: tăng/giảm/sideways + lý do
-- Vùng giá quan tâm
+- Bias tuần tới + vùng giá
 
 **💡 Khuyến nghị tiếp cận**
-- Ưu tiên: long/short/đứng ngoài
-- Tránh: vào lệnh trước event nào / khung giờ nào
+- Ưu tiên + tránh
 
 **⚠️ Rủi ro chính**
-- ...`;
+
+💡 Tip: Để phân tích sâu 1 event, dùng \`/tin NFP\` hoặc \`/tin CPI\` hoặc \`/tin FOMC\`.`;
+    }
 
     const body = {
       systemInstruction: { parts: [{ text: systemText }] },
@@ -1448,8 +1517,15 @@ Hãy tổng hợp + dự đoán theo format:
       return;
     }
 
-    let m = `📰 *Tổng hợp tin XAU 7 ngày*\n`;
-    m += `_${relevant.length} tin liên quan, ${highImpact.length} tin high-impact 🚨_\n\n`;
+    let m;
+    if (topicLabel) {
+      m = `📰 *Phân tích chuyên sâu: ${topicLabel}*\n`;
+      m += `_${filtered.length} tin liên quan đến "${topicLabel}" trong 7 ngày_\n\n`;
+    } else {
+      const highImp = filtered.filter(isHighImpact).length;
+      m = `📰 *Tổng hợp tin XAU 7 ngày*\n`;
+      m += `_${filtered.length} tin liên quan, ${highImp} tin high-impact 🚨_\n\n`;
+    }
     m += aiText;
     m += `\n\n_Source: FXStreet, Investing.com, MarketWatch_`;
 
@@ -2312,8 +2388,10 @@ async function handleTelegramUpdate(env, update) {
     return;
   }
   // /tin — tổng hợp tin tức 7 ngày + AI dự đoán
+  // /tin <topic> — phân tích chuyên sâu 1 event (NFP/CPI/FOMC/...)
   if (cmd === "/tin" || cmd === "/news") {
-    await handleTinCmd(env, chatId, replyTo);
+    const topic = text.replace(/^\S+\s*/, "").trim();
+    await handleTinCmd(env, chatId, replyTo, topic || null);
     return;
   }
   // /ai (hoặc /AI), /ask, /hoi — tư vấn position sizing / risk management
