@@ -420,22 +420,41 @@ function extractText(geminiResp) {
 // ──────────────────────────────────────────────────────────
 // Telegram bot — receive group messages, parse commands, reply
 // ──────────────────────────────────────────────────────────
-async function sendTelegramTo(env, chatId, text, replyToMessageId = null) {
+/**
+ * Gửi message Telegram. parseMode default "Markdown" cho static; pass null
+ * khi text đến từ AI (tránh Bad Request entity parse error do AI output
+ * có ký tự Markdown không cân: ** lẻ, _ trong tên biến, ngoặc...).
+ * Auto-fallback sang plain text khi 400.
+ */
+async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseMode = "Markdown") {
   if (!env.TELEGRAM_BOT_TOKEN) return false;
-  const body = {
-    chat_id: chatId,
-    text,
-    parse_mode: "Markdown",
-    disable_web_page_preview: true,
+  const buildBody = (mode) => {
+    const b = { chat_id: chatId, text, disable_web_page_preview: true };
+    if (mode) b.parse_mode = mode;
+    if (replyToMessageId) b.reply_to_message_id = replyToMessageId;
+    return JSON.stringify(b);
   };
-  if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const post = async (mode) => {
+    return fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: buildBody(mode),
     });
-    if (!r.ok) console.log(`[tg-reply] ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  };
+  try {
+    let r = await post(parseMode);
+    // Nếu Markdown parse fail → retry plain text (auto-fallback)
+    if (!r.ok && parseMode === "Markdown") {
+      const errText = await r.text();
+      if (errText.includes("can't parse entities") || errText.includes("parse_mode")) {
+        console.log(`[tg-reply] markdown fail, retry plain`);
+        r = await post(null);
+      } else {
+        console.log(`[tg-reply] ${r.status}: ${errText.slice(0, 200)}`);
+      }
+    } else if (!r.ok) {
+      console.log(`[tg-reply] ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    }
     return r.ok;
   } catch (e) {
     console.log(`[tg-reply] error: ${e.message}`);
@@ -532,7 +551,12 @@ KHÔNG khuyến nghị mua/bán cụ thể.`;
     };
     const resp = await callGeminiSmart(env, body);
     const text = extractText(resp);
-    await sendTelegramTo(env, chatId, text ? `🥇 *Quick Scan*\n\n${text}` : "❌ AI unavailable", replyTo);
+    if (text) {
+      // Plain text — AI output có thể có ký tự Markdown không cân
+      await sendTelegramTo(env, chatId, `🥇 Quick Scan\n\n${text}`, replyTo, null);
+    } else {
+      await sendTelegramTo(env, chatId, "❌ AI unavailable", replyTo);
+    }
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
@@ -611,7 +635,8 @@ NGUYÊN TẮC: SL ngoài vùng nhiễu (>1×ATR cách swing) tránh liquidity sw
     }
     // Telegram limit 4096 chars
     const safe = text.length > 3800 ? text.slice(0, 3800) + "\n…(cắt bớt)" : text;
-    await sendTelegramTo(env, chatId, `🧠 *SMC ${tf}*\n\n${safe}`, replyTo);
+    // Plain text vì AI output có Markdown không cân (vd "EMA 21 → bắt đầu *uptrend")
+    await sendTelegramTo(env, chatId, `🧠 SMC ${tf}\n\n${safe}`, replyTo, null);
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
