@@ -364,6 +364,307 @@ function formatAlertMessage(latest, alerts, pivots) {
   return m;
 }
 
+// ──────────────────────────────────────────────────────────
+// Reusable: call Gemini với KV cache + rotation + Workers AI fallback
+// (Dùng từ Telegram bot handler — khác /v1beta route ở chỗ trả parsed JSON)
+// ──────────────────────────────────────────────────────────
+async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
+  const bodyStr = JSON.stringify(body);
+  const hash = await hashBody(bodyStr);
+  const cacheKey = `gemini:${model}:${hash}`;
+
+  // Cache hit
+  const cached = await cacheGet(env, cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch {}
+  }
+
+  // Try Gemini keys
+  const allKeys = collectGeminiKeys(env);
+  const active = allKeys.filter(k => !isKeyOnCooldown(k.label));
+  const tryKeys = active.length > 0 ? active : allKeys;
+
+  for (const { key, label } of tryKeys) {
+    try {
+      const r = await fetch(`${GOOGLE_BASE}/v1beta/models/${model}:generateContent?key=${key}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: bodyStr,
+      });
+      if (r.status === 200) {
+        clearKeyCooldown(label);
+        const json = await r.json();
+        await cachePut(env, cacheKey, JSON.stringify(json));
+        return json;
+      }
+      markKeyCooldown(label, r.status);
+    } catch (e) {
+      console.log(`[gemini-smart] ${label} error: ${e.message}`);
+    }
+  }
+
+  // Fallback Workers AI
+  const ai = await tryWorkersAI(env, bodyStr);
+  if (ai) {
+    await cachePut(env, cacheKey, JSON.stringify(ai));
+    return ai;
+  }
+  return null;
+}
+
+function extractText(geminiResp) {
+  return geminiResp?.candidates?.[0]?.content?.parts
+    ?.map(p => p.text || "").join("\n") || null;
+}
+
+// ──────────────────────────────────────────────────────────
+// Telegram bot — receive group messages, parse commands, reply
+// ──────────────────────────────────────────────────────────
+async function sendTelegramTo(env, chatId, text, replyToMessageId = null) {
+  if (!env.TELEGRAM_BOT_TOKEN) return false;
+  const body = {
+    chat_id: chatId,
+    text,
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+  };
+  if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) console.log(`[tg-reply] ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    return r.ok;
+  } catch (e) {
+    console.log(`[tg-reply] error: ${e.message}`);
+    return false;
+  }
+}
+
+const TF_TO_TD = { "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day" };
+const TF_HORIZON = { "5m": "30-60 phút", "15m": "2-4 giờ", "1h": "1-2 ngày", "4h": "2-3 ngày", "1d": "1-2 tuần" };
+
+function helpMessage() {
+  return `🥇 *XAU Bot — Lệnh*
+
+\`/gia\` — giá hiện tại + indicators
+\`/nhanh\` — AI quick scan 3-5 dòng
+
+*Phân tích SMC theo khung:*
+\`/5p\` — khung 5 phút
+\`/15p\` — khung 15 phút
+\`/1h\` — khung 1 giờ
+\`/4h\` — khung 4 giờ
+\`/1d\` — khung 1 ngày
+
+Ví dụ: gõ \`/1h\` để phân tích khung 1 giờ.
+
+App đầy đủ: [xau-smc-analyzer.pages.dev](https://xau-smc-analyzer.pages.dev)`;
+}
+
+// Map lệnh tiếng Việt → TF nội bộ
+const VN_CMD_TO_TF = {
+  "/5p": "5m", "/5m": "5m",
+  "/15p": "15m", "/15m": "15m",
+  "/1h": "1h", "/1g": "1h", "/1gio": "1h",
+  "/4h": "4h", "/4g": "4h", "/4gio": "4h",
+  "/1d": "1d", "/1ngay": "1d", "/ngay": "1d",
+};
+
+async function handlePriceCmd(env, chatId, replyTo) {
+  try {
+    const c15 = await fetchTdCandles(env, "15min", 220);
+    if (c15.length < 50) {
+      await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
+      return;
+    }
+    const e = enrichIndicators(c15);
+    const l = e[e.length - 1];
+    let pivots = null;
+    try {
+      const c1d = await fetchTdCandles(env, "1day", 5);
+      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
+    } catch {}
+
+    let m = `🥇 *XAU/USD* — 15m\n`;
+    m += `Giá: *$${l.close.toFixed(2)}*\n\n`;
+    m += `RSI(14): *${l.rsi?.toFixed(1)}*\n`;
+    m += `EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}\n`;
+    m += `SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)}\n`;
+    m += `BB(20): ${l.bbLower?.toFixed(2)} – ${l.bbUpper?.toFixed(2)}`;
+    if (pivots) {
+      m += `\n\n*Pivots (daily):*\nR2 ${pivots.r2.toFixed(2)} | R1 ${pivots.r1.toFixed(2)} | PP ${pivots.pp.toFixed(2)}\nS1 ${pivots.s1.toFixed(2)} | S2 ${pivots.s2.toFixed(2)}`;
+    }
+    await sendTelegramTo(env, chatId, m, replyTo);
+  } catch (e) {
+    await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
+  }
+}
+
+async function handleScanCmd(env, chatId, replyTo) {
+  await sendTelegramTo(env, chatId, "⏳ Đang scan...", replyTo);
+  try {
+    const c15 = await fetchTdCandles(env, "15min", 220);
+    if (c15.length < 50) {
+      await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
+      return;
+    }
+    const e = enrichIndicators(c15);
+    const l = e[e.length - 1];
+
+    const prompt = `Giá XAU/USD: $${l.close.toFixed(2)} (khung 15m)
+RSI(14): ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}
+SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)}
+BB(20): ${l.bbLower?.toFixed(2)} – ${l.bbUpper?.toFixed(2)}
+
+Trả lời tiếng Việt 3-5 dòng:
+1. Phe mua/bán đang kiểm soát?
+2. Mốc S/R cần watch?
+3. Setup đáng quan tâm 2-4h tới?
+
+KHÔNG khuyến nghị mua/bán cụ thể.`;
+
+    const body = {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 500, temperature: 0.5 },
+    };
+    const resp = await callGeminiSmart(env, body);
+    const text = extractText(resp);
+    await sendTelegramTo(env, chatId, text ? `🥇 *Quick Scan*\n\n${text}` : "❌ AI unavailable", replyTo);
+  } catch (e) {
+    await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
+  }
+}
+
+async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
+  const tf = (tfArg || "15m").toLowerCase();
+  if (!TF_TO_TD[tf]) {
+    await sendTelegramTo(env, chatId, `❌ TF không hợp lệ. Dùng: ${Object.keys(TF_TO_TD).join(", ")}`, replyTo);
+    return;
+  }
+  await sendTelegramTo(env, chatId, `⏳ Phân tích SMC khung ${tf}...`, replyTo);
+
+  try {
+    const candles = await fetchTdCandles(env, TF_TO_TD[tf], 220);
+    if (candles.length < 50) {
+      await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
+      return;
+    }
+    const e = enrichIndicators(candles);
+    const l = e[e.length - 1];
+
+    let pivots = null;
+    try {
+      const c1d = await fetchTdCandles(env, "1day", 5);
+      if (c1d.length >= 2) pivots = computePivots(c1d[c1d.length - 2]);
+    } catch {}
+
+    const last10 = candles.slice(-10).map(c =>
+      `O=${c.open.toFixed(2)} H=${c.high.toFixed(2)} L=${c.low.toFixed(2)} C=${c.close.toFixed(2)}`
+    ).join(" | ");
+    const horizon = TF_HORIZON[tf];
+    const pivotStr = pivots
+      ? `R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
+      : "không có";
+
+    const prompt = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC. Phân tích khung ${tf}, horizon ${horizon}.
+
+DỮ LIỆU:
+- Giá: $${l.close.toFixed(2)} | RSI(14): ${l.rsi?.toFixed(1)}
+- EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}
+- SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(golden)" : "(death)"}
+- BB(20): ${l.bbLower?.toFixed(2)} - ${l.bbUpper?.toFixed(2)}
+- Pivots: ${pivotStr}
+- 10 nến: ${last10}
+
+Trả lời tiếng Việt format Markdown:
+
+📊 *Cấu trúc & Động lượng*
+• Phe kiểm soát: ...
+• BOS/CHOCH: ...
+• RSI/MACD: ... (phân kỳ/kiệt sức/bình thường)
+
+🎯 *Vùng cản quan trọng*
+• Kháng cự: 2 mức + lý do
+• Hỗ trợ: 2 mức + lý do
+
+💡 *Kế hoạch ${horizon}*
+LONG: Entry=$X, SL=$Y, TP=$Z, R:R=N (lý do ngắn) — hoặc "không khả thi"
+SHORT: Entry=$X, SL=$Y, TP=$Z, R:R=N (lý do ngắn) — hoặc "không khả thi"
+
+⚠️ *Rủi ro*
+• 2-3 điểm
+
+NGUYÊN TẮC: SL ngoài vùng nhiễu (>1×ATR cách swing) tránh liquidity sweep. R:R tối thiểu 1:1.5. Mọi mức giá phải là số cụ thể. KHÔNG khuyến nghị "mua/bán ngay".`;
+
+    const body = {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 1500, temperature: 0.5 },
+    };
+    const resp = await callGeminiSmart(env, body);
+    const text = extractText(resp);
+    if (!text) {
+      await sendTelegramTo(env, chatId, "❌ AI unavailable", replyTo);
+      return;
+    }
+    // Telegram limit 4096 chars
+    const safe = text.length > 3800 ? text.slice(0, 3800) + "\n…(cắt bớt)" : text;
+    await sendTelegramTo(env, chatId, `🧠 *SMC ${tf}*\n\n${safe}`, replyTo);
+  } catch (e) {
+    await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
+  }
+}
+
+async function handleTelegramUpdate(env, update) {
+  const msg = update.message || update.channel_post;
+  if (!msg?.text) return;
+
+  const chatId = String(msg.chat.id);
+  const text = msg.text.trim();
+  const replyTo = msg.message_id;
+
+  // Auth: chỉ chấp nhận từ chat đã configure (defense against random chats finding webhook)
+  if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
+    console.log(`[bot] ignore from chat ${chatId}`);
+    return;
+  }
+
+  // Parse command (strip @bot_username if mentioned)
+  const tokens = text.split(/\s+/);
+  const cmd = tokens[0].toLowerCase().split("@")[0];
+  const args = tokens.slice(1);
+
+  console.log(`[bot] cmd=${cmd} args=${args.join(",")}`);
+  // Help / start
+  if (cmd === "/start" || cmd === "/help" || cmd === "/trogiup") {
+    await sendTelegramTo(env, chatId, helpMessage(), replyTo);
+    return;
+  }
+  // Giá hiện tại (no AI, instant)
+  if (cmd === "/gia" || cmd === "/giá" || cmd === "/price") {
+    await handlePriceCmd(env, chatId, replyTo);
+    return;
+  }
+  // Quick scan AI
+  if (cmd === "/nhanh" || cmd === "/scan" || cmd === "/quick") {
+    await handleScanCmd(env, chatId, replyTo);
+    return;
+  }
+  // Phân tích SMC theo TF — match lệnh tiếng Việt /5p, /15p, /1h, /4h, /1d, ...
+  if (VN_CMD_TO_TF[cmd]) {
+    await handleAnalyzeCmd(env, chatId, replyTo, VN_CMD_TO_TF[cmd]);
+    return;
+  }
+  // Backward compat: /analyze [tf] hoặc /smc [tf]
+  if (cmd === "/analyze" || cmd === "/smc" || cmd === "/phantich") {
+    await handleAnalyzeCmd(env, chatId, replyTo, args[0] || "15m");
+    return;
+  }
+  // Bỏ qua các message khác (không spam group)
+}
+
 // Main cron handler
 async function runAlertCheck(env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
@@ -461,7 +762,7 @@ export default {
     ctx.waitUntil(runAlertCheck(env));
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const origin = request.headers.get("Origin") || "";
     const url = new URL(request.url);
 
@@ -497,6 +798,29 @@ export default {
           "/probe",
         ],
       }, origin);
+    }
+
+    // Telegram webhook endpoint — Telegram POST update tới đây mỗi khi có message
+    if (url.pathname === "/telegram-webhook" && request.method === "POST") {
+      try {
+        const update = await request.json();
+        // Process async để Telegram không phải đợi
+        ctx.waitUntil(handleTelegramUpdate(env, update));
+      } catch (e) {
+        console.log(`[webhook] parse error: ${e.message}`);
+      }
+      return new Response("OK", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+
+    // Setup webhook (chạy 1 lần sau deploy để register URL với Telegram)
+    if (url.pathname === "/setup-webhook") {
+      if (!env.TELEGRAM_BOT_TOKEN) {
+        return jsonResponse(500, { error: "TELEGRAM_BOT_TOKEN chưa set" }, origin);
+      }
+      const webhookUrl = `https://${url.host}/telegram-webhook`;
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
+      const result = await r.json();
+      return jsonResponse(200, { webhookUrl, telegramResponse: result }, origin);
     }
 
     // Test Telegram setup: gửi message kiểm tra bot/chat_id config OK
