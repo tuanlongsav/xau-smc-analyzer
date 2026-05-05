@@ -257,6 +257,89 @@ function computePivots(candle) {
 }
 
 /**
+ * Phiên giao dịch hiện tại theo UTC (XAU: Á thấp, Âu/Mỹ cao).
+ */
+function getTradingSession() {
+  const h = new Date().getUTCHours();
+  if (h >= 0 && h < 7) return "Á (volatility thấp, thường đi ngang)";
+  if (h >= 7 && h < 8) return "giao thoa Á-Âu (bắt đầu volatile)";
+  if (h >= 8 && h < 13) return "Âu (volatility tăng, có xu hướng)";
+  if (h >= 13 && h < 16) return "giao thoa Âu-Mỹ (volatility cao nhất)";
+  if (h >= 16 && h < 21) return "Mỹ (volatility cao, có thể reversal)";
+  return "ngoài giờ chính (thanh khoản thấp)";
+}
+
+/**
+ * Phát hiện pattern nến — Pin bar / Engulfing / Doji / Marubozu.
+ */
+function detectCandlePattern(latest, prev) {
+  const o = latest.open, c = latest.close, h = latest.high, l = latest.low;
+  const body = Math.abs(c - o);
+  const range = h - l;
+  if (range === 0) return "Doji không biên độ";
+  const bodyRatio = body / range;
+  const upperWick = h - Math.max(o, c);
+  const lowerWick = Math.min(o, c) - l;
+  const upperRatio = upperWick / range;
+  const lowerRatio = lowerWick / range;
+
+  if (bodyRatio < 0.3 && lowerRatio > 0.6)
+    return "Pin bar đáy (Hammer) — râu dưới dài, báo hiệu đảo chiều TĂNG";
+  if (bodyRatio < 0.3 && upperRatio > 0.6)
+    return "Pin bar đỉnh (Shooting Star) — râu trên dài, báo hiệu đảo chiều GIẢM";
+  if (bodyRatio < 0.1) return "Doji — phe mua bán cân bằng, do dự";
+
+  if (prev) {
+    const prevBody = Math.abs(prev.close - prev.open);
+    const prevBullish = prev.close > prev.open;
+    const currBullish = c > o;
+    if (!prevBullish && currBullish && body > prevBody && o <= prev.close && c >= prev.open)
+      return "Bullish Engulfing (nến nhấn chìm tăng) — đảo chiều TĂNG mạnh";
+    if (prevBullish && !currBullish && body > prevBody && o >= prev.close && c <= prev.open)
+      return "Bearish Engulfing (nến nhấn chìm giảm) — đảo chiều GIẢM mạnh";
+  }
+  if (bodyRatio > 0.7) {
+    return c > o ? "Marubozu tăng (nến đặc) — momentum phe MUA mạnh" : "Marubozu giảm (nến đặc) — momentum phe BÁN mạnh";
+  }
+  return c > o ? "Nến tăng bình thường" : "Nến giảm bình thường";
+}
+
+/**
+ * HTF trend (4h + 1d) — cached 1h, dùng cho LTF analysis cần context lớn.
+ */
+async function getHTFContext(env) {
+  const cacheKey = `htf_trend:${new Date().toISOString().slice(0, 13)}`;
+  if (env.CACHE) {
+    const cached = await env.CACHE.get(cacheKey);
+    if (cached) { try { return JSON.parse(cached); } catch {} }
+  }
+  try {
+    const [c4h, c1d] = await Promise.all([
+      fetchTdCandles(env, "4h", 220),
+      fetchTdCandles(env, "1day", 220),
+    ]);
+    const trendOf = (candles) => {
+      if (!candles || candles.length < 50) return "chưa rõ";
+      const e = enrichIndicators(candles);
+      const last = e[e.length - 1];
+      if (last.close > last.ema200 && last.ema21 > last.ema50 && last.ema50 > last.ema200) return "Tăng mạnh";
+      if (last.close > last.ema50 && last.close > last.ema200) return "Tăng";
+      if (last.close < last.ema200 && last.ema21 < last.ema50 && last.ema50 < last.ema200) return "Giảm mạnh";
+      if (last.close < last.ema50 && last.close < last.ema200) return "Giảm";
+      return "Sideways";
+    };
+    const result = { trend4h: trendOf(c4h), trend1d: trendOf(c1d) };
+    if (env.CACHE) {
+      await env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 });
+    }
+    return result;
+  } catch (e) {
+    console.log(`[htf-context] fail: ${e.message}`);
+    return null;
+  }
+}
+
+/**
  * Lấy daily pivots — cache KV theo ngày UTC, auto-rotate khi qua nửa đêm.
  * Tiết kiệm TwelveData calls (yesterday's daily candle ổn định trong ngày).
  *
@@ -669,21 +752,21 @@ function extractJSON(text) {
 function helpMessage() {
   return `🥇 *XAU Bot — Lệnh*
 
-\`/gia\` — giá hiện tại + indicators (instant)
+*Tức thời (no AI):*
+\`/gia\` — giá + indicators 1 khung
+\`/nhanh\` — Pulse 5 khung (bias mỗi khung, kết luận chung)
 
-*Quick scan (~5s/khung):*
-\`/nhanh\` (15p mặc định) | \`/nhanh5p\` \`/nhanh15p\` \`/nhanh1h\` \`/nhanh4h\` \`/nhanh1d\`
+*Quick scan AI (~5s/khung):*
+\`/nhanh5p\` \`/nhanh15p\` \`/nhanh1h\` \`/nhanh4h\` \`/nhanh1d\`
 
-*Phân tích SMC chi tiết (~15s/khung):*
+*Phân tích chi tiết (~15s/khung, có entry/SL/TP1-2-3):*
 \`/5p\` \`/15p\` \`/1h\` \`/4h\` \`/1d\`
 
-*Combo nhiều khung (top-down):*
+*Combo top-down nhiều khung:*
 \`/5p15p1h\` — chi tiết 3 khung intraday
 \`/1h4h1d\` — chi tiết 3 khung HTF
-\`/nhanh5p15p1h\` — quick scan 3 khung
-\`/nhanh1h4h1d\` — quick scan HTF
-
-Combo theo bất kỳ thứ tự: \`/15p1h4h\`, \`/nhanh4h1d\`, ...
+\`/nhanh5p15p1h\` — scan 3 khung
+\`/nhanh1h4h1d\` — scan HTF
 
 App đầy đủ: [xau-smc-analyzer.pages.dev](https://xau-smc-analyzer.pages.dev)`;
 }
@@ -697,9 +780,8 @@ const VN_CMD_TO_TF = {
   "/1d": "1d", "/1ngay": "1d", "/ngay": "1d",
 };
 
-// Map lệnh /nhanhXX → TF (quick scan ngắn theo khung)
+// Map lệnh /nhanhXX → TF (quick scan AI theo khung — KHÔNG có /nhanh)
 const VN_SCAN_CMD_TO_TF = {
-  "/nhanh": "15m",       // default 15m
   "/nhanh5p": "5m",
   "/nhanh15p": "15m",
   "/nhanh1h": "1h",
@@ -707,6 +789,7 @@ const VN_SCAN_CMD_TO_TF = {
   "/nhanh1d": "1d",
   "/scan": "15m", "/quick": "15m", // backward compat
 };
+// /nhanh (không TF) = Pulse all-TF overview, không dùng AI, instant
 
 /**
  * Parse combo TF command như /5p15p1h hoặc /nhanh5p15p1h.
@@ -808,6 +891,97 @@ async function handlePriceCmd(env, chatId, replyTo) {
         m += `▼ <b>$${lv.price.toFixed(2)}</b> — ${htmlEsc(lv.label)} <i>(-${(c - lv.price).toFixed(2)})</i>\n`;
       }
     }
+
+    await sendTelegramTo(env, chatId, m, replyTo, "HTML");
+  } catch (e) {
+    await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
+  }
+}
+
+/**
+ * /nhanh = Pulse 5 khung (no AI, fast). Dùng EMA alignment + RSI rule-based.
+ */
+async function handleNhanhPulse(env, chatId, replyTo) {
+  await sendChatAction(env, chatId, "typing");
+  try {
+    const tfs = ["5m", "15m", "1h", "4h", "1d"];
+    const data = await Promise.all(tfs.map(async tf => {
+      try {
+        const candles = await fetchTdCandles(env, TF_TO_TD[tf], 220);
+        if (candles.length < 50) return null;
+        const e = enrichIndicators(candles);
+        return { tf, latest: e[e.length - 1], prev: e[e.length - 2] };
+      } catch { return null; }
+    }));
+    const valid = data.filter(Boolean);
+    if (valid.length === 0) {
+      await sendTelegramTo(env, chatId, "❌ Không fetch được data", replyTo);
+      return;
+    }
+    const c = valid[0].latest.close;
+    const pivots = await getCachedDailyPivots(env);
+
+    const determineBias = (l) => {
+      if (l.ema200 == null || l.ema50 == null || l.ema21 == null) return { icon: "❓", label: "?" };
+      if (l.close > l.ema200 && l.ema21 > l.ema50 && l.ema50 > l.ema200) return { icon: "🚀", label: "Tăng mạnh" };
+      if (l.close > l.ema50 && l.close > l.ema200) return { icon: "🟢", label: "Tăng" };
+      if (l.close < l.ema200 && l.ema21 < l.ema50 && l.ema50 < l.ema200) return { icon: "🔻", label: "Giảm mạnh" };
+      if (l.close < l.ema50 && l.close < l.ema200) return { icon: "🔴", label: "Giảm" };
+      return { icon: "↔️", label: "Sideways" };
+    };
+    const rsiTag = (r) => {
+      if (r == null) return "?";
+      if (r > 70) return "QM";   // quá mua
+      if (r < 30) return "QB";   // quá bán
+      return "TT";               // trung tính
+    };
+
+    let m = `<b>🥇 XAU Pulse</b> — Giá: <b>$${c.toFixed(2)}</b>\n`;
+    m += `<i>Phiên ${getTradingSession()}</i>\n\n`;
+    m += `<b>📊 Bias các khung:</b>\n`;
+
+    const biasLabels = [];
+    for (const d of valid) {
+      const b = determineBias(d.latest);
+      biasLabels.push(b.label);
+      const rsiVal = d.latest.rsi?.toFixed(0) || "?";
+      m += `${b.icon} <b>${d.tf}</b>: ${b.label} | RSI <b>${rsiVal}</b> ${rsiTag(d.latest.rsi)}\n`;
+    }
+
+    // Mức cần watch — top 2 above + below
+    const latest15m = valid.find(d => d.tf === "15m")?.latest;
+    if (latest15m) {
+      const levels = [];
+      if (latest15m.bbUpper) levels.push({ price: latest15m.bbUpper, label: "BB upper 15m" });
+      if (latest15m.bbLower) levels.push({ price: latest15m.bbLower, label: "BB lower 15m" });
+      if (latest15m.recentHigh) levels.push({ price: latest15m.recentHigh, label: "High 50 nến 15m" });
+      if (latest15m.recentLow) levels.push({ price: latest15m.recentLow, label: "Low 50 nến 15m" });
+      if (pivots) {
+        levels.push({ price: pivots.r1, label: "Pivot R1" });
+        levels.push({ price: pivots.r2, label: "Pivot R2" });
+        levels.push({ price: pivots.s1, label: "Pivot S1" });
+        levels.push({ price: pivots.s2, label: "Pivot S2" });
+      }
+      const above = levels.filter(lv => lv.price > c).sort((a, b) => a.price - b.price).slice(0, 3);
+      const below = levels.filter(lv => lv.price < c).sort((a, b) => b.price - a.price).slice(0, 3);
+      if (above.length || below.length) {
+        m += `\n<b>📍 Mức cần watch:</b>\n`;
+        for (const lv of above) m += `▲ <b>$${lv.price.toFixed(2)}</b> ${htmlEsc(lv.label)} <i>(+${(lv.price - c).toFixed(2)})</i>\n`;
+        for (const lv of below) m += `▼ <b>$${lv.price.toFixed(2)}</b> ${htmlEsc(lv.label)} <i>(-${(c - lv.price).toFixed(2)})</i>\n`;
+      }
+    }
+
+    // Consensus
+    const upCount = biasLabels.filter(b => b.includes("Tăng")).length;
+    const downCount = biasLabels.filter(b => b.includes("Giảm")).length;
+    const sideCount = biasLabels.filter(b => b === "Sideways").length;
+    let conclusion;
+    if (upCount >= valid.length - 1) conclusion = `Đa số khung BULLISH (${upCount}/${valid.length}) — ưu tiên long, watch breakout lên`;
+    else if (downCount >= valid.length - 1) conclusion = `Đa số khung BEARISH (${downCount}/${valid.length}) — ưu tiên short, watch breakdown xuống`;
+    else if (sideCount >= 2) conclusion = `Nhiều khung sideways — đợi rõ hướng, không vội vào lệnh`;
+    else conclusion = `Phân vân giữa các khung (${upCount}↑/${downCount}↓/${sideCount}↔️) — top-down trước khi vào`;
+    m += `\n💡 <b>${conclusion}</b>`;
+    m += `\n\n<i>Để chi tiết: /15p /1h /1h4h1d /nhanh15p ...</i>`;
 
     await sendTelegramTo(env, chatId, m, replyTo, "HTML");
   } catch (e) {
@@ -942,54 +1116,70 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
       ? `R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
       : "không có";
 
-    const systemText = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC.
+    // Bổ sung: candle pattern, session, HTF context (nếu LTF analysis)
+    const candlePattern = detectCandlePattern(l, e[e.length - 2]);
+    const session = getTradingSession();
+    const isLTF = tf === "5m" || tf === "15m" || tf === "1h";
+    const htfCtx = isLTF ? await getHTFContext(env) : null;
+    const htfBlock = htfCtx
+      ? `- Xu hướng khung lớn: 4h ${htfCtx.trend4h}, 1d ${htfCtx.trend1d}\n  (Tip: 4h/1d giống dòng sông lớn, ${tf} chỉ là gợn sóng. Đi ngược HTF = rủi ro cao.)`
+      : "";
 
-NGUYÊN TẮC:
-- Trả lời JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
-- Mọi mức giá là số cụ thể (float).
-- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) tránh liquidity sweep.
-- R:R tối thiểu 1:1.5, ưu tiên 1:2+.
-- KHÔNG khuyến nghị "mua/bán ngay".`;
+    const systemText = `Bạn là chuyên gia phân tích kỹ thuật (Trader) XAU/USD nhiều năm kinh nghiệm + sư phạm.
 
-    const userText = `Phân tích XAU/USD khung ${tf}, horizon ${horizon}.
+NHIỆM VỤ:
+- Phân tích dữ liệu thị trường, đưa ra QUYẾT ĐỊNH GIAO DỊCH cụ thể (BUY/SELL/WAIT) ở phần đầu.
+- Sau đó GIẢI THÍCH bằng tiếng Việt đời thường, dễ hiểu cho người mới.
+- Mỗi thuật ngữ kỹ thuật phải kèm giải nghĩa ngắn (vd "SMC = Smart Money Concepts, theo dấu chân các quỹ lớn").
 
-DỮ LIỆU:
-- Giá: $${l.close.toFixed(2)} | RSI(14): ${l.rsi?.toFixed(1)}
+QUY TẮC:
+- Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
+- Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
+- Tất cả mức giá phải là số cụ thể (float).
+- 3 mức TP: TP1 an toàn (R:R ~1:1), TP2 kỳ vọng (R:R ~1:2), TP3 tối đa theo trend (R:R ~1:3+).
+- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh "quét stop".
+- Nếu setup chưa rõ → chọn WAIT (đứng ngoài), KHÔNG bịa entry.`;
+
+    const userText = `Phân tích XAU/USD khung ${tf} (horizon ${horizon}).
+
+📊 DỮ LIỆU THỊ TRƯỜNG:
+- Giá hiện tại: $${l.close.toFixed(2)}
+- RSI(14): ${l.rsi?.toFixed(1)} | ATR: ${l.atr?.toFixed(2)}
 - EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}
-- SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(golden alignment)" : "(death alignment)"}
-- BB(20): ${l.bbLower?.toFixed(2)} - ${l.bbUpper?.toFixed(2)}
-- Pivots (daily): ${pivotStr}
-- 10 nến gần nhất: ${last10}
+- SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(Golden alignment — xu hướng tăng dài hạn)" : "(Death alignment — xu hướng giảm dài hạn)"}
+- Bollinger Bands(20): Lower ${l.bbLower?.toFixed(2)} – Upper ${l.bbUpper?.toFixed(2)}
+- Pivots (daily): ${pivotStr || "không có"}
+- Nến vừa đóng: ${candlePattern}
+- Phiên giao dịch hiện tại: ${session}
+${htfBlock}
+- 10 nến gần nhất (OHLC): ${last10}
 
-Trả JSON theo schema:
+# CẤU TRÚC ĐẦU RA BẮT BUỘC (JSON)
 {
-  "huong_chinh": "LONG | SHORT | NEUTRAL",
-  "do_tin_cay": "thấp | trung bình | cao",
-  "tom_tat": "1-2 câu summary phe nào kiểm soát + horizon",
-  "long": {
-    "kha_thi": true | false,
-    "entry": <float>,
-    "sl": <float>,
-    "tp": <float>,
-    "rr": <float>,
-    "ly_do": "1-2 câu confluence/lý do",
-    "dieu_kien_confirm": "điều kiện trigger (vd 'close M15 trên $X + RSI > 50')"
+  "quyet_dinh": {
+    "huong": "BUY | SELL | WAIT",
+    "do_tin_cay": "Cao | Trung bình | Thấp",
+    "entry": <float | null nếu WAIT>,
+    "sl": <float | null nếu WAIT>,
+    "tp1": <float | null>,
+    "tp2": <float | null>,
+    "tp3": <float | null>,
+    "rr_tp1": <float | null>,
+    "rr_tp2": <float | null>
   },
-  "short": { ... same fields ... },
-  "khang_cu": [
-    {"gia": <float>, "ghi_chu": "vd 'swing high + EMA50 + Fib 0.5'"},
-    {"gia": <float>, "ghi_chu": "..."},
-    {"gia": <float>, "ghi_chu": "..."}
-  ],
-  "ho_tro": [...same...],
-  "phan_tich": {
-    "phe_kiem_soat": "phe mua | phe bán | trung lập",
-    "ly_do_kiem_soat": "1-2 câu giải thích",
-    "bos_choch": "BOS hoặc CHOCH gần nhất ở $X (tăng/giảm)",
-    "rsi_macd_signal": "phân kỳ bullish | phân kỳ bearish | kiệt sức quá mua | kiệt sức quá bán | bình thường",
-    "order_block_fvg": "OB/FVG còn fresh ở vùng $X-$Y, hoặc 'không có'"
+  "giai_thich": {
+    "buc_tranh_toan_canh": "1-2 câu plain Vietnamese: thị trường đang làm gì, phe nào kiểm soát, ở giai đoạn nào (impulse/correction/consolidation). Dùng từ ngữ dễ hình dung.",
+    "ly_do_entry_sl": "Đoạn 3-5 câu giải thích vì sao chọn entry và SL ở đó. PHẢI bao gồm:\\n- Lý do confluence (vd 'EMA50 + Fib 0.5 + OB chồng nhau')\\n- Giải nghĩa từng thuật ngữ kỹ thuật xuất hiện (vd 'EMA = đường trung bình động — giá trung bình của X nến gần nhất, dùng làm hỗ trợ động')\\n- SL đặt ở đâu để tránh 'quét stop' (giải nghĩa: smart money cố tình đẩy giá chọc qua SL phổ biến trước khi đi theo hướng thật)",
+    "rui_ro_can_luu_y": [
+      "Lệnh thua nếu... (kịch bản 1, vd: tin Fed 19:30 hôm nay)",
+      "Lệnh thua nếu... (kịch bản 2)"
+    ]
   },
-  "rui_ro_chinh": ["...", "...", "..."]
+  "huong_HTF": {
+    "khung_4h": "${htfCtx?.trend4h || "chưa rõ"}",
+    "khung_1d": "${htfCtx?.trend1d || "chưa rõ"}",
+    "ghi_chu": "1 câu — setup này có align với HTF không? Nếu không → giảm độ tin cậy"
+  }
 }`;
 
     const body = {
@@ -1031,65 +1221,64 @@ Trả JSON theo schema:
 }
 
 /**
- * Format JSON từ Gemini → Telegram HTML.
- * Recommendation (entry/SL/TP/levels BOLD) hiện trước, phân tích chi tiết sau.
+ * Format JSON theo schema mới (quyet_dinh + giai_thich) → Telegram HTML.
+ * QUYẾT ĐỊNH lên đầu (BUY/SELL/WAIT, entry, SL, 3 TPs).
+ * GIẢI THÍCH dưới (bức tranh + lý do entry/SL + rủi ro).
  */
 function formatAnalysisHTML(d, tf, horizon) {
   const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
-  const huong = (d.huong_chinh || "NEUTRAL").toUpperCase();
-  const huongIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[huong] || "❓";
+  const fmtRr = (r) => (typeof r === "number" && !isNaN(r)) ? Number(r).toFixed(1) : null;
+  const qd = d.quyet_dinh || {};
+  const gt = d.giai_thich || {};
+  const htf = d.huong_HTF || {};
 
-  let m = `<b>🥇 SMC ${tf}</b> — Horizon ${horizon}\n`;
-  m += `${huongIcon} Hướng chính: <b>${huong}</b> | Tin cậy: <b>${htmlEsc(d.do_tin_cay || "?")}</b>\n`;
-  if (d.tom_tat) m += `<i>${htmlEsc(d.tom_tat)}</i>\n`;
-  m += `\n━━━ <b>🎯 KHUYẾN NGHỊ</b> ━━━\n\n`;
+  const huong = String(qd.huong || "WAIT").toUpperCase();
+  const huongIcon = { BUY: "🟢", SELL: "🔴", WAIT: "🟡" }[huong] || "❓";
+  const huongLabel = {
+    BUY: "MUA (LONG)",
+    SELL: "BÁN (SHORT)",
+    WAIT: "ĐỨNG NGOÀI",
+  }[huong] || huong;
 
-  const scenarioBlock = (sc, label, icon) => {
-    if (!sc?.kha_thi) {
-      return `${icon} <b>${label}</b>: ❌ không khả thi\n<i>${htmlEsc(sc?.ly_do || "Chưa thuận")}</i>`;
+  let m = `<b>🥇 Phân tích XAU/USD ${tf}</b> — Horizon ${horizon}\n\n`;
+
+  // ══════ PHẦN 1: QUYẾT ĐỊNH ══════
+  m += `━━━ <b>🎯 QUYẾT ĐỊNH</b> ━━━\n`;
+  m += `${huongIcon} <b>${huongLabel}</b> | Tin cậy: <b>${htmlEsc(qd.do_tin_cay || "?")}</b>\n`;
+
+  if (huong !== "WAIT" && qd.entry != null) {
+    m += `\n📍 Entry: <b>$${fmt2(qd.entry)}</b>\n`;
+    m += `🛑 SL: <b>$${fmt2(qd.sl)}</b>\n`;
+    if (qd.tp1 != null) {
+      const rr = fmtRr(qd.rr_tp1);
+      m += `🎯 TP1 an toàn: <b>$${fmt2(qd.tp1)}</b>${rr ? ` <i>(R:R ${rr})</i>` : ""}\n`;
     }
-    let s = `${icon} <b>${label}</b> ✅`;
-    if (sc.rr != null) s += ` | R:R: <b>${Number(sc.rr).toFixed(1)}</b>`;
-    s += `\n`;
-    s += `Entry: <b>$${fmt2(sc.entry)}</b>\n`;
-    s += `SL: <b>$${fmt2(sc.sl)}</b> | TP: <b>$${fmt2(sc.tp)}</b>\n`;
-    if (sc.dieu_kien_confirm) s += `Confirm: ${htmlEsc(sc.dieu_kien_confirm)}\n`;
-    if (sc.ly_do) s += `<i>${htmlEsc(sc.ly_do)}</i>`;
-    return s;
-  };
-
-  m += scenarioBlock(d.long, "LONG", "📈") + "\n\n";
-  m += scenarioBlock(d.short, "SHORT", "📉") + "\n\n";
-
-  // Mức giá quan trọng
-  if ((Array.isArray(d.khang_cu) && d.khang_cu.length) || (Array.isArray(d.ho_tro) && d.ho_tro.length)) {
-    m += `<b>📍 Mức giá quan trọng:</b>\n`;
-    for (const k of (d.khang_cu || [])) {
-      m += `▲ <b>$${fmt2(k.gia)}</b>${k.ghi_chu ? ` — <i>${htmlEsc(k.ghi_chu)}</i>` : ""}\n`;
+    if (qd.tp2 != null) {
+      const rr = fmtRr(qd.rr_tp2);
+      m += `🎯 TP2 kỳ vọng: <b>$${fmt2(qd.tp2)}</b>${rr ? ` <i>(R:R ${rr})</i>` : ""}\n`;
     }
-    for (const h of (d.ho_tro || [])) {
-      m += `▼ <b>$${fmt2(h.gia)}</b>${h.ghi_chu ? ` — <i>${htmlEsc(h.ghi_chu)}</i>` : ""}\n`;
-    }
-    m += `\n`;
+    if (qd.tp3 != null) m += `🎯 TP3 tối đa (theo trend): <b>$${fmt2(qd.tp3)}</b>\n`;
+  } else {
+    m += `\n<i>Chưa có setup rõ ràng — chờ giá xác nhận hướng.</i>\n`;
   }
 
-  // PHÂN TÍCH chi tiết
-  m += `━━━ <b>📊 PHÂN TÍCH</b> ━━━\n\n`;
-  const p = d.phan_tich || {};
-  if (p.phe_kiem_soat) {
-    m += `Phe kiểm soát: <b>${htmlEsc(String(p.phe_kiem_soat).toUpperCase())}</b>\n`;
+  // ══════ PHẦN 2: GIẢI THÍCH (cho người mới) ══════
+  m += `\n━━━ <b>📚 GIẢI THÍCH</b> ━━━\n`;
+  if (gt.buc_tranh_toan_canh) {
+    m += `\n<b>🎨 Bức tranh toàn cảnh:</b>\n${htmlEsc(gt.buc_tranh_toan_canh)}\n`;
   }
-  if (p.ly_do_kiem_soat) m += `<i>${htmlEsc(p.ly_do_kiem_soat)}</i>\n`;
-  if (p.bos_choch) m += `Cấu trúc: ${htmlEsc(p.bos_choch)}\n`;
-  if (p.rsi_macd_signal) m += `RSI/MACD: <b>${htmlEsc(p.rsi_macd_signal)}</b>\n`;
-  if (p.order_block_fvg) m += `OB/FVG: ${htmlEsc(p.order_block_fvg)}\n`;
+  if (gt.ly_do_entry_sl) {
+    m += `\n<b>💡 Lý do chọn Entry/SL:</b>\n${htmlEsc(gt.ly_do_entry_sl)}\n`;
+  }
+  if (Array.isArray(gt.rui_ro_can_luu_y) && gt.rui_ro_can_luu_y.length) {
+    m += `\n<b>⚠️ Rủi ro cần lưu ý:</b>\n`;
+    for (const r of gt.rui_ro_can_luu_y) m += `• ${htmlEsc(r)}\n`;
+  }
 
-  // Rủi ro
-  if (Array.isArray(d.rui_ro_chinh) && d.rui_ro_chinh.length) {
-    m += `\n<b>⚠️ Rủi ro:</b>\n`;
-    for (const r of d.rui_ro_chinh) {
-      m += `• ${htmlEsc(r)}\n`;
-    }
+  // HTF context
+  if (htf.khung_4h || htf.khung_1d) {
+    m += `\n<b>🌊 Bối cảnh khung lớn:</b> 4h <b>${htmlEsc(htf.khung_4h || "?")}</b> | 1d <b>${htmlEsc(htf.khung_1d || "?")}</b>`;
+    if (htf.ghi_chu) m += `\n<i>${htmlEsc(htf.ghi_chu)}</i>`;
   }
 
   return m;
@@ -1354,7 +1543,12 @@ async function handleTelegramUpdate(env, update) {
     await handlePriceCmd(env, chatId, replyTo);
     return;
   }
-  // Quick scan AI — match /nhanh, /nhanh5p, /nhanh15p, /nhanh1h, ...
+  // /nhanh = Pulse 5 khung (no AI, instant rule-based)
+  if (cmd === "/nhanh") {
+    await handleNhanhPulse(env, chatId, replyTo);
+    return;
+  }
+  // /nhanh5p, /nhanh15p, /nhanh1h, /nhanh4h, /nhanh1d = AI quick scan single TF
   if (VN_SCAN_CMD_TO_TF[cmd]) {
     await handleScanCmd(env, chatId, replyTo, VN_SCAN_CMD_TO_TF[cmd]);
     return;
@@ -1538,7 +1732,7 @@ export default {
       }
       const commands = [
         { command: "gia",      description: "Giá XAU + indicators" },
-        { command: "nhanh",    description: "Quick scan (15p mặc định)" },
+        { command: "nhanh",    description: "Pulse 5 khung (no AI, instant)" },
         { command: "nhanh5p",  description: "Quick scan 5 phút" },
         { command: "nhanh15p", description: "Quick scan 15 phút" },
         { command: "nhanh1h",  description: "Quick scan 1 giờ" },
