@@ -397,25 +397,37 @@ async function fetchTdCandles(env, interval, outputsize, symbol = "XAU/USD") {
  * - DXY: nghịch (~-0.7) — DXY tăng → áp lực giảm XAU
  * - OIL: đồng pha — cả 2 hedge inflation, OIL tăng = bullish XAU
  */
-async function getCachedAuxData(env, symbol, label) {
+async function getCachedAuxData(env, symbol, label, interval = "1h") {
   const bucket = Math.floor(Date.now() / (5 * 60 * 1000));
-  const cacheKey = `aux:${symbol}:${bucket}`;
+  const cacheKey = `aux:${symbol}:${interval}:${bucket}`;
   if (env.CACHE) {
     const cached = await env.CACHE.get(cacheKey);
     if (cached) { try { return JSON.parse(cached); } catch {} }
   }
   try {
-    const candles = await fetchTdCandles(env, "1h", 50, symbol);
-    if (candles.length < 10) return null;
+    const candles = await fetchTdCandles(env, interval, 220, symbol);
+    if (candles.length < 20) return null;
     const enriched = enrichIndicators(candles);
     const last = enriched[enriched.length - 1];
-    const prev24h = candles.length >= 24 ? candles[candles.length - 24] : candles[0];
+
+    // % change qua khoảng thời gian phù hợp TF (gần đúng 24h)
+    const ms24h = 24 * 60 * 60 * 1000;
+    const targetTime = (Date.now() - ms24h) / 1000;
+    const prev24h = candles.find(c => c.time >= targetTime) || candles[0];
     const pct24h = ((last.close - prev24h.close) / prev24h.close) * 100;
+
+    // % change theo TF (so với candle thứ 5 trước — fresh trend chính khung user xem)
+    const candlesAgo = Math.min(5, candles.length - 1);
+    const prevTf = candles[candles.length - 1 - candlesAgo];
+    const pctTf = ((last.close - prevTf.close) / prevTf.close) * 100;
+
     const trend = getTrendAssessment(last);
     const result = {
-      symbol, label,
+      symbol, label, interval,
       price: last.close,
       pct24h,
+      pctTf,
+      candlesAgo,
       trendLabel: trend?.label || "?",
       trendEmoji: trend?.emoji || "❓",
     };
@@ -424,7 +436,7 @@ async function getCachedAuxData(env, symbol, label) {
     }
     return result;
   } catch (e) {
-    console.log(`[aux] ${symbol} fail: ${e.message}`);
+    console.log(`[aux] ${symbol}@${interval} fail: ${e.message}`);
     return null;
   }
 }
@@ -447,14 +459,15 @@ function parseAuxArgs(args) {
  */
 function formatAuxBlock(auxCtx) {
   if (!auxCtx) return "";
+  const fmtPct = (p) => `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
   const lines = [];
   if (auxCtx.oil) {
-    const sign = auxCtx.oil.pct24h >= 0 ? "+" : "";
-    lines.push(`🛢️ Dầu (USO ETF): $${auxCtx.oil.price.toFixed(2)} | ${auxCtx.oil.trendEmoji} ${auxCtx.oil.trendLabel} (24h ${sign}${auxCtx.oil.pct24h.toFixed(2)}%)`);
+    const o = auxCtx.oil;
+    lines.push(`🛢️ Dầu (USO ETF, ${o.interval}): ${o.trendEmoji} ${o.trendLabel} | ${o.candlesAgo} nến gần: ${fmtPct(o.pctTf)} | 24h: ${fmtPct(o.pct24h)}`);
   }
   if (auxCtx.dxy) {
-    const sign = auxCtx.dxy.pct24h >= 0 ? "+" : "";
-    lines.push(`💵 USD Index (qua EUR/USD ${auxCtx.dxy.eurusdPrice?.toFixed(4) || "?"}): ${auxCtx.dxy.trendEmoji} ${auxCtx.dxy.trendLabel} (DXY 24h ≈ ${sign}${auxCtx.dxy.pct24h.toFixed(2)}%)`);
+    const x = auxCtx.dxy;
+    lines.push(`💵 USD Index (EUR/USD inverse, ${x.interval}): ${x.trendEmoji} ${x.trendLabel} | DXY ${x.candlesAgo} nến gần: ≈${fmtPct(x.pctTf)} | 24h: ≈${fmtPct(x.pct24h)}`);
   }
   return lines.join("\n");
 }
@@ -462,34 +475,58 @@ function formatAuxBlock(auxCtx) {
 /**
  * Get aux context cho query — fetch nếu user yêu cầu oil/dxy.
  */
-async function getAuxContext(env, args) {
+async function getAuxContext(env, args, tf = "1h") {
   const { wantsOil, wantsDxy } = parseAuxArgs(args);
   if (!wantsOil && !wantsDxy) return null;
+  const interval = TF_TO_TD[tf] || "1h"; // map khung user → TD interval
   const ctx = {};
   const tasks = [];
-  // TwelveData free tier không có DXY/WTI direct:
-  // - DXY: dùng EUR/USD inverse (EUR là 57% weight của DXY, correlation -0.76 với DXY)
-  // - OIL: dùng USO ETF (proxy WTI, correlation ~99% với WTI direction)
-  if (wantsOil) tasks.push(getCachedAuxData(env, "USO", "OIL (USO ETF)").then(d => { if (d) ctx.oil = d; }));
+  // TwelveData free tier proxies:
+  // - DXY: EUR/USD inverse (EUR 57% DXY weight, correlation -0.76)
+  // - OIL: USO ETF (WTI tracker, direction match 99%)
+  if (wantsOil) tasks.push(
+    getCachedAuxData(env, "USO", "Dầu (USO ETF)", interval).then(d => { if (d) ctx.oil = d; })
+  );
   if (wantsDxy) tasks.push(
-    getCachedAuxData(env, "EUR/USD", "EUR/USD").then(d => {
+    getCachedAuxData(env, "EUR/USD", "EUR/USD", interval).then(d => {
       if (d) {
-        // Invert để mô phỏng DXY direction
-        const inverted = {
+        ctx.dxy = {
           ...d,
           symbol: "DXY (proxy)",
           label: "DXY (qua EUR/USD inverse)",
           eurusdPrice: d.price,
-          pct24h: -d.pct24h,  // inverse correlation
+          pct24h: -d.pct24h,
+          pctTf: -d.pctTf,
           trendLabel: { "Tăng mạnh": "Giảm mạnh", "Tăng": "Giảm", "Sideways": "Sideways", "Giảm": "Tăng", "Giảm mạnh": "Tăng mạnh" }[d.trendLabel] || "?",
           trendEmoji: { "🚀": "🔻", "🟢": "🔴", "↔️": "↔️", "🔴": "🟢", "🔻": "🚀" }[d.trendEmoji] || "❓",
         };
-        ctx.dxy = inverted;
       }
     })
   );
   await Promise.all(tasks);
   return Object.keys(ctx).length > 0 ? ctx : null;
+}
+
+/**
+ * Diễn giải tác động inter-market lên XAU dựa trên DXY/OIL trend.
+ * Dùng cho /nhanh pulse (no AI), context tự computed.
+ */
+function interpretAuxImpact(auxCtx) {
+  if (!auxCtx) return "";
+  const lines = [];
+  if (auxCtx.dxy) {
+    const p = auxCtx.dxy.pct24h;
+    if (p > 0.3) lines.push("USD mạnh lên → áp lực GIẢM cho XAU (correlation nghịch)");
+    else if (p < -0.3) lines.push("USD yếu đi → ỦNG HỘ cho XAU");
+    else lines.push("USD đi ngang → ít tác động lên XAU");
+  }
+  if (auxCtx.oil) {
+    const p = auxCtx.oil.pct24h;
+    if (p > 0.5) lines.push("Dầu tăng → ĐỒNG PHA bullish với XAU (cùng hedge inflation)");
+    else if (p < -0.5) lines.push("Dầu giảm → áp lực giảm cho XAU");
+    else lines.push("Dầu đi ngang → trung tính với XAU");
+  }
+  return lines.join(". ") + ".";
 }
 
 // ──────────────────────────────────────────────────────────
@@ -1323,6 +1360,8 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
     if (auxCtx) {
       const auxLines = formatAuxBlock(auxCtx).split("\n").map(l => htmlEsc(l)).join("\n");
       m += `\n${auxLines}\n`;
+      const impact = interpretAuxImpact(auxCtx);
+      if (impact) m += `<i>↳ Tác động lên XAU: ${htmlEsc(impact)}</i>\n`;
     }
     m += `\n<b>📊 Bias các khung:</b>\n`;
 
@@ -1382,7 +1421,7 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m", auxArgs = []) {
     const horizon = TF_HORIZON[tf] || "ngắn hạn";
     const [candles, auxCtx] = await Promise.all([
       fetchTdCandles(env, tdInterval, 220),
-      getAuxContext(env, auxArgs),
+      getAuxContext(env, auxArgs, tf),
     ]);
     if (candles.length < 50) {
       await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
@@ -1406,7 +1445,15 @@ QUY TẮC:
 - BẮT BUỘC điền tất cả field, không bỏ trống.
 - Mọi mức giá là số cụ thể (float).
 - Mọi khung từ 5m → 1d đều có thể phân tích được, không từ chối.`;
-    const auxText = auxCtx ? `\n\nINTER-MARKET CONTEXT:\n${formatAuxBlock(auxCtx)}\nLưu ý: DXY tăng = áp lực giảm XAU (correlation nghịch ~-0.7). OIL tăng = ủng hộ XAU (đồng pha inflation hedge).` : "";
+    const auxText = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT (cùng khung ${tf}):
+${formatAuxBlock(auxCtx)}
+
+YÊU CẦU BẮT BUỘC: Trong câu trả lời (tom_tat hoặc canh_bao), PHẢI giải thích cụ thể tác động của DXY/OIL lên XAU:
+- Nếu DXY tăng → áp lực giảm XAU (correlation nghịch ~-0.7).
+- Nếu DXY giảm → hỗ trợ XAU.
+- Nếu OIL tăng → đồng pha bullish XAU (cùng inflation hedge).
+- Nếu OIL giảm → áp lực giảm XAU.
+Đối chiếu với setup XAU: nếu inter-market đồng thuận → tăng độ tin cậy. Nếu mâu thuẫn → giảm độ tin cậy + thêm vào canh_bao.` : "";
     const userText = `XAU/USD khung ${tf} (horizon ${horizon}), giá $${l.close.toFixed(2)}.
 RSI: ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
 SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
@@ -1498,7 +1545,7 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
   try {
     const [candles, auxCtx] = await Promise.all([
       fetchTdCandles(env, TF_TO_TD[tf], 220),
-      getAuxContext(env, auxArgs),
+      getAuxContext(env, auxArgs, tf),
     ]);
     if (candles.length < 50) {
       await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
@@ -1558,7 +1605,16 @@ QUY TẮC:
 - SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
 - Nếu setup chưa rõ → chọn WAIT (Đứng ngoài), KHÔNG bịa entry.`;
 
-    const auxBlock = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT:\n${formatAuxBlock(auxCtx)}\n(DXY tăng → áp lực giảm XAU; OIL tăng → ủng hộ XAU. Đối chiếu để confirm setup.)` : "";
+    const auxBlock = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT (cùng khung ${tf}):
+${formatAuxBlock(auxCtx)}
+
+YÊU CẦU BẮT BUỘC trong giai_thich:
+- buc_tranh_toan_canh PHẢI nhắc đến DXY/OIL: vd "DXY giảm 0.4% trong 24h → hỗ trợ XAU"
+- ly_do_entry_sl PHẢI nói có inter-market confirm setup không
+- rui_ro_can_luu_y PHẢI thêm rủi ro mâu thuẫn nếu inter-market đi ngược setup
+Quy tắc correlation:
+- DXY ↑ → XAU ↓ (nghịch ~-0.7)
+- OIL ↑ → XAU ↑ (đồng pha inflation hedge)` : "";
 
     const userText = `Phân tích XAU/USD khung ${tf} (horizon ${horizon}).
 
