@@ -1072,6 +1072,9 @@ function helpMessage() {
 \`/nhanh5p15p1h\` — scan 3 khung
 \`/nhanh1h4h1d\` — scan HTF
 
+*Tin tức (AI tổng hợp + dự đoán):*
+\`/tin\` — tin XAU 7 ngày + dự báo phản ứng catalyst (NFP/CPI/FOMC...)
+
 *Tư vấn cá nhân (AI):*
 \`/ai <câu hỏi>\` — risk management + position sizing
 Vd:
@@ -1214,6 +1217,202 @@ async function handlePriceCmd(env, chatId, replyTo) {
     }
 
     await sendTelegramTo(env, chatId, m, replyTo, "HTML");
+  } catch (e) {
+    await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
+  }
+}
+
+/**
+ * /tin — tổng hợp tin tức 7 ngày + AI dự đoán phản ứng XAU.
+ */
+const NEWS_FEEDS = [
+  { url: "https://www.fxstreet.com/rss/news", source: "fxstreet" },
+  { url: "https://www.investing.com/rss/news_285.rss", source: "investing" },
+  { url: "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain", source: "marketwatch" },
+];
+
+const GOLD_NEWS_KEYWORDS = [
+  "gold", "xau", "vàng", "bullion", "precious", "fed", "fomc", "powell",
+  "cpi", "ppi", "pce", "nfp", "non-farm", "non farm", "payroll", "unemployment",
+  "jobless", "jobs report", "inflation", "rate", "interest", "treasury",
+  "yield", "dxy", "dollar", "usd", "ecb", "boj", "boe",
+];
+
+const HIGH_IMPACT_KEYWORDS = [
+  "NFP", "non-farm", "non farm", "FOMC", "Fed decision", "Fed meeting",
+  "Powell", "rate decision", "rate hike", "rate cut",
+  "CPI", "PPI", "PCE", "core inflation",
+  "GDP", "unemployment claims", "jobless claims",
+  "ECB decision", "BOJ", "BOE",
+];
+
+async function fetchNewsFromRSS(env) {
+  const PROXY = "https://api.rss2json.com/v1/api.json";
+  const results = await Promise.allSettled(
+    NEWS_FEEDS.map(async ({ url, source }) => {
+      try {
+        const r = await fetch(`${PROXY}?rss_url=${encodeURIComponent(url)}`);
+        const d = await r.json();
+        if (d.status !== "ok" || !Array.isArray(d.items)) return [];
+        return d.items.map(it => ({
+          ts: new Date(it.pubDate).getTime(),
+          title: (it.title || "").trim(),
+          summary: (it.description || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim().slice(0, 300),
+          url: it.link || "",
+          source,
+        }));
+      } catch (e) {
+        console.log(`[news] ${source} fail: ${e.message}`);
+        return [];
+      }
+    })
+  );
+  // Flatten + dedupe theo URL
+  const flat = results.flatMap(r => r.status === "fulfilled" ? r.value : []);
+  const seen = new Set();
+  return flat.filter(it => {
+    if (!it.url || seen.has(it.url)) return false;
+    seen.add(it.url);
+    return true;
+  });
+}
+
+async function getCachedNews(env) {
+  const bucket = Math.floor(Date.now() / (15 * 60 * 1000));
+  const cacheKey = `news:${bucket}`;
+  if (env.CACHE) {
+    const cached = await env.CACHE.get(cacheKey);
+    if (cached) { try { return JSON.parse(cached); } catch {} }
+  }
+  const news = await fetchNewsFromRSS(env);
+  if (env.CACHE && news.length > 0) {
+    await env.CACHE.put(cacheKey, JSON.stringify(news), { expirationTtl: 1500 });
+  }
+  return news;
+}
+
+function isGoldRelevant(item) {
+  const t = (item.title + " " + (item.summary || "")).toLowerCase();
+  return GOLD_NEWS_KEYWORDS.some(k => t.includes(k));
+}
+
+function isHighImpact(item) {
+  const t = item.title + " " + (item.summary || "");
+  return HIGH_IMPACT_KEYWORDS.some(k => t.toLowerCase().includes(k.toLowerCase()));
+}
+
+function formatTimeAgo(ts) {
+  const ms = Date.now() - ts;
+  const h = ms / 3600000;
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))}p`;
+  if (h < 24) return `${Math.round(h)}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
+async function handleTinCmd(env, chatId, replyTo) {
+  await sendChatAction(env, chatId, "typing");
+  try {
+    const all = await getCachedNews(env);
+    if (all.length === 0) {
+      await sendTelegramTo(env, chatId, "❌ Không lấy được tin tức (RSS proxy lỗi).", replyTo);
+      return;
+    }
+    const sevenDaysAgo = Date.now() - 7 * 24 * 3600 * 1000;
+    const relevant = all
+      .filter(n => n.ts >= sevenDaysAgo)
+      .filter(isGoldRelevant)
+      .sort((a, b) => b.ts - a.ts);
+
+    if (relevant.length === 0) {
+      await sendTelegramTo(env, chatId, "ℹ️ Không có tin gold-relevant nào trong 7 ngày qua.", replyTo);
+      return;
+    }
+
+    const highImpact = relevant.filter(isHighImpact);
+    const top = relevant.slice(0, 20);
+
+    const newsList = top.map((n, i) => {
+      const tag = isHighImpact(n) ? " 🚨" : "";
+      return `${i + 1}.${tag} [${n.source} ${formatTimeAgo(n.ts)}] ${n.title}${n.summary ? `\n   ${n.summary.slice(0, 180)}` : ""}`;
+    }).join("\n");
+
+    const today = new Date().toISOString().slice(0, 10);
+    const systemText = `Bạn là chuyên gia phân tích tin tức macro & tác động lên XAU/USD.
+
+NHIỆM VỤ:
+- Tổng hợp 3-5 chủ đề chính từ tin tức 7 ngày
+- Highlight catalysts mạnh sắp tới (NFP, CPI, FOMC, Fed speech...) trong tuần này/tới
+- Dự đoán PHẢN ỨNG có thể của XAU với mỗi catalyst (bullish/bearish, biên độ ước tính)
+- Đề xuất hướng tiếp cận: vào lệnh khi nào, tránh khi nào, position size
+
+NGÔN NGỮ — bilingual:
+- "tăng giá (bullish)" / "giảm giá (bearish)" / "tích cực" / "tiêu cực"
+- "Số liệu việc làm Mỹ (NFP — Non-Farm Payrolls)"
+- "Chỉ số giá tiêu dùng (CPI)" / "Chỉ số giá sản xuất (PPI)"
+- "Quyết định lãi suất (Rate Decision)"
+- "Cuộc họp FOMC" / "Phát biểu Powell"
+
+NGUYÊN TẮC:
+- Tin macro tích cực USD (NFP cao, CPI cao, hawkish Fed) → DXY tăng → XAU GIẢM
+- Tin macro tiêu cực USD (NFP thấp, CPI thấp, dovish Fed) → DXY giảm → XAU TĂNG
+- Bất ổn địa chính trị / risk-off → XAU TĂNG (safe-haven)
+- KHÔNG khuyến nghị mua/bán cụ thể, chỉ dự đoán phản ứng + scenario.
+
+FORMAT MARKDOWN ĐƠN GIẢN.`;
+
+    const userText = `Hôm nay: ${today}
+
+📰 ${relevant.length} tin gold-relevant 7 ngày qua (${highImpact.length} tin high-impact 🚨):
+
+${newsList}
+
+Hãy tổng hợp + dự đoán theo format:
+
+**📌 Chủ đề chính tuần qua**
+- Chủ đề 1: ...
+- Chủ đề 2: ...
+
+**🚨 Catalysts mạnh sắp tới** (nếu có lịch trình rõ — VD "NFP thứ 6 tuần này")
+- Sự kiện: ngày + giờ + dự đoán phản ứng XAU
+
+**📈 Dự báo XAU**
+- Bias chung tuần tới: tăng/giảm/sideways + lý do
+- Vùng giá quan tâm
+
+**💡 Khuyến nghị tiếp cận**
+- Ưu tiên: long/short/đứng ngoài
+- Tránh: vào lệnh trước event nào / khung giờ nào
+
+**⚠️ Rủi ro chính**
+- ...`;
+
+    const body = {
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: "user", parts: [{ text: userText }] }],
+      generationConfig: {
+        maxOutputTokens: 3500,
+        temperature: 0.5,
+        thinkingConfig: { thinkingBudget: 1024 },
+      },
+    };
+
+    const resp = await callGeminiSmart(env, body);
+    const aiText = extractText(resp);
+    if (!aiText) {
+      await sendTelegramTo(env, chatId, "❌ AI không phản hồi.", replyTo);
+      return;
+    }
+
+    let m = `📰 *Tổng hợp tin XAU 7 ngày*\n`;
+    m += `_${relevant.length} tin liên quan, ${highImpact.length} tin high-impact 🚨_\n\n`;
+    m += aiText;
+    m += `\n\n_Source: FXStreet, Investing.com, MarketWatch_`;
+
+    const parts = splitForTelegram(m, 3900);
+    for (let i = 0; i < parts.length; i++) {
+      const suffix = parts.length > 1 ? `\n\n_[${i + 1}/${parts.length}]_` : "";
+      await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "Markdown");
+    }
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
@@ -2067,6 +2266,11 @@ async function handleTelegramUpdate(env, update) {
     await sendTelegramTo(env, chatId, glossaryMessage(), replyTo);
     return;
   }
+  // /tin — tổng hợp tin tức 7 ngày + AI dự đoán
+  if (cmd === "/tin" || cmd === "/news") {
+    await handleTinCmd(env, chatId, replyTo);
+    return;
+  }
   // /ai (hoặc /AI), /ask, /hoi — tư vấn position sizing / risk management
   if (cmd === "/ai" || cmd === "/ask" || cmd === "/hoi") {
     const question = text.replace(/^\S+\s*/, "").trim();
@@ -2283,6 +2487,7 @@ export default {
         { command: "1h4h1d",        description: "SMC 3 khung HTF" },
         { command: "nhanh5p15p1h",  description: "Scan 3 khung intraday" },
         { command: "nhanh1h4h1d",   description: "Scan 3 khung HTF" },
+        { command: "tin",      description: "Tin tức XAU 7 ngày + dự báo catalyst" },
         { command: "ai",       description: "Tư vấn risk + lot size + TP/SL" },
         { command: "tudien",   description: "Từ điển thuật ngữ Việt-Anh" },
         { command: "help",     description: "Hướng dẫn lệnh" },
