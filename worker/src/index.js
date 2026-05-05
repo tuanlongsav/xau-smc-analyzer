@@ -375,12 +375,12 @@ async function getCachedDailyPivots(env) {
 // ──────────────────────────────────────────────────────────
 // TwelveData fetch (cron context — direct call, không qua /twelvedata route)
 // ──────────────────────────────────────────────────────────
-async function fetchTdCandles(env, interval, outputsize) {
-  const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${outputsize}&apikey=${env.TWELVEDATA_API_KEY}`;
+async function fetchTdCandles(env, interval, outputsize, symbol = "XAU/USD") {
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputsize}&apikey=${env.TWELVEDATA_API_KEY}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`TD ${r.status}`);
   const d = await r.json();
-  if (d.status === "error") throw new Error(`TD: ${d.message}`);
+  if (d.status === "error") throw new Error(`TD ${symbol}: ${d.message}`);
   if (!Array.isArray(d.values)) return [];
   return d.values.reverse().map(v => ({
     time: Math.floor(new Date(v.datetime + "Z").getTime() / 1000),
@@ -389,6 +389,88 @@ async function fetchTdCandles(env, interval, outputsize) {
     low: parseFloat(v.low),
     close: parseFloat(v.close),
   }));
+}
+
+/**
+ * Lấy context inter-market (DXY, WTI Oil) — cache 5 phút trong KV.
+ * XAU correlation:
+ * - DXY: nghịch (~-0.7) — DXY tăng → áp lực giảm XAU
+ * - OIL: đồng pha — cả 2 hedge inflation, OIL tăng = bullish XAU
+ */
+async function getCachedAuxData(env, symbol, label) {
+  const bucket = Math.floor(Date.now() / (5 * 60 * 1000));
+  const cacheKey = `aux:${symbol}:${bucket}`;
+  if (env.CACHE) {
+    const cached = await env.CACHE.get(cacheKey);
+    if (cached) { try { return JSON.parse(cached); } catch {} }
+  }
+  try {
+    const candles = await fetchTdCandles(env, "1h", 50, symbol);
+    if (candles.length < 10) return null;
+    const enriched = enrichIndicators(candles);
+    const last = enriched[enriched.length - 1];
+    const prev24h = candles.length >= 24 ? candles[candles.length - 24] : candles[0];
+    const pct24h = ((last.close - prev24h.close) / prev24h.close) * 100;
+    const trend = getTrendAssessment(last);
+    const result = {
+      symbol, label,
+      price: last.close,
+      pct24h,
+      trendLabel: trend?.label || "?",
+      trendEmoji: trend?.emoji || "❓",
+    };
+    if (env.CACHE) {
+      await env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 600 });
+    }
+    return result;
+  } catch (e) {
+    console.log(`[aux] ${symbol} fail: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Parse args sau lệnh chính tìm "oil" / "dxy" / "all".
+ * Returns { wantsOil, wantsDxy }
+ */
+function parseAuxArgs(args) {
+  const tokens = (args || []).map(a => String(a).toLowerCase());
+  const all = tokens.includes("all") || tokens.includes("inter");
+  return {
+    wantsOil: all || tokens.includes("oil") || tokens.includes("wti"),
+    wantsDxy: all || tokens.includes("dxy") || tokens.includes("dx") || tokens.includes("usd"),
+  };
+}
+
+/**
+ * Format aux context block (text plain) cho prompt AI hoặc pulse display.
+ */
+function formatAuxBlock(auxCtx) {
+  if (!auxCtx) return "";
+  const lines = [];
+  if (auxCtx.oil) {
+    const sign = auxCtx.oil.pct24h >= 0 ? "+" : "";
+    lines.push(`🛢️ OIL (WTI): $${auxCtx.oil.price.toFixed(2)} | ${auxCtx.oil.trendEmoji} ${auxCtx.oil.trendLabel} (24h ${sign}${auxCtx.oil.pct24h.toFixed(2)}%)`);
+  }
+  if (auxCtx.dxy) {
+    const sign = auxCtx.dxy.pct24h >= 0 ? "+" : "";
+    lines.push(`💵 DXY: ${auxCtx.dxy.price.toFixed(2)} | ${auxCtx.dxy.trendEmoji} ${auxCtx.dxy.trendLabel} (24h ${sign}${auxCtx.dxy.pct24h.toFixed(2)}%)`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Get aux context cho query — fetch nếu user yêu cầu oil/dxy.
+ */
+async function getAuxContext(env, args) {
+  const { wantsOil, wantsDxy } = parseAuxArgs(args);
+  if (!wantsOil && !wantsDxy) return null;
+  const ctx = {};
+  const tasks = [];
+  if (wantsOil) tasks.push(getCachedAuxData(env, "WTI/USD", "OIL").then(d => { if (d) ctx.oil = d; }));
+  if (wantsDxy) tasks.push(getCachedAuxData(env, "DXY", "DXY").then(d => { if (d) ctx.dxy = d; }));
+  await Promise.all(tasks);
+  return Object.keys(ctx).length > 0 ? ctx : null;
 }
 
 // ──────────────────────────────────────────────────────────
@@ -933,6 +1015,13 @@ Vd:
 • \`/ai đã mua giá 4520 hiện lỗ xử lý ra sao\`
 • \`/ai muốn risk 2% với SL 8 điểm thì bao nhiêu lot\`
 
+*Inter-market context (correlation):*
+Thêm \`oil\` hoặc \`dxy\` (hoặc \`all\`) sau lệnh để kèm context giá dầu / chỉ số đô:
+• \`/nhanh oil\` — pulse + giá OIL
+• \`/15p dxy\` — phân tích 15p + DXY
+• \`/1h oil dxy\` — kèm cả 2
+• \`/nhanh1h all\` — quick scan 1h + cả OIL+DXY
+
 *Khác:*
 \`/tudien\` — Từ điển thuật ngữ Việt-Anh
 
@@ -1172,18 +1261,21 @@ Trả lời câu hỏi của user dùng giá/indicators thực ở trên. Tính 
 /**
  * /nhanh = Pulse 5 khung (no AI, fast). Dùng EMA alignment + RSI rule-based.
  */
-async function handleNhanhPulse(env, chatId, replyTo) {
+async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
   await sendChatAction(env, chatId, "typing");
   try {
     const tfs = ["5m", "15m", "1h", "4h", "1d"];
-    const data = await Promise.all(tfs.map(async tf => {
-      try {
-        const candles = await fetchTdCandles(env, TF_TO_TD[tf], 220);
-        if (candles.length < 50) return null;
-        const e = enrichIndicators(candles);
-        return { tf, latest: e[e.length - 1], prev: e[e.length - 2] };
-      } catch { return null; }
-    }));
+    const [data, auxCtx] = await Promise.all([
+      Promise.all(tfs.map(async tf => {
+        try {
+          const candles = await fetchTdCandles(env, TF_TO_TD[tf], 220);
+          if (candles.length < 50) return null;
+          const e = enrichIndicators(candles);
+          return { tf, latest: e[e.length - 1], prev: e[e.length - 2] };
+        } catch { return null; }
+      })),
+      getAuxContext(env, auxArgs),
+    ]);
     const valid = data.filter(Boolean);
     if (valid.length === 0) {
       await sendTelegramTo(env, chatId, "❌ Không fetch được data", replyTo);
@@ -1208,8 +1300,12 @@ async function handleNhanhPulse(env, chatId, replyTo) {
     };
 
     let m = `<b>🥇 XAU Pulse</b> — Giá: <b>$${c.toFixed(2)}</b>\n`;
-    m += `<i>Phiên ${getTradingSession()}</i>\n\n`;
-    m += `<b>📊 Bias các khung:</b>\n`;
+    m += `<i>Phiên ${getTradingSession()}</i>\n`;
+    if (auxCtx) {
+      const auxLines = formatAuxBlock(auxCtx).split("\n").map(l => htmlEsc(l)).join("\n");
+      m += `\n${auxLines}\n`;
+    }
+    m += `\n<b>📊 Bias các khung:</b>\n`;
 
     const biasLabels = [];
     for (const d of valid) {
@@ -1260,12 +1356,15 @@ async function handleNhanhPulse(env, chatId, replyTo) {
   }
 }
 
-async function handleScanCmd(env, chatId, replyTo, tf = "15m") {
+async function handleScanCmd(env, chatId, replyTo, tf = "15m", auxArgs = []) {
   await sendChatAction(env, chatId, "typing");
   try {
     const tdInterval = TF_TO_TD[tf] || "15min";
     const horizon = TF_HORIZON[tf] || "ngắn hạn";
-    const candles = await fetchTdCandles(env, tdInterval, 220);
+    const [candles, auxCtx] = await Promise.all([
+      fetchTdCandles(env, tdInterval, 220),
+      getAuxContext(env, auxArgs),
+    ]);
     if (candles.length < 50) {
       await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
       return;
@@ -1288,10 +1387,11 @@ QUY TẮC:
 - BẮT BUỘC điền tất cả field, không bỏ trống.
 - Mọi mức giá là số cụ thể (float).
 - Mọi khung từ 5m → 1d đều có thể phân tích được, không từ chối.`;
+    const auxText = auxCtx ? `\n\nINTER-MARKET CONTEXT:\n${formatAuxBlock(auxCtx)}\nLưu ý: DXY tăng = áp lực giảm XAU (correlation nghịch ~-0.7). OIL tăng = ủng hộ XAU (đồng pha inflation hedge).` : "";
     const userText = `XAU/USD khung ${tf} (horizon ${horizon}), giá $${l.close.toFixed(2)}.
 RSI: ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
 SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
-${pivotStr}
+${pivotStr}${auxText}
 
 Trả JSON:
 {
@@ -1334,7 +1434,12 @@ Trả JSON:
     const huongIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[huong] || "❓";
 
     let m = `<b>🥇 Quick Scan ${tf}</b> — horizon ${horizon}\n`;
-    m += `Giá: <b>$${l.close.toFixed(2)}</b> | ${huongIcon} <b>${huong}</b>\n\n`;
+    m += `Giá: <b>$${l.close.toFixed(2)}</b> | ${huongIcon} <b>${huong}</b>\n`;
+    if (auxCtx) {
+      const auxLines = formatAuxBlock(auxCtx).split("\n");
+      m += auxLines.map(l => htmlEsc(l)).join("\n") + "\n";
+    }
+    m += `\n`;
 
     if (d.tom_tat) m += `${htmlEsc(d.tom_tat)}\n\n`;
 
@@ -1364,7 +1469,7 @@ Trả JSON:
   }
 }
 
-async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
+async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
   const tf = (tfArg || "15m").toLowerCase();
   if (!TF_TO_TD[tf]) {
     await sendTelegramTo(env, chatId, `❌ TF không hợp lệ. Dùng: ${Object.keys(TF_TO_TD).join(", ")}`, replyTo);
@@ -1372,7 +1477,10 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
   }
   await sendChatAction(env, chatId, "typing");
   try {
-    const candles = await fetchTdCandles(env, TF_TO_TD[tf], 220);
+    const [candles, auxCtx] = await Promise.all([
+      fetchTdCandles(env, TF_TO_TD[tf], 220),
+      getAuxContext(env, auxArgs),
+    ]);
     if (candles.length < 50) {
       await sendTelegramTo(env, chatId, "❌ Lỗi fetch data", replyTo);
       return;
@@ -1431,6 +1539,8 @@ QUY TẮC:
 - SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
 - Nếu setup chưa rõ → chọn WAIT (Đứng ngoài), KHÔNG bịa entry.`;
 
+    const auxBlock = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT:\n${formatAuxBlock(auxCtx)}\n(DXY tăng → áp lực giảm XAU; OIL tăng → ủng hộ XAU. Đối chiếu để confirm setup.)` : "";
+
     const userText = `Phân tích XAU/USD khung ${tf} (horizon ${horizon}).
 
 📊 DỮ LIỆU THỊ TRƯỜNG:
@@ -1443,7 +1553,7 @@ QUY TẮC:
 - Nến vừa đóng: ${candlePattern}
 - Phiên giao dịch hiện tại: ${session}
 ${htfBlock}
-- 10 nến gần nhất (OHLC): ${last10}
+- 10 nến gần nhất (OHLC): ${last10}${auxBlock}
 
 # CẤU TRÚC ĐẦU RA BẮT BUỘC (JSON)
 {
@@ -1498,7 +1608,12 @@ ${htfBlock}
       return;
     }
 
-    const html = formatAnalysisHTML(d, tf, horizon);
+    let html = formatAnalysisHTML(d, tf, horizon);
+    if (auxCtx) {
+      const auxLines = formatAuxBlock(auxCtx).split("\n").map(l => htmlEsc(l)).join("\n");
+      // Insert aux block sau header (sau dòng đầu tiên — Phân tích...)
+      html = html.replace(/(\n\n)/, `\n${auxLines}\n\n`);
+    }
     const parts = splitForTelegram(html, 3900);
     console.log(`[bot] /analyze ${tf} text=${text?.length}c, html=${html.length}c, parts=${parts.length}`);
     for (let i = 0; i < parts.length; i++) {
@@ -1852,17 +1967,17 @@ async function handleTelegramUpdate(env, update) {
   }
   // /nhanh = Pulse 5 khung (no AI, instant rule-based)
   if (cmd === "/nhanh") {
-    await handleNhanhPulse(env, chatId, replyTo);
+    await handleNhanhPulse(env, chatId, replyTo, args);
     return;
   }
   // /nhanh5p, /nhanh15p, /nhanh1h, /nhanh4h, /nhanh1d = AI quick scan single TF
   if (VN_SCAN_CMD_TO_TF[cmd]) {
-    await handleScanCmd(env, chatId, replyTo, VN_SCAN_CMD_TO_TF[cmd]);
+    await handleScanCmd(env, chatId, replyTo, VN_SCAN_CMD_TO_TF[cmd], args);
     return;
   }
   // Phân tích SMC theo TF — match lệnh tiếng Việt /5p, /15p, /1h, /4h, /1d, ...
   if (VN_CMD_TO_TF[cmd]) {
-    await handleAnalyzeCmd(env, chatId, replyTo, VN_CMD_TO_TF[cmd]);
+    await handleAnalyzeCmd(env, chatId, replyTo, VN_CMD_TO_TF[cmd], args);
     return;
   }
   // Combo: /5p15p1h hoặc /nhanh5p15p1h → phân tích TOP-DOWN tổng hợp 1 reply
