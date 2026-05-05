@@ -417,47 +417,47 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     }
   };
 
-  // ── 1. RSI extreme (chuẩn 70/30) ──
+  // ── 1. RSI quá mua / quá bán (Overbought/Oversold) ──
   if (latest.rsi != null) {
     if (latest.rsi > 70)
-      await push("rsi_overbought", "🔴", `RSI quá mua *${latest.rsi.toFixed(1)}* — coi chừng điều chỉnh`,
-        "Watch BB upper / Pivot R1 cho rejection. Không chase long.");
+      await push("rsi_overbought", "🔴", `RSI quá mua (Overbought) *${latest.rsi.toFixed(1)}* — coi chừng điều chỉnh`,
+        "Theo dõi dải trên Bollinger / Điểm xoay R1 để xem có phản ứng từ chối không. Tránh đuổi mua.");
     if (latest.rsi < 30)
-      await push("rsi_oversold", "🟢", `RSI quá bán *${latest.rsi.toFixed(1)}* — khả năng hồi phục`,
-        "Watch hỗ trợ S1/Recent Low cho bounce. Đợi confirm trước khi long.");
+      await push("rsi_oversold", "🟢", `RSI quá bán (Oversold) *${latest.rsi.toFixed(1)}* — khả năng hồi phục`,
+        "Theo dõi vùng hỗ trợ S1 / đáy 50 nến để xem có nảy ngược không. Đợi xác nhận trước khi mua.");
   }
 
-  // ── 2. Bollinger breakout ──
+  // ── 2. Phá vỡ Bollinger Bands ──
   if (latest.bbUpper != null && prev.bbUpper != null) {
     if (latest.close > latest.bbUpper && prev.close <= prev.bbUpper)
-      await push("bb_up", "📈", `Vượt BB upper *$${latest.bbUpper.toFixed(2)}* — momentum tăng mạnh`,
-        "BB break thường tiếp diễn 3-5 nến. Watch retest BB upper làm hỗ trợ.");
+      await push("bb_up", "📈", `Vượt biên trên Bollinger (BB upper) *$${latest.bbUpper.toFixed(2)}* — đà tăng mạnh`,
+        "Phá vỡ BB thường tiếp diễn 3-5 nến. Theo dõi giá retest BB upper làm hỗ trợ.");
     if (latest.close < latest.bbLower && prev.close >= prev.bbLower)
-      await push("bb_dn", "📉", `Phá BB lower *$${latest.bbLower.toFixed(2)}* — momentum giảm mạnh`,
-        "BB break thường tiếp diễn. Watch retest BB lower làm kháng cự.");
+      await push("bb_dn", "📉", `Phá biên dưới Bollinger (BB lower) *$${latest.bbLower.toFixed(2)}* — đà giảm mạnh`,
+        "Phá vỡ BB thường tiếp diễn. Theo dõi retest BB lower làm kháng cự.");
   }
 
-  // ── 3. Golden/Death Cross ──
+  // ── 3. Giao cắt vàng / tử thần (Golden / Death Cross) ──
   if (prev.sma50 != null && prev.sma200 != null && latest.sma50 != null && latest.sma200 != null) {
     if (prev.sma50 <= prev.sma200 && latest.sma50 > latest.sma200)
-      await push("golden", "⭐", `*Golden Cross* (SMA50 cắt lên SMA200) — bull trend dài hạn`,
-        "Tín hiệu trend reversal mạnh. Ưu tiên buy-the-dip về EMA21/50.");
+      await push("golden", "⭐", `*Giao cắt vàng (Golden Cross)* — SMA50 cắt lên SMA200, xu hướng tăng dài hạn`,
+        "Tín hiệu đảo chiều mạnh. Ưu tiên mua khi giá hồi (BTD) về EMA21/50.");
     if (prev.sma50 >= prev.sma200 && latest.sma50 < latest.sma200)
-      await push("death", "💀", `*Death Cross* (SMA50 cắt xuống SMA200) — bear trend dài hạn`,
-        "Tín hiệu trend reversal mạnh. Ưu tiên sell-the-rally về EMA21/50.");
+      await push("death", "💀", `*Giao cắt tử thần (Death Cross)* — SMA50 cắt xuống SMA200, xu hướng giảm dài hạn`,
+        "Tín hiệu đảo chiều mạnh. Ưu tiên bán khi giá hồi (STR) về EMA21/50.");
   }
 
-  // ── 4. EMA 21/50 cross ──
+  // ── 4. Cắt EMA21/50 (đường trung bình động hàm mũ) ──
   if (prev.ema21 != null && prev.ema50 != null && latest.ema21 != null && latest.ema50 != null) {
     if (prev.ema21 <= prev.ema50 && latest.ema21 > latest.ema50)
-      await push("ema_up", "📊", "EMA21 cắt lên EMA50 — short-term bullish",
-        "Momentum chuyển sang tăng. Watch close trên EMA50 confirm.");
+      await push("ema_up", "📊", "EMA21 cắt lên EMA50 — đà tăng ngắn hạn",
+        "Đà chuyển sang tăng. Theo dõi giá đóng cửa trên EMA50 để xác nhận.");
     if (prev.ema21 >= prev.ema50 && latest.ema21 < latest.ema50)
-      await push("ema_dn", "📊", "EMA21 cắt xuống EMA50 — short-term bearish",
-        "Momentum chuyển sang giảm. Watch close dưới EMA50 confirm.");
+      await push("ema_dn", "📊", "EMA21 cắt xuống EMA50 — đà giảm ngắn hạn",
+        "Đà chuyển sang giảm. Theo dõi đóng cửa dưới EMA50 để xác nhận.");
   }
 
-  // ── 5. Pivot break ──
+  // ── 5. Phá vỡ Điểm xoay (Pivot break) ──
   if (pivots) {
     const levels = [
       { key: "r2", label: "R2", price: pivots.r2 },
@@ -467,54 +467,53 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     ];
     for (const { key, label, price } of levels) {
       if (prev.close <= price && latest.close > price)
-        await push(`piv_up_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* lên`,
-          `Watch retest ${label} làm hỗ trợ. Mục tiêu mở rộng tới mốc trên.`);
+        await push(`piv_up_${key}`, "🎯", `Phá điểm xoay ${label} (Pivot) *$${price.toFixed(2)}* lên`,
+          `Theo dõi retest ${label} làm hỗ trợ. Mục tiêu mở rộng tới mốc kháng cự kế tiếp.`);
       if (prev.close >= price && latest.close < price)
-        await push(`piv_dn_${key}`, "🎯", `Phá pivot ${label} *$${price.toFixed(2)}* xuống`,
-          `Watch retest ${label} làm kháng cự. Mục tiêu mở rộng tới mốc dưới.`);
+        await push(`piv_dn_${key}`, "🎯", `Phá điểm xoay ${label} (Pivot) *$${price.toFixed(2)}* xuống`,
+          `Theo dõi retest ${label} làm kháng cự. Mục tiêu mở rộng tới mốc hỗ trợ kế tiếp.`);
     }
   }
 
-  // ── 6. Biến động giá mạnh trong nến gần nhất (% move) ──
+  // ── 6. Biến động giá mạnh (Strong move) ──
   if (latest.open && latest.close) {
     const change = latest.close - latest.open;
     const changePct = Math.abs(change / latest.open) * 100;
-    if (changePct > 0.4) {  // 0.4% trong 1 nến 15m là đáng kể với XAU
+    if (changePct > 0.4) {
       const direction = change > 0 ? "TĂNG" : "GIẢM";
       const icon = change > 0 ? "🚀" : "💥";
       await push(`big_move_${change > 0 ? "up" : "dn"}`, icon,
         `Biến động mạnh: ${direction} *${changePct.toFixed(2)}%* nến gần nhất ($${prev.close.toFixed(2)} → $${latest.close.toFixed(2)})`,
         change > 0
-          ? "Watch follow-through 1-2 nến tới. Có thể continue hoặc retrace 50%."
-          : "Watch hỗ trợ nearest. Có thể oversold bounce hoặc continue down.");
+          ? "Theo dõi 1-2 nến kế tiếp xem có tiếp diễn không. Có thể continue hoặc thoái lui (retrace) 50%."
+          : "Theo dõi vùng hỗ trợ gần nhất. Có thể nảy ngược (oversold bounce) hoặc tiếp tục giảm.");
     }
   }
 
-  // ── 7. Volatility spike (ATR > 1.5x avg gần đây) ──
+  // ── 7. ATR tăng vọt (Volatility spike — biên độ thực trung bình) ──
   if (latest.atr != null && Array.isArray(candlesEnriched) && candlesEnriched.length >= 30) {
     const recentAtrs = candlesEnriched.slice(-30, -1).map(c => c.atr).filter(a => a != null);
     if (recentAtrs.length > 10) {
       const avgAtr = recentAtrs.reduce((s, a) => s + a, 0) / recentAtrs.length;
       if (latest.atr > avgAtr * 1.5) {
         await push("vol_spike", "⚡",
-          `ATR spike: *${latest.atr.toFixed(2)}* (${(latest.atr / avgAtr).toFixed(1)}x avg)`,
-          "Volatility cao bất thường — đợi candle close trước khi entry, mở rộng SL.");
+          `ATR tăng vọt (Volatility Spike): *${latest.atr.toFixed(2)}* (${(latest.atr / avgAtr).toFixed(1)}x trung bình)`,
+          "Biến động cao bất thường — đợi nến đóng cửa trước khi vào lệnh, mở rộng dừng lỗ (SL).");
       }
     }
   }
 
-  // ── 8. Liquidity sweep (wick break recent high/low rồi close back) ──
+  // ── 8. Quét thanh khoản (Liquidity Sweep) ──
   if (prev.recentHigh != null && prev.recentLow != null) {
-    // Sweep above: high vượt prev's recent high, close lại < prev's recent high
     if (latest.high > prev.recentHigh && latest.close < prev.recentHigh) {
       await push("liq_sweep_up", "🎣",
-        `Liquidity sweep TRÊN — wick $${latest.high.toFixed(2)} vượt $${prev.recentHigh.toFixed(2)} rồi close lại trong`,
-        "Tín hiệu reversal bearish phổ biến (smart money quét stop). Watch RSI divergence + close dưới EMA21.");
+        `Quét thanh khoản TRÊN (Liquidity Sweep Up) — râu nến $${latest.high.toFixed(2)} vượt đỉnh $${prev.recentHigh.toFixed(2)} rồi đóng cửa lại trong`,
+        "Tín hiệu đảo chiều giảm phổ biến (smart money quét lệnh dừng lỗ). Theo dõi phân kỳ (Divergence) RSI + đóng cửa dưới EMA21.");
     }
     if (latest.low < prev.recentLow && latest.close > prev.recentLow) {
       await push("liq_sweep_dn", "🎣",
-        `Liquidity sweep DƯỚI — wick $${latest.low.toFixed(2)} phá $${prev.recentLow.toFixed(2)} rồi close lại trong`,
-        "Tín hiệu reversal bullish (stop hunt). Watch close trên EMA21 + RSI confirm.");
+        `Quét thanh khoản DƯỚI (Liquidity Sweep Down) — râu nến $${latest.low.toFixed(2)} phá đáy $${prev.recentLow.toFixed(2)} rồi đóng cửa lại trong`,
+        "Tín hiệu đảo chiều tăng (smart money quét stop). Theo dõi đóng cửa trên EMA21 + RSI xác nhận.");
     }
   }
 
@@ -564,22 +563,24 @@ function getTrendAssessment(latest) {
   return { label: "Sideways", emoji: "↔️", note: "Giá giữa các EMA, chưa rõ trend" };
 }
 
-// Helper: collect key levels around current price
+// Helper: collect key levels around current price (label tiếng Việt)
 function getKeyLevelsAround(latest, pivots, currentPrice) {
   const levels = [];
   const add = (price, label) => {
     if (price != null && !isNaN(price)) levels.push({ price, label });
   };
-  add(latest.bbUpper, "BB upper");
-  add(latest.bbLower, "BB lower");
-  add(latest.ema21, "EMA 21");
-  add(latest.ema50, "EMA 50");
-  add(latest.ema200, "EMA 200");
-  add(latest.recentHigh, "High 50 nến");
-  add(latest.recentLow, "Low 50 nến");
+  add(latest.bbUpper, "Biên trên Bollinger (BB upper)");
+  add(latest.bbLower, "Biên dưới Bollinger (BB lower)");
+  add(latest.ema21, "Đường EMA 21");
+  add(latest.ema50, "Đường EMA 50");
+  add(latest.ema200, "Đường EMA 200");
+  add(latest.recentHigh, "Đỉnh 50 nến");
+  add(latest.recentLow, "Đáy 50 nến");
   if (pivots) {
-    add(pivots.r2, "Pivot R2"); add(pivots.r1, "Pivot R1");
-    add(pivots.s1, "Pivot S1"); add(pivots.s2, "Pivot S2");
+    add(pivots.r2, "Điểm xoay R2 (Pivot)");
+    add(pivots.r1, "Điểm xoay R1 (Pivot)");
+    add(pivots.s1, "Điểm xoay S1 (Pivot)");
+    add(pivots.s2, "Điểm xoay S2 (Pivot)");
   }
   return {
     above: levels.filter(l => l.price > currentPrice).sort((a, b) => a.price - b.price).slice(0, 3),
@@ -863,6 +864,49 @@ function extractJSON(text) {
   return null;
 }
 
+function glossaryMessage() {
+  return `📚 *Từ điển thuật ngữ XAU/USD*
+
+*Smart Money Concepts (SMC):*
+• BOS (Break of Structure) — Phá vỡ cấu trúc
+• CHOCH (Change of Character) — Đổi tính chất xu hướng
+• OB (Order Block) — Khối lệnh tổ chức
+• FVG (Fair Value Gap) — Khoảng trống công bằng
+• Liquidity Sweep — Quét thanh khoản (smart money quét stop)
+• SMC — Phương pháp dòng tiền thông minh
+
+*Chỉ báo:*
+• EMA (Exponential MA) — Đường trung bình hàm mũ
+• SMA (Simple MA) — Đường trung bình đơn giản
+• RSI (Relative Strength Index) — Chỉ số sức mạnh tương đối
+• ATR (Average True Range) — Biên độ thực trung bình
+• BB (Bollinger Bands) — Dải Bollinger
+• MACD — chỉ báo phân kỳ hội tụ trung bình
+• Pivot Point — Điểm xoay (mốc S/R quan trọng)
+
+*Pattern nến:*
+• Pin Bar / Hammer / Shooting Star — Nến rút râu
+• Engulfing — Nến nhấn chìm
+• Marubozu — Nến đặc (body chiếm gần hết range)
+• Doji — Nến do dự (open ≈ close)
+
+*Tín hiệu:*
+• Golden Cross — Giao cắt vàng (SMA50 cắt lên SMA200)
+• Death Cross — Giao cắt tử thần (SMA50 cắt xuống SMA200)
+• Divergence — Phân kỳ (RSI/MACD đi ngược price)
+• Overbought/Oversold — Quá mua / Quá bán
+• Breakout — Phá vỡ (cản)
+
+*Trading:*
+• Long / Short — Lệnh mua / bán
+• Entry / SL / TP — Điểm vào / Cắt lỗ / Chốt lời
+• R:R (Risk:Reward) — Tỷ lệ rủi ro/lợi nhuận
+• HTF / MTF / LTF — Khung lớn / trung / nhỏ
+• Top-down — Phân tích từ HTF xuống LTF
+• Pullback — Hồi giá ngược trend
+• BTD / STR — Buy The Dip / Sell The Rally`;
+}
+
 function helpMessage() {
   return `🥇 *XAU Bot — Lệnh*
 
@@ -881,6 +925,9 @@ function helpMessage() {
 \`/1h4h1d\` — chi tiết 3 khung HTF
 \`/nhanh5p15p1h\` — scan 3 khung
 \`/nhanh1h4h1d\` — scan HTF
+
+*Khác:*
+\`/tudien\` — Từ điển thuật ngữ Việt-Anh
 
 App đầy đủ: [xau-smc-analyzer.pages.dev](https://xau-smc-analyzer.pages.dev)`;
 }
@@ -1123,6 +1170,9 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m") {
 
     const systemText = `Bạn là chuyên gia TA XAU/USD. Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
 
+NGÔN NGỮ — bilingual cho thuật ngữ:
+- Tiếng Việt trước, tiếng Anh trong ngoặc. VD: "Quá mua (Overbought)", "Phân kỳ (Divergence)", "Đường EMA (Exponential MA)".
+
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
 - BẮT BUỘC điền tất cả field, không bỏ trống.
@@ -1244,15 +1294,32 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg) {
 NHIỆM VỤ:
 - Phân tích dữ liệu thị trường, đưa ra QUYẾT ĐỊNH GIAO DỊCH cụ thể (BUY/SELL/WAIT) ở phần đầu.
 - Sau đó GIẢI THÍCH bằng tiếng Việt đời thường, dễ hiểu cho người mới.
-- Mỗi thuật ngữ kỹ thuật phải kèm giải nghĩa ngắn (vd "SMC = Smart Money Concepts, theo dấu chân các quỹ lớn").
+
+NGÔN NGỮ — BẮT BUỘC bilingual cho thuật ngữ kỹ thuật:
+- Viết tiếng Việt TRƯỚC, tiếng Anh trong NGOẶC sau. Ví dụ:
+  • "Phá vỡ cấu trúc (BOS — Break of Structure)"
+  • "Đổi tính chất (CHOCH — Change of Character)"
+  • "Khối lệnh (OB — Order Block)"
+  • "Khoảng trống công bằng (FVG — Fair Value Gap)"
+  • "Quét thanh khoản (Liquidity Sweep)"
+  • "Phân kỳ tăng/giảm (Bullish/Bearish Divergence)"
+  • "Giao cắt vàng (Golden Cross)" / "Giao cắt tử thần (Death Cross)"
+  • "Nến rút râu đáy (Hammer)" / "Nến nhấn chìm (Engulfing)"
+  • "Đường trung bình động hàm mũ (EMA)"
+  • "Dải Bollinger (BB)"
+  • "Biên độ thực trung bình (ATR)"
+  • "Điểm xoay (Pivot Point)"
+  • "Khung lớn / Khung trung / Khung nhỏ (HTF/MTF/LTF)"
+  • "Mua / Bán / Đứng ngoài (Long / Short / Wait)"
+  • "Điểm vào lệnh / Cắt lỗ / Chốt lời (Entry / SL / TP)"
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
 - Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
 - Tất cả mức giá phải là số cụ thể (float).
 - 3 mức TP: TP1 an toàn (R:R ~1:1), TP2 kỳ vọng (R:R ~1:2), TP3 tối đa theo trend (R:R ~1:3+).
-- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh "quét stop".
-- Nếu setup chưa rõ → chọn WAIT (đứng ngoài), KHÔNG bịa entry.`;
+- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
+- Nếu setup chưa rõ → chọn WAIT (Đứng ngoài), KHÔNG bịa entry.`;
 
     const userText = `Phân tích XAU/USD khung ${tf} (horizon ${horizon}).
 
@@ -1477,19 +1544,24 @@ BB(20): ${latest.bbLower?.toFixed(2)} - ${latest.bbUpper?.toFixed(2)}
     const ltf = sortedByTime[0].tf;
     const horizon = TF_HORIZON[htf] || "ngắn-trung hạn";
 
-    const systemText = `Bạn là chuyên gia TA XAU/USD scalping/day trading + SMC, chuyên top-down multi-timeframe.
+    const systemText = `Bạn là chuyên gia TA XAU/USD chuyên top-down nhiều khung (multi-timeframe).
 
 NGUYÊN TẮC TOP-DOWN:
-- HTF (khung lớn nhất ${htf}) → định BIAS chính (xu hướng tổng).
-- MTF (khung giữa) → định SETUP (vùng entry/cản).
-- LTF (khung nhỏ ${ltf}) → định ENTRY TIMING + confirm.
+- Khung lớn (HTF — Higher Timeframe = ${htf}) → định BIAS chính (xu hướng tổng).
+- Khung trung (MTF) → định SETUP (vùng entry/cản).
+- Khung nhỏ (LTF — Lower Timeframe = ${ltf}) → định timing vào lệnh + xác nhận.
 - Khuyến nghị PHẢI dựa trên hợp lực 3 khung. Nếu các khung mâu thuẫn → ghi rõ ở 'alignment' và giảm độ tin cậy.
+
+NGÔN NGỮ — bilingual cho thuật ngữ:
+- Tiếng Việt trước, tiếng Anh trong ngoặc. VD:
+  "Phá vỡ cấu trúc (BOS)", "Khối lệnh (OB)", "Quét thanh khoản (Liquidity Sweep)",
+  "Phân kỳ (Divergence)", "Đường trung bình EMA", "Dải Bollinger (BB)".
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
 - BẮT BUỘC điền field 'by_tf' cho TẤT CẢ ${valid.length} khung — không bỏ sót.
 - Mọi mức giá là số cụ thể (float).
-- SL ngoài vùng nhiễu (>1×ATR cách swing).
+- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
 - R:R tối thiểu 1:1.5.`;
 
     const userText = `Phân tích TOP-DOWN XAU/USD ${valid.length} khung: ${tfsLabel}.
@@ -1650,6 +1722,11 @@ async function handleTelegramUpdate(env, update) {
   // Help / start
   if (cmd === "/start" || cmd === "/help" || cmd === "/trogiup") {
     await sendTelegramTo(env, chatId, helpMessage(), replyTo);
+    return;
+  }
+  // Dictionary thuật ngữ
+  if (cmd === "/tudien" || cmd === "/glossary") {
+    await sendTelegramTo(env, chatId, glossaryMessage(), replyTo);
     return;
   }
   // Giá hiện tại (no AI, instant)
@@ -1862,6 +1939,7 @@ export default {
         { command: "1h4h1d",        description: "SMC 3 khung HTF" },
         { command: "nhanh5p15p1h",  description: "Scan 3 khung intraday" },
         { command: "nhanh1h4h1d",   description: "Scan 3 khung HTF" },
+        { command: "tudien",   description: "Từ điển thuật ngữ Việt-Anh" },
         { command: "help",     description: "Hướng dẫn lệnh" },
       ];
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
