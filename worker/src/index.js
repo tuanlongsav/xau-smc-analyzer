@@ -926,6 +926,13 @@ function helpMessage() {
 \`/nhanh5p15p1h\` — scan 3 khung
 \`/nhanh1h4h1d\` — scan HTF
 
+*Tư vấn cá nhân (AI):*
+\`/ask <câu hỏi>\` — risk management + position sizing
+Vd:
+• \`/ask vốn 5tr lệnh 0.05 lot SL TP thế nào\`
+• \`/ask đã mua giá 4520 hiện lỗ xử lý ra sao\`
+• \`/ask muốn risk 2% với SL 8 điểm thì bao nhiêu lot\`
+
 *Khác:*
 \`/tudien\` — Từ điển thuật ngữ Việt-Anh
 
@@ -1054,6 +1061,109 @@ async function handlePriceCmd(env, chatId, replyTo) {
     }
 
     await sendTelegramTo(env, chatId, m, replyTo, "HTML");
+  } catch (e) {
+    await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
+  }
+}
+
+/**
+ * /ask <câu hỏi> — tư vấn vị thế/khối lượng/SL/TP qua AI.
+ * Ví dụ:
+ *   /ask vốn 5tr lệnh 0.05 lot SL TP thế nào
+ *   /ask đã mua giá 4520 hiện đang lỗ, xử lý ra sao
+ */
+async function handleAskCmd(env, chatId, replyTo, question) {
+  if (!question || question.trim().length < 5) {
+    await sendTelegramTo(env, chatId,
+      "❌ Cần câu hỏi cụ thể.\n\nVí dụ:\n• <code>/ask vốn 5tr lệnh 0.05 lot đặt SL TP thế nào</code>\n• <code>/ask đã mua giá 4520 lỗ xử lý sao</code>\n• <code>/ask muốn risk 2% với SL 8 điểm thì bao nhiêu lot</code>",
+      replyTo, "HTML");
+    return;
+  }
+  await sendChatAction(env, chatId, "typing");
+
+  try {
+    const candles = await fetchTdCandles(env, "15min", 220);
+    if (candles.length < 50) {
+      await sendTelegramTo(env, chatId, "❌ Lỗi fetch data thị trường", replyTo);
+      return;
+    }
+    const enriched = enrichIndicators(candles);
+    const latest = enriched[enriched.length - 1];
+    const prev = enriched[enriched.length - 2];
+    const pivots = await getCachedDailyPivots(env);
+    const trend = getTrendAssessment(latest);
+    const session = getTradingSession();
+    const candlePattern = detectCandlePattern(latest, prev);
+
+    const systemText = `Bạn là chuyên gia tư vấn quản lý rủi ro (Risk Management) và chiến lược giao dịch XAU/USD.
+
+NGUYÊN TẮC TƯ VẤN:
+- Risk Management ưu tiên: rủi ro 1-2% tài khoản/lệnh là chuẩn, KHÔNG bao giờ vượt 5%.
+- Công thức tính khối lượng (Position Sizing) cho XAU/USD:
+  • 0.01 lot ≈ $1 P&L mỗi $1 giá biến động
+  • 0.05 lot ≈ $5/$1
+  • 0.10 lot ≈ $10/$1
+  • 1.00 lot ≈ $100/$1
+  • Lot tối đa = (Tài khoản × Risk%) ÷ (SL distance × $ per 0.01 lot per $1)
+- Quy đổi VND ↔ USD: 1 USD ≈ 25,000 VND (làm tròn).
+- Nếu khối lượng user đang dự định quá to so với tài khoản → CẢNH BÁO mạnh + đề xuất giảm.
+- Nếu user đã vào lệnh:
+  • Tính P&L hiện tại
+  • Phân tích vị trí hiện tại so với trend / S/R / EMA
+  • Đề xuất: chốt lời 1 phần / dời SL về break-even / hold / cut loss
+- KHÔNG khuyến nghị "mua/bán ngay". Đây là tư vấn quản lý risk giáo dục.
+
+NGÔN NGỮ:
+- Tiếng Việt dễ hiểu cho người mới.
+- Thuật ngữ bilingual: "Cắt lỗ (SL)", "Chốt lời (TP)", "Khối lượng (Lot)", "Tỷ lệ rủi ro/lợi nhuận (R:R)", "Hòa vốn (Break-even)".
+- Format Markdown đơn giản (KHÔNG HTML).
+
+ĐỊNH DẠNG OUTPUT:
+**📋 Tóm tắt câu hỏi:** 1 câu
+**🧮 Tính toán:** số liệu cụ thể (lot, $ rủi ro, % tài khoản, SL distance, R:R nếu có)
+**💡 Đề xuất:** hành động cụ thể với mức giá thật từ thị trường hiện tại
+**⚠️ Cảnh báo:** nếu có rủi ro lớn`;
+
+    const marketContext = `📊 BỐI CẢNH THỊ TRƯỜNG HIỆN TẠI:
+- Giá XAU/USD: $${latest.close.toFixed(2)}
+- Xu hướng 15m: ${trend?.label || "?"} ${trend?.note ? `(${trend.note})` : ""}
+- RSI(14): ${latest.rsi?.toFixed(1)} | ATR(14): ${latest.atr?.toFixed(2)}
+- EMA 21/50/200: ${latest.ema21?.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}
+- BB(20): ${latest.bbLower?.toFixed(2)} – ${latest.bbUpper?.toFixed(2)}
+- Pivots (daily): ${pivots ? `R2 ${pivots.r2.toFixed(2)} | R1 ${pivots.r1.toFixed(2)} | PP ${pivots.pp.toFixed(2)} | S1 ${pivots.s1.toFixed(2)} | S2 ${pivots.s2.toFixed(2)}` : "không có"}
+- Nến mới: ${candlePattern}
+- Phiên: ${session}`;
+
+    const userText = `${marketContext}
+
+❓ CÂU HỎI USER:
+${question}
+
+Trả lời câu hỏi của user dùng giá/indicators thực ở trên. Tính toán cụ thể nếu user đề cập đến số tiền/lot. Format Markdown đơn giản.`;
+
+    const body = {
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: "user", parts: [{ text: userText }] }],
+      generationConfig: {
+        maxOutputTokens: 3000,
+        temperature: 0.5,
+      },
+    };
+
+    const resp = await callGeminiSmart(env, body);
+    const text = extractText(resp);
+    if (!text) {
+      await sendTelegramTo(env, chatId, "❌ AI không phản hồi. Thử lại.", replyTo);
+      return;
+    }
+
+    const fullMsg = `💬 *Tư vấn:* "${question.length > 80 ? question.slice(0, 80) + "..." : question}"\n\n${text}\n\n_⚠️ Đây là tư vấn quản lý risk giáo dục, KHÔNG phải khuyến nghị đầu tư._`;
+    const parts = splitForTelegram(fullMsg, 3900);
+    for (let i = 0; i < parts.length; i++) {
+      const suffix = parts.length > 1 ? `\n\n_[${i + 1}/${parts.length}]_` : "";
+      // parseMode=Markdown với auto-fallback plain nếu AI Markdown lỗi
+      await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "Markdown");
+    }
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
   }
@@ -1729,6 +1839,13 @@ async function handleTelegramUpdate(env, update) {
     await sendTelegramTo(env, chatId, glossaryMessage(), replyTo);
     return;
   }
+  // /ask <question> — tư vấn position sizing / risk management
+  if (cmd === "/ask" || cmd === "/hoi") {
+    // Lấy tất cả text sau lệnh đầu tiên
+    const question = text.replace(/^\S+\s*/, "").trim();
+    await handleAskCmd(env, chatId, replyTo, question);
+    return;
+  }
   // Giá hiện tại (no AI, instant)
   if (cmd === "/gia" || cmd === "/giá" || cmd === "/price") {
     await handlePriceCmd(env, chatId, replyTo);
@@ -1939,6 +2056,7 @@ export default {
         { command: "1h4h1d",        description: "SMC 3 khung HTF" },
         { command: "nhanh5p15p1h",  description: "Scan 3 khung intraday" },
         { command: "nhanh1h4h1d",   description: "Scan 3 khung HTF" },
+        { command: "ask",      description: "Tư vấn risk + lot size + TP/SL" },
         { command: "tudien",   description: "Từ điển thuật ngữ Việt-Anh" },
         { command: "help",     description: "Hướng dẫn lệnh" },
       ];
