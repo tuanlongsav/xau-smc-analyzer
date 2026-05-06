@@ -788,6 +788,75 @@ function generateScenarios(alerts, trend, lv, latest) {
   return scenarios.slice(0, 3);
 }
 
+// Fallback rule-based khi AI hoàn toàn fail (Gemini outage + Workers AI timeout).
+// User vẫn nhận được tóm tắt kỹ thuật + gợi ý lệnh rule-based, không phải error message.
+function buildRuleBasedFallback(latest, pivots, tf, horizon) {
+  const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
+  const trend = getTrendAssessment(latest);
+  const lv = getKeyLevelsAround(latest, pivots, latest.close);
+
+  let m = `<b>🥇 Phân tích XAU/USD ${tf}</b> — Horizon ${horizon}\n`;
+  m += `<i>⚠️ AI tạm thời quá tải (Gemini overload + Workers AI timeout). Hiển thị phân tích rule-based:</i>\n\n`;
+  m += `Giá hiện tại: <b>$${fmt2(latest.close)}</b>\n`;
+
+  if (trend) {
+    m += `\n📈 <b>Xu hướng:</b> ${trend.emoji} ${trend.label}\n   <i>${trend.note}</i>\n`;
+  }
+
+  // RSI signal
+  if (latest.rsi != null) {
+    const r = latest.rsi;
+    const sig = r > 70 ? "Quá mua (Overbought) — coi chừng điều chỉnh giảm"
+              : r < 30 ? "Quá bán (Oversold) — khả năng hồi phục"
+              : "Trung tính";
+    m += `\n📊 <b>RSI(14):</b> <b>${r.toFixed(1)}</b> — ${sig}\n`;
+  }
+  if (latest.atr != null) {
+    m += `📏 <b>ATR(14):</b> ${fmt2(latest.atr)} điểm — biên độ trung bình mỗi nến\n`;
+  }
+
+  // Key levels
+  if (lv.above.length || lv.below.length) {
+    m += `\n📍 <b>Mức giá cần quan sát:</b>\n`;
+    for (const l of lv.above) m += `▲ <b>$${fmt2(l.price)}</b> ${l.label} <i>(+${(l.price - latest.close).toFixed(2)})</i>\n`;
+    for (const l of lv.below) m += `▼ <b>$${fmt2(l.price)}</b> ${l.label} <i>(-${(latest.close - l.price).toFixed(2)})</i>\n`;
+  }
+
+  // Trade suggestion: trong fallback chỉ có trend (không có alerts).
+  // Tạm dùng trend strong → MUA/BÁN, ATR-based SL/TP.
+  let sg = null;
+  if (trend && latest.atr > 0) {
+    const c = latest.close;
+    const atr = latest.atr;
+    const isBull = trend.label.includes("Tăng");
+    const isBear = trend.label.includes("Giảm");
+    if (isBull || isBear) {
+      const dir = isBull ? "BUY" : "SELL";
+      const slDist = Math.max(1.5 * atr, lv[isBull ? "below" : "above"][0]
+        ? Math.abs(c - lv[isBull ? "below" : "above"][0].price) + 0.3 * atr
+        : 1.5 * atr);
+      sg = isBull
+        ? { dir, entry: c, sl: c - slDist, tp1: c + slDist, tp2: c + 2 * slDist, tp3: c + 3 * slDist, slDist }
+        : { dir, entry: c, sl: c + slDist, tp1: c - slDist, tp2: c - 2 * slDist, tp3: c - 3 * slDist, slDist };
+    }
+  }
+  if (sg) {
+    const dirLabel = sg.dir === "BUY" ? "MUA (LONG)" : "BÁN (SHORT)";
+    const dirIcon = sg.dir === "BUY" ? "🟢" : "🔴";
+    m += `\n<b>🎯 Gợi ý vào lệnh:</b> ${dirIcon} <b>${dirLabel}</b>\n`;
+    m += `📍 Điểm vào (Entry): <b>$${fmt2(sg.entry)}</b>\n`;
+    m += `🛑 Cắt lỗ (SL): <b>$${fmt2(sg.sl)}</b> <i>(rủi ro ~${sg.slDist.toFixed(2)} điểm)</i>\n`;
+    m += `🎯 Chốt lời 1 (TP1, R:R 1:1): <b>$${fmt2(sg.tp1)}</b>\n`;
+    m += `🎯 Chốt lời 2 (TP2, R:R 1:2): <b>$${fmt2(sg.tp2)}</b>\n`;
+    m += `🎯 Chốt lời 3 (TP3, mở rộng): <b>$${fmt2(sg.tp3)}</b>\n`;
+  } else {
+    m += `\n<b>🎯 Gợi ý:</b> Tín hiệu không rõ — đứng ngoài, đợi xác nhận hướng.\n`;
+  }
+
+  m += `\n<i>💡 Phân tích này dựa trên quy tắc kỹ thuật cố định. Khi AI hoạt động lại sẽ cho phân tích sâu hơn (bức tranh, lý do, rủi ro). Thử lại sau 1-2 phút.</i>`;
+  return m;
+}
+
 // Helper: tạo gợi ý vào lệnh rule-based (Entry / SL / TP1-2-3) cho cảnh báo giá
 // Logic: chấm điểm bull/bear từ alerts + xu hướng → ra hướng. Entry = giá hiện tại.
 // SL = max(1.2×ATR, swing buffer + 0.3×ATR). TP1=1R, TP2=2R, TP3=mức kháng/hỗ trợ kế tiếp hoặc 3R.
@@ -929,13 +998,22 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
   const active = allKeys.filter(k => !isKeyOnCooldown(k.label));
   const tryKeys = active.length > 0 ? active : allKeys;
 
-  // Timeout 22s cho mỗi Gemini call — tránh treo gần 30s waitUntil của Worker.
-  // Nếu key hiện tại quá chậm → abort, thử key khác (rotation đã handle bên dưới).
-  const GEMINI_TIMEOUT_MS = 22_000;
+  // Worker waitUntil chỉ ~30s sau response → phải fail-fast để có cơ hội thử
+  // Workers AI fallback. Chỉ thử TỐI ĐA 2 key Gemini, mỗi key timeout 12s.
+  // Worst case: 2×12 = 24s + Workers AI ~5s = 29s ≈ 30s limit.
+  const GEMINI_TIMEOUT_MS = 12_000;
+  const MAX_KEYS_TO_TRY = 2;
 
+  let attempted = 0;
   for (const { key, label } of tryKeys) {
+    if (attempted >= MAX_KEYS_TO_TRY) {
+      console.log(`[gemini-smart] đã thử ${MAX_KEYS_TO_TRY} key, fall through Workers AI`);
+      break;
+    }
+    attempted++;
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+    const t0 = Date.now();
     try {
       const r = await fetch(`${GOOGLE_BASE}/v1beta/models/${model}:generateContent?key=${key}`, {
         method: "POST",
@@ -948,6 +1026,7 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
         clearKeyCooldown(label);
         const json = await r.json();
         if (isValidResponse(json)) {
+          console.log(`[gemini-smart] ${label} OK in ${Date.now() - t0}ms`);
           await cachePut(env, cacheKey, JSON.stringify(json));
           return json;
         }
@@ -957,11 +1036,12 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
         console.log(`[gemini-smart] ${label} invalid response (finish=${finish}, text len=${t.length}, tail=${t.slice(-100)})`);
         continue;
       }
+      console.log(`[gemini-smart] ${label} HTTP ${r.status} in ${Date.now() - t0}ms`);
       markKeyCooldown(label, r.status);
     } catch (e) {
       clearTimeout(tid);
       const isAbort = e.name === "AbortError";
-      console.log(`[gemini-smart] ${label} ${isAbort ? "TIMEOUT" : "error"}: ${e.message}`);
+      console.log(`[gemini-smart] ${label} ${isAbort ? "TIMEOUT" : "error"} after ${Date.now() - t0}ms: ${e.message}`);
       // Abort: cooldown như 500 (2 phút) để skip key này, thử key khác / Workers AI
       if (isAbort) markKeyCooldown(label, 500);
     }
@@ -2169,11 +2249,9 @@ ${htfBlock}
       const finish = resp?.candidates?.[0]?.finishReason || "?";
       const blocked = resp?.promptFeedback?.blockReason;
       console.log(`[bot] /analyze ${tf} JSON parse fail (len=${(text||"").length}, finish=${finish}, blocked=${blocked||"no"}), text: ${text||""}`);
-      let errMsg = `❌ AI response không hợp lệ (len=${(text||"").length}, finish=${finish})`;
-      if (blocked) errMsg += `\nBlocked: <code>${htmlEsc(blocked)}</code>`;
-      if (text && text.length < 500) errMsg += `\n<i>${htmlEsc(text.slice(0, 300))}</i>`;
-      errMsg += `\nThử <code>/${tf.replace("m", "p")}</code> lại.`;
-      await sendTelegramTo(env, chatId, errMsg, replyTo, "HTML");
+      // AI fail (Gemini overload + Workers AI timeout) → graceful fallback rule-based
+      const fallbackMsg = buildRuleBasedFallback(l, pivots, tf, horizon);
+      await sendTelegramTo(env, chatId, fallbackMsg, replyTo, "HTML");
       return;
     }
 
@@ -2288,10 +2366,13 @@ function splitForTelegram(text, maxLen = 3900) {
  * Khác với loop: cho AI xem data nhiều khung và tự tổng hợp consensus.
  */
 async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs = []) {
+  const t0 = Date.now();
+  const log = (label) => console.log(`[multi-tf] ${tfs.join("+")} t+${((Date.now() - t0)/1000).toFixed(1)}s ${label}`);
   const taskLabel = isNhanh
     ? `quét nhanh đa khung ${tfs.join("+")} — ~10s`
     : `phân tích chi tiết đa khung ${tfs.join("+")} — ~20-25s`;
   await sendQuickAck(env, chatId, replyTo, taskLabel);
+  log("ack sent");
   await sendChatAction(env, chatId, "typing");
   try {
     // HTF (khung lớn nhất) cho aux interval
@@ -2307,6 +2388,7 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs 
           const candles = await fetchTdCandles(env, tdInterval, 220);
           if (candles.length < 50) return null;
           const enriched = enrichIndicators(candles);
+          log(`fetch ${tf} ok (${candles.length} candles)`);
           return { tf, latest: enriched[enriched.length - 1], candles };
         } catch (e) {
           console.log(`[multi-tf] fetch ${tf} fail: ${e.message}`);
@@ -2433,14 +2515,21 @@ ${valid.map(v => `    "${v.tf}": { "bias": "LONG|SHORT|NEUTRAL", "key_level": <f
       },
     };
 
+    log("calling gemini");
     const resp = await callGeminiSmart(env, body);
+    log(`gemini done (source=${resp?.usageMetadata?.source || "gemini"})`);
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
       console.log(`[bot] multi-tf parse fail (text len=${(text||"").length}), tail: ${(text||"").slice(-200)}`);
-      await sendTelegramTo(env, chatId, "❌ AI response không hợp lệ. Thử lại.", replyTo);
+      // AI fail (Gemini outage + Workers AI timeout) → fallback rule-based dùng HTF data
+      const htfData = sortedByTime[sortedByTime.length - 1];
+      const fallbackMsg = buildRuleBasedFallback(htfData.latest, pivots, htf, horizon);
+      const prefix = `<i>⚠️ AI tạm thời quá tải. Hiển thị phân tích đa khung rule-based (theo ${htf}):</i>\n\n`;
+      await sendTelegramTo(env, chatId, prefix + fallbackMsg.replace(/^<b>🥇 Phân tích.*?\n.*?\n\n/, ""), replyTo, "HTML");
       return;
     }
+    log("rendering");
 
     let html = formatMultiTfHTML(d, valid, horizon, isNhanh);
     if (auxCtx) {
@@ -2716,7 +2805,10 @@ async function runAlertCheck(env) {
 }
 
 async function tryWorkersAI(env, body) {
-  if (!env.AI) return null;
+  if (!env.AI) {
+    console.log(`[workers-ai] env.AI binding không có → bỏ qua`);
+    return null;
+  }
   let parsed;
   try { parsed = JSON.parse(body); } catch { return null; }
 
@@ -2739,23 +2831,43 @@ async function tryWorkersAI(env, body) {
     max_tokens: parsed.generationConfig?.maxOutputTokens || 2048,
     temperature: parsed.generationConfig?.temperature ?? 0.5,
   };
-  // Nếu Gemini yêu cầu JSON, hint AI cũng trả JSON
   if (parsed.generationConfig?.responseMimeType === "application/json") {
     opts.response_format = { type: "json_object" };
   }
 
+  const totalChars = messages.reduce((s, m) => s + m.content.length, 0);
+  // Llama 3.1 8B nhanh hơn 3.3 70B nhiều (~3-5s vs 10-20s) cho output schema cứng.
+  // Quality kém hơn nhưng đủ cho structured JSON khi Gemini outage.
+  const model = "@cf/meta/llama-3.1-8b-instruct-fast";
+  console.log(`[workers-ai] gọi ${model} (${totalChars} chars input, max ${opts.max_tokens} tokens)`);
+
+  // Timeout 20s — Worker waitUntil 30s tổng, đã dùng ~7s cho 2 keys Gemini
+  // còn ~23s, để 3s buffer cho format + send Telegram
+  const t0 = Date.now();
   let aiResp;
   try {
-    aiResp = await env.AI.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", opts);
+    aiResp = await Promise.race([
+      env.AI.run(model, opts),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("Workers AI timeout 20s")), 20_000)),
+    ]);
   } catch (e) {
-    console.log(`[gemini→AI fallback] error: ${e.message}`);
+    console.log(`[workers-ai] error after ${Date.now() - t0}ms: ${e.message}`);
     return null;
   }
+  console.log(`[workers-ai] xong sau ${Date.now() - t0}ms`);
 
-  const text = aiResp?.response || "";
-  if (!text) return null;
+  // Workers AI với response_format=json_object có thể trả .response là object
+  // (đã parse) thay vì string. Convert về string để Gemini-format wrapper consistent.
+  let text = aiResp?.response;
+  if (text && typeof text !== "string") {
+    text = JSON.stringify(text);
+  }
+  if (!text) {
+    console.log(`[workers-ai] response trống — aiResp keys: ${Object.keys(aiResp || {}).join(",")}`);
+    return null;
+  }
+  console.log(`[workers-ai] text length=${text.length}, head=${text.slice(0, 100).replace(/\n/g, " ")}`);
 
-  // Wrap thành format Gemini cho frontend không cần biết
   return {
     candidates: [{
       content: { parts: [{ text }] },
@@ -2811,18 +2923,13 @@ export default {
 
     // Telegram webhook endpoint — Telegram POST update tới đây mỗi khi có message
     //
-    // Quan trọng: KHÔNG dùng ctx.waitUntil(). Lý do:
-    //   - waitUntil() chỉ cho 30s wall time SAU response — không đủ cho lệnh
-    //     phân tích đa khung (~30-60s).
-    //   - Vượt 30s → Cloudflare giết tiến trình silent → user nhận được ack
-    //     nhưng không nhận kết quả cuối.
+    // Telegram timeout của họ ~10s. Worker phải trả 200 OK NGAY, sau đó
+    // ctx.waitUntil() tiếp tục xử lý nền (~30s wall time).
     //
-    // Thay vào đó: await trực tiếp trong request lifetime. Worker Standard
-    // có wall time generous khi đang chờ I/O (Gemini fetch). Telegram cho
-    // webhook timeout 60s → đủ cho mọi lệnh hiện tại.
+    // Để chắc xử lý <30s, các handler đã tối ưu: thinking=0, maxTokens nhỏ,
+    // candles fetch giảm còn 150, không HTF context cho LTF analysis.
     //
-    // Risk: nếu xử lý vượt 60s, Telegram retry → bot xử lý 2 lần. Mitigate
-    // bằng dedup KV theo update_id (TTL 5 phút).
+    // Dedup theo update_id phòng Telegram retry trùng (TTL 5 phút).
     if (url.pathname === "/telegram-webhook" && request.method === "POST") {
       let update;
       try {
@@ -2832,7 +2939,6 @@ export default {
         return new Response("OK", { status: 200 });
       }
 
-      // Dedup theo update_id — Telegram có thể retry cùng update nếu webhook timeout.
       const updateId = update?.update_id;
       if (updateId && env.CACHE) {
         const dedupKey = `tg_processed:${updateId}`;
@@ -2841,16 +2947,13 @@ export default {
           console.log(`[webhook] skip duplicate update_id=${updateId}`);
           return new Response("OK", { status: 200 });
         }
-        // Mark NGAY trước khi xử lý — phòng concurrent retry.
-        await env.CACHE.put(dedupKey, "1", { expirationTtl: 300 });
+        ctx.waitUntil(env.CACHE.put(dedupKey, "1", { expirationTtl: 300 }));
       }
 
-      // Await direct — tận dụng full request lifetime (~60s Telegram timeout).
-      try {
-        await handleTelegramUpdate(env, update);
-      } catch (e) {
-        console.log(`[webhook] handler error: ${e.message}`);
-      }
+      // Trả 200 OK NGAY (Telegram timeout ~10s) + xử lý trong waitUntil.
+      ctx.waitUntil(handleTelegramUpdate(env, update).catch(e => {
+        console.log(`[webhook] handler fatal: ${e.message}`);
+      }));
       return new Response("OK", { status: 200, headers: { "Content-Type": "text/plain" } });
     }
 
