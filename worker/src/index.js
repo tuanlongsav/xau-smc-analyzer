@@ -6,8 +6,7 @@
 // Frontend gọi `${WORKER_URL}/v1beta/models/{model}:generateContent` (mirror path Google),
 // Worker chèn `?key=...` rồi forward sang generativelanguage.googleapis.com.
 //
-// Set key: wrangler secret put GEMINI_API_KEY_1 (rồi _2, _3, _4, _5 cho rotation)
-// Backward compat: GEMINI_API_KEY (= _1), GEMINI_API_KEY_BACKUP (= _2) vẫn được đọc.
+// Set key: wrangler secret put GEMINI_API_KEY_1 (rồi _2, _3, _4, _5 cho rotation).
 
 const GOOGLE_BASE = "https://generativelanguage.googleapis.com";
 
@@ -46,23 +45,18 @@ function jsonResponse(status, obj, origin) {
 
 /**
  * Gom các Gemini key có cấu hình thành mảng theo thứ tự ưu tiên.
- * Tên chuẩn: GEMINI_API_KEY_1..5
- * Backward compat: GEMINI_API_KEY (= _1), GEMINI_API_KEY_BACKUP (= _2)
- *   — nếu có cả 2 tên cho cùng slot, ưu tiên tên mới (_1 / _2).
+ * Tên chuẩn duy nhất: GEMINI_API_KEY_1..5
  */
 function collectGeminiKeys(env) {
   const slots = [
-    { names: ["GEMINI_API_KEY_1", "GEMINI_API_KEY"],        label: "key_1" },
-    { names: ["GEMINI_API_KEY_2", "GEMINI_API_KEY_BACKUP"], label: "key_2" },
-    { names: ["GEMINI_API_KEY_3"],                          label: "key_3" },
-    { names: ["GEMINI_API_KEY_4"],                          label: "key_4" },
-    { names: ["GEMINI_API_KEY_5"],                          label: "key_5" },
+    { name: "GEMINI_API_KEY_1", label: "key_1" },
+    { name: "GEMINI_API_KEY_2", label: "key_2" },
+    { name: "GEMINI_API_KEY_3", label: "key_3" },
+    { name: "GEMINI_API_KEY_4", label: "key_4" },
+    { name: "GEMINI_API_KEY_5", label: "key_5" },
   ];
   return slots
-    .map(s => {
-      const found = s.names.find(n => env[n]);
-      return { key: found ? env[found] : null, label: s.label, source: found || null };
-    })
+    .map(s => ({ key: env[s.name], label: s.label, source: s.name }))
     .filter(s => !!s.key);
 }
 
@@ -2776,15 +2770,11 @@ export default {
           TELEGRAM_BOT_TOKEN: !!env.TELEGRAM_BOT_TOKEN,
           TELEGRAM_CHAT_ID: env.TELEGRAM_CHAT_ID || null,
           TWELVEDATA_API_KEY: !!env.TWELVEDATA_API_KEY,
-          // Tên chuẩn (mới)
           GEMINI_API_KEY_1: !!env.GEMINI_API_KEY_1,
           GEMINI_API_KEY_2: !!env.GEMINI_API_KEY_2,
           GEMINI_API_KEY_3: !!env.GEMINI_API_KEY_3,
           GEMINI_API_KEY_4: !!env.GEMINI_API_KEY_4,
           GEMINI_API_KEY_5: !!env.GEMINI_API_KEY_5,
-          // Tên cũ (backward compat) — có thể xoá sau khi migrate xong
-          GEMINI_API_KEY:        !!env.GEMINI_API_KEY,
-          GEMINI_API_KEY_BACKUP: !!env.GEMINI_API_KEY_BACKUP,
         },
       };
 

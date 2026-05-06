@@ -30,7 +30,7 @@ const _baseConfig = {
 
   // URL Cloudflare Worker proxy (giấu Gemini + TwelveData keys).
   // Worker code: ./worker/src/index.js
-  // Set keys: cd worker && wrangler secret put GEMINI_API_KEY (và TWELVEDATA_API_KEY)
+  // Set keys: cd worker && wrangler secret put GEMINI_API_KEY_1 (và _2/_3/_4/_5, TWELVEDATA_API_KEY)
   GEMINI_PROXY_URL: "https://xau-gemini-proxy.tuanlong-sav.workers.dev",
 
   SYMBOL: "XAU/USD",

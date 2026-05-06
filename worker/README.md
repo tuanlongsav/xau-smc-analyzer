@@ -18,8 +18,6 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN  # cho bot + cron alert
 npx wrangler secret put TELEGRAM_CHAT_ID    # vd -1001234567890 (group)
 ```
 
-> Backward compat: code vẫn đọc `GEMINI_API_KEY` (= `_1`) và `GEMINI_API_KEY_BACKUP` (= `_2`) nếu tên mới chưa set.
-
 Sau khi deploy, copy URL ra và update `js/config.js` của frontend (field `GEMINI_PROXY_URL`).
 
 ## Test
@@ -36,13 +34,6 @@ Test thật phải từ browser ở origin được phép (xem `isAllowedOrigin`
 
 ```bash
 npx wrangler secret put GEMINI_API_KEY_1   # paste key mới, ghi đè (hoặc _2/_3/_4/_5)
-```
-
-## Xoá key cũ (sau khi migrate sang tên mới)
-
-```bash
-npx wrangler secret delete GEMINI_API_KEY         # tên cũ — đã được _1 thay thế
-npx wrangler secret delete GEMINI_API_KEY_BACKUP  # tên cũ — đã được _2 thay thế
 ```
 
 ## Xem logs
