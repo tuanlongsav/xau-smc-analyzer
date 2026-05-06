@@ -910,21 +910,57 @@ function generateTradeSuggestion(latest, alerts, trend, lv) {
   return { dir, entry, sl, tp1, tp2, tp3, slDist: Math.abs(entry - sl) };
 }
 
-function formatAlertMessage(latest, alerts, pivots) {
+// Helper: tính bias đơn cho 1 candle (dùng cho block xác nhận đa khung)
+function biasOf(l) {
+  if (!l || l.ema200 == null || l.ema50 == null || l.ema21 == null) return null;
+  if (l.close > l.ema200 && l.ema21 > l.ema50 && l.ema50 > l.ema200) return { icon: "🚀", short: "Tăng mạnh", dir: "up" };
+  if (l.close > l.ema50 && l.close > l.ema200) return { icon: "🟢", short: "Tăng giá", dir: "up" };
+  if (l.close < l.ema200 && l.ema21 < l.ema50 && l.ema50 < l.ema200) return { icon: "🔻", short: "Giảm mạnh", dir: "down" };
+  if (l.close < l.ema50 && l.close < l.ema200) return { icon: "🔴", short: "Giảm giá", dir: "down" };
+  return { icon: "↔️", short: "Đi ngang", dir: "side" };
+}
+
+function formatAlertMessage(latest, alerts, pivots, mtfContext = null) {
   const t = new Date().toISOString().slice(0, 16).replace("T", " ");
-  let m = `🥇 *Cảnh báo giá XAU/USD* (khung 15p)\n`;
+  let m = `🥇 *Cảnh báo giá XAU/USD* (đa khung 5p+15p+1g, trigger 15p)\n`;
   m += `Giá hiện tại: *$${latest.close.toFixed(2)}* — ${t} UTC\n\n`;
 
-  m += `*🔔 Sự kiện vừa kích hoạt:*\n`;
+  m += `*🔔 Sự kiện vừa kích hoạt (khung 15p):*\n`;
   for (const a of alerts) {
     m += `${a.icon} ${a.text}\n`;
     if (a.suggestion) m += `   💡 _${a.suggestion}_\n`;
   }
 
-  // Xu hướng tổng
+  // 🌊 Xác nhận đa khung — show bias + RSI cho mỗi khung
+  if (mtfContext) {
+    m += `\n*🌊 Xác nhận đa khung:*\n`;
+    const dirs = [];
+    for (const tfKey of ["5p", "15p", "1g"]) {
+      const c = mtfContext[tfKey];
+      if (!c) {
+        m += `• *${tfKey}*: _không có data_\n`;
+        continue;
+      }
+      const b = biasOf(c);
+      const rsi = c.rsi != null ? c.rsi.toFixed(0) : "?";
+      const rsiTag = c.rsi == null ? "" : (c.rsi > 70 ? " (Quá mua)" : c.rsi < 30 ? " (Quá bán)" : "");
+      m += `${b ? b.icon : "❓"} *${tfKey}*: ${b ? b.short : "?"} | RSI ${rsi}${rsiTag}\n`;
+      if (b) dirs.push(b.dir);
+    }
+    // Đồng thuận
+    const upN = dirs.filter(d => d === "up").length;
+    const dnN = dirs.filter(d => d === "down").length;
+    if (upN === 3) m += `_↳ Đồng thuận TĂNG GIÁ 3/3 ✅ (tín hiệu tin cậy cao)_\n`;
+    else if (dnN === 3) m += `_↳ Đồng thuận GIẢM GIÁ 3/3 ✅ (tín hiệu tin cậy cao)_\n`;
+    else if (upN === 2) m += `_↳ Đa số TĂNG GIÁ 2/3 ⚠️ (1 khung mâu thuẫn — thận trọng)_\n`;
+    else if (dnN === 2) m += `_↳ Đa số GIẢM GIÁ 2/3 ⚠️ (1 khung mâu thuẫn — thận trọng)_\n`;
+    else m += `_↳ Khung phân vân — tín hiệu yếu, ưu tiên đứng ngoài_\n`;
+  }
+
+  // Xu hướng tổng (theo 15p)
   const trend = getTrendAssessment(latest);
   if (trend) {
-    m += `\n📈 *Xu hướng tổng:* ${trend.emoji} ${trend.label}\n`;
+    m += `\n📈 *Xu hướng tổng (15p):* ${trend.emoji} ${trend.label}\n`;
     m += `   _${trend.note}_\n`;
   }
 
@@ -936,12 +972,27 @@ function formatAlertMessage(latest, alerts, pivots) {
     for (const l of lv.below) m += `▼ *$${l.price.toFixed(2)}* ${l.label} _(-${(latest.close - l.price).toFixed(2)})_\n`;
   }
 
-  // 🎯 Gợi ý vào lệnh — Entry / SL / TP1-2-3 (rule-based)
+  // 🎯 Gợi ý vào lệnh — Entry/SL/TP1-2-3, có boost từ MTF consensus nếu align
   const sg = generateTradeSuggestion(latest, alerts, trend, lv);
   if (sg) {
     const dirLabel = sg.dir === "BUY" ? "MUA (LONG)" : "BÁN (SHORT)";
     const dirIcon = sg.dir === "BUY" ? "🟢" : "🔴";
-    m += `\n*🎯 Gợi ý vào lệnh:* ${dirIcon} *${dirLabel}*\n`;
+
+    // Đánh giá độ tin cậy bằng MTF consensus
+    let confidence = "trung bình";
+    if (mtfContext) {
+      const dirs = ["5p", "15p", "1g"]
+        .map(k => biasOf(mtfContext[k]))
+        .filter(Boolean)
+        .map(b => b.dir);
+      const wantDir = sg.dir === "BUY" ? "up" : "down";
+      const aligned = dirs.filter(d => d === wantDir).length;
+      if (aligned === 3) confidence = "*CAO* (3/3 khung đồng thuận)";
+      else if (aligned === 2) confidence = "trung bình (2/3 khung đồng thuận)";
+      else confidence = "_thấp_ (chỉ 1/3 khung đồng thuận — cẩn trọng)";
+    }
+
+    m += `\n*🎯 Gợi ý vào lệnh:* ${dirIcon} *${dirLabel}* | Tin cậy: ${confidence}\n`;
     m += `📍 Điểm vào (Entry): *$${sg.entry.toFixed(2)}*\n`;
     m += `🛑 Cắt lỗ (SL): *$${sg.sl.toFixed(2)}* _(rủi ro ~${sg.slDist.toFixed(2)} điểm)_\n`;
     m += `🎯 Chốt lời 1 (TP1, R:R 1:1 — an toàn): *$${sg.tp1.toFixed(2)}*\n`;
@@ -959,8 +1010,8 @@ function formatAlertMessage(latest, alerts, pivots) {
     scenarios.forEach((s, i) => { m += `${i + 1}. ${s}\n`; });
   }
 
-  // Chỉ báo tóm tắt
-  m += `\n_Chỉ báo: RSI ${latest.rsi?.toFixed(1)} | ATR ${latest.atr?.toFixed(2)} | EMA 21/50/200: ${latest.ema21?.toFixed(0)}/${latest.ema50?.toFixed(0)}/${latest.ema200?.toFixed(0)}_\n`;
+  // Chỉ báo tóm tắt (15p)
+  m += `\n_Chỉ báo (15p): RSI ${latest.rsi?.toFixed(1)} | ATR ${latest.atr?.toFixed(2)} | EMA 21/50/200: ${latest.ema21?.toFixed(0)}/${latest.ema50?.toFixed(0)}/${latest.ema200?.toFixed(0)}_\n`;
   if (pivots) {
     m += `_Điểm xoay (Pivot): R2 ${pivots.r2.toFixed(1)} | R1 ${pivots.r1.toFixed(1)} | PP ${pivots.pp.toFixed(1)} | S1 ${pivots.s1.toFixed(1)} | S2 ${pivots.s2.toFixed(1)}_\n`;
   }
@@ -2780,25 +2831,45 @@ async function runAlertCheck(env) {
     return;
   }
   try {
-    const c15 = await fetchTdCandles(env, "15min", 220);
-    if (c15.length < 200) {
-      console.log(`[cron] insufficient candles: ${c15.length}`);
+    // Cảnh báo đa khung 5p+15p+1h: trigger ở 15p (cân bằng giữa nhanh & nhiễu),
+    // xác nhận bằng xu hướng 5p (timing) + 1h (bối cảnh).
+    const [c5m, c15m, c1h] = await Promise.all([
+      fetchTdCandles(env, "5min", 220),
+      fetchTdCandles(env, "15min", 220),
+      fetchTdCandles(env, "1h", 220),
+    ]);
+
+    if (c15m.length < 200) {
+      console.log(`[cron] insufficient 15m candles: ${c15m.length}`);
       return;
     }
-    const enriched = enrichIndicators(c15);
-    const latest = enriched[enriched.length - 1];
-    const prev = enriched[enriched.length - 2];
+
+    const e5m = c5m.length >= 50 ? enrichIndicators(c5m) : null;
+    const e15m = enrichIndicators(c15m);
+    const e1h = c1h.length >= 50 ? enrichIndicators(c1h) : null;
+
+    const latest = e15m[e15m.length - 1];   // primary trigger frame
+    const prev = e15m[e15m.length - 2];
 
     const pivots = await getCachedDailyPivots(env);
 
-    const alerts = await detectFreshAlerts(env, latest, prev, pivots, enriched);
+    // Detect alerts trên 15p (primary)
+    const alerts = await detectFreshAlerts(env, latest, prev, pivots, e15m);
     if (alerts.length === 0) {
       console.log(`[cron] no fresh alerts, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)}`);
       return;
     }
-    const msg = formatAlertMessage(latest, alerts, pivots);
+
+    // Build context xác nhận đa khung
+    const mtfContext = {
+      "5p":  e5m  ? e5m[e5m.length - 1]   : null,
+      "15p": latest,
+      "1g":  e1h  ? e1h[e1h.length - 1]   : null,
+    };
+
+    const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
     const ok = await sendTelegram(env, msg);
-    console.log(`[cron] sent ${alerts.length} alerts, telegram=${ok}`);
+    console.log(`[cron] sent ${alerts.length} alerts (multi-TF), telegram=${ok}`);
   } catch (e) {
     console.log(`[cron] error: ${e.message}`);
   }
@@ -3209,6 +3280,7 @@ export default {
 
     // Test full alert pipeline với fake data — verify Telegram delivery + format
     if (url.pathname === "/test-cron-alert") {
+      const dryRun = url.searchParams.get("dryRun") === "1"; // dryRun=1 → không gửi vào group, chỉ trả preview
       const fakeLatest = {
         close: 4520.50, rsi: 78.5, atr: 12.3,
         ema21: 4515.20, ema50: 4505.10, ema200: 4480.50,
@@ -3216,15 +3288,22 @@ export default {
       };
       const fakePivots = { pp: 4510, r1: 4525, r2: 4540, s1: 4495, s2: 4480 };
       const fakeAlerts = [
-        { icon: "🔴", text: `RSI quá mua *78.5* — coi chừng điều chỉnh`, suggestion: "Watch BB upper rejection. Không chase long." },
-        { icon: "🎯", text: `Phá pivot R1 *$4525* lên`, suggestion: "Watch retest R1 làm hỗ trợ. Mục tiêu R2 $4540." },
-        { icon: "⚡", text: `ATR spike: *12.30* (1.7x avg)`, suggestion: "Volatility cao bất thường — đợi candle close trước khi entry." },
+        { icon: "🎣", text: `Quét thanh khoản DƯỚI (Liquidity Sweep Down) — râu nến $4515 phá đáy $4520 rồi đóng cửa lại trong`, suggestion: "Tín hiệu đảo chiều tăng. Theo dõi đóng cửa trên EMA21 + RSI xác nhận." },
+        { icon: "🎯", text: `Phá điểm xoay R1 (Pivot) *$4525* lên`, suggestion: "Theo dõi retest R1 làm hỗ trợ. Mục tiêu R2 $4540." },
       ];
-      const msg = formatAlertMessage(fakeLatest, fakeAlerts, fakePivots);
-      const ok = await sendTelegram(env, msg);
+      // Fake multi-TF context — 5p tăng giá, 15p tăng giá, 1g tăng mạnh
+      const fakeMtf = {
+        "5p":  { close: 4521, rsi: 65, ema21: 4518, ema50: 4515, ema200: 4485 }, // bullish
+        "15p": fakeLatest,                                                       // primary
+        "1g":  { close: 4520, rsi: 72, ema21: 4510, ema50: 4495, ema200: 4470 }, // strong bullish
+      };
+      const msg = formatAlertMessage(fakeLatest, fakeAlerts, fakePivots, fakeMtf);
+      let ok = false;
+      if (!dryRun) ok = await sendTelegram(env, msg);
       return jsonResponse(200, {
         ok,
-        message: ok ? "✅ Cảnh báo giá test đã gửi vào group" : "❌ Gửi thất bại — kiểm tra TELEGRAM_BOT_TOKEN/CHAT_ID",
+        dryRun,
+        message: dryRun ? "Preview only (dryRun=1)" : (ok ? "✅ Cảnh báo giá test đã gửi vào group" : "❌ Gửi thất bại"),
         previewMessage: msg,
       }, origin);
     }
