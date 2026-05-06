@@ -2810,13 +2810,46 @@ export default {
     }
 
     // Telegram webhook endpoint — Telegram POST update tới đây mỗi khi có message
+    //
+    // Quan trọng: KHÔNG dùng ctx.waitUntil(). Lý do:
+    //   - waitUntil() chỉ cho 30s wall time SAU response — không đủ cho lệnh
+    //     phân tích đa khung (~30-60s).
+    //   - Vượt 30s → Cloudflare giết tiến trình silent → user nhận được ack
+    //     nhưng không nhận kết quả cuối.
+    //
+    // Thay vào đó: await trực tiếp trong request lifetime. Worker Standard
+    // có wall time generous khi đang chờ I/O (Gemini fetch). Telegram cho
+    // webhook timeout 60s → đủ cho mọi lệnh hiện tại.
+    //
+    // Risk: nếu xử lý vượt 60s, Telegram retry → bot xử lý 2 lần. Mitigate
+    // bằng dedup KV theo update_id (TTL 5 phút).
     if (url.pathname === "/telegram-webhook" && request.method === "POST") {
+      let update;
       try {
-        const update = await request.json();
-        // Process async để Telegram không phải đợi
-        ctx.waitUntil(handleTelegramUpdate(env, update));
+        update = await request.json();
       } catch (e) {
         console.log(`[webhook] parse error: ${e.message}`);
+        return new Response("OK", { status: 200 });
+      }
+
+      // Dedup theo update_id — Telegram có thể retry cùng update nếu webhook timeout.
+      const updateId = update?.update_id;
+      if (updateId && env.CACHE) {
+        const dedupKey = `tg_processed:${updateId}`;
+        const seen = await env.CACHE.get(dedupKey);
+        if (seen) {
+          console.log(`[webhook] skip duplicate update_id=${updateId}`);
+          return new Response("OK", { status: 200 });
+        }
+        // Mark NGAY trước khi xử lý — phòng concurrent retry.
+        await env.CACHE.put(dedupKey, "1", { expirationTtl: 300 });
+      }
+
+      // Await direct — tận dụng full request lifetime (~60s Telegram timeout).
+      try {
+        await handleTelegramUpdate(env, update);
+      } catch (e) {
+        console.log(`[webhook] handler error: ${e.message}`);
       }
       return new Response("OK", { status: 200, headers: { "Content-Type": "text/plain" } });
     }

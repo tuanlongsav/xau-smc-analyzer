@@ -21,6 +21,13 @@ binding = "AI"
 [triggers]
 crons = ["*/5 * * * *"]
 
+# Tăng CPU limit từ 30s mặc định → 60s. Cần thiết cho lệnh /5p15p1h, /1h4h1d
+# (combo phân tích đa khung): fetch 3-5 nguồn TwelveData parallel + Gemini API
+# call có thể chiếm 30-50s wall time. Hầu hết là I/O wait nên CPU thực <5s,
+# nhưng để biên an toàn.
+[limits]
+cpu_ms = 60000
+
 # Secret cần set bằng tay sau khi deploy:
 #   npx wrangler secret put GEMINI_API_KEY_1
 #   npx wrangler secret put GEMINI_API_KEY_2
