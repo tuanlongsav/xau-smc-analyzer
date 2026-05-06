@@ -261,11 +261,11 @@ function computePivots(candle) {
  */
 function getTradingSession() {
   const h = new Date().getUTCHours();
-  if (h >= 0 && h < 7) return "Á (volatility thấp, thường đi ngang)";
-  if (h >= 7 && h < 8) return "giao thoa Á-Âu (bắt đầu volatile)";
-  if (h >= 8 && h < 13) return "Âu (volatility tăng, có xu hướng)";
-  if (h >= 13 && h < 16) return "giao thoa Âu-Mỹ (volatility cao nhất)";
-  if (h >= 16 && h < 21) return "Mỹ (volatility cao, có thể reversal)";
+  if (h >= 0 && h < 7)  return "Á (biến động thấp, thường đi ngang)";
+  if (h >= 7 && h < 8)  return "giao thoa Á-Âu (biến động bắt đầu tăng)";
+  if (h >= 8 && h < 13) return "Âu (biến động tăng, có xu hướng rõ)";
+  if (h >= 13 && h < 16) return "giao thoa Âu-Mỹ (biến động cao nhất trong ngày)";
+  if (h >= 16 && h < 21) return "Mỹ (biến động cao, hay có đảo chiều)";
   return "ngoài giờ chính (thanh khoản thấp)";
 }
 
@@ -322,11 +322,11 @@ async function getHTFContext(env) {
       if (!candles || candles.length < 50) return "chưa rõ";
       const e = enrichIndicators(candles);
       const last = e[e.length - 1];
-      if (last.close > last.ema200 && last.ema21 > last.ema50 && last.ema50 > last.ema200) return "Tăng mạnh";
-      if (last.close > last.ema50 && last.close > last.ema200) return "Tăng";
-      if (last.close < last.ema200 && last.ema21 < last.ema50 && last.ema50 < last.ema200) return "Giảm mạnh";
-      if (last.close < last.ema50 && last.close < last.ema200) return "Giảm";
-      return "Sideways";
+      if (last.close > last.ema200 && last.ema21 > last.ema50 && last.ema50 > last.ema200) return "Tăng mạnh (Strong Bullish)";
+      if (last.close > last.ema50 && last.close > last.ema200) return "Tăng giá (Bullish)";
+      if (last.close < last.ema200 && last.ema21 < last.ema50 && last.ema50 < last.ema200) return "Giảm mạnh (Strong Bearish)";
+      if (last.close < last.ema50 && last.close < last.ema200) return "Giảm giá (Bearish)";
+      return "Đi ngang (Sideways)";
     };
     const result = { trend4h: trendOf(c4h), trend1d: trendOf(c1d) };
     if (env.CACHE) {
@@ -497,7 +497,13 @@ async function getAuxContext(env, args, tf = "1h") {
           eurusdPrice: d.price,
           pct24h: -d.pct24h,
           pctTf: -d.pctTf,
-          trendLabel: { "Tăng mạnh": "Giảm mạnh", "Tăng": "Giảm", "Sideways": "Sideways", "Giảm": "Tăng", "Giảm mạnh": "Tăng mạnh" }[d.trendLabel] || "?",
+          trendLabel: {
+            "Tăng mạnh (Strong Bullish)": "Giảm mạnh (Strong Bearish)",
+            "Tăng giá (Bullish)":         "Giảm giá (Bearish)",
+            "Đi ngang (Sideways)":        "Đi ngang (Sideways)",
+            "Giảm giá (Bearish)":         "Tăng giá (Bullish)",
+            "Giảm mạnh (Strong Bearish)": "Tăng mạnh (Strong Bullish)",
+          }[d.trendLabel] || "?",
           trendEmoji: { "🚀": "🔻", "🟢": "🔴", "↔️": "↔️", "🔴": "🟢", "🔻": "🚀" }[d.trendEmoji] || "❓",
         };
       }
@@ -516,15 +522,15 @@ function interpretAuxImpact(auxCtx) {
   const lines = [];
   if (auxCtx.dxy) {
     const p = auxCtx.dxy.pct24h;
-    if (p > 0.3) lines.push("USD mạnh lên → áp lực GIẢM giá (bearish) cho XAU (correlation nghịch ~-0.7)");
-    else if (p < -0.3) lines.push("USD yếu đi → ủng hộ TĂNG giá (bullish) cho XAU");
-    else lines.push("USD đi ngang (sideways) → ít tác động lên XAU");
+    if (p > 0.3)       lines.push("Đô la mạnh lên → áp lực GIẢM GIÁ (bearish) cho XAU (tương quan nghịch ~-0.7)");
+    else if (p < -0.3) lines.push("Đô la yếu đi → ủng hộ TĂNG GIÁ (bullish) cho XAU");
+    else                lines.push("Đô la đi ngang (sideways) → ít tác động lên XAU");
   }
   if (auxCtx.oil) {
     const p = auxCtx.oil.pct24h;
-    if (p > 0.5) lines.push("Dầu tăng → đồng pha TĂNG giá (bullish) với XAU (cùng hedge lạm phát)");
-    else if (p < -0.5) lines.push("Dầu giảm → áp lực GIẢM giá (bearish) cho XAU");
-    else lines.push("Dầu đi ngang (sideways) → trung tính với XAU");
+    if (p > 0.5)       lines.push("Dầu tăng → đồng pha TĂNG GIÁ (bullish) với XAU (cùng phòng hộ lạm phát)");
+    else if (p < -0.5) lines.push("Dầu giảm → áp lực GIẢM GIÁ (bearish) cho XAU");
+    else                lines.push("Dầu đi ngang (sideways) → trung tính với XAU");
   }
   return lines.join(". ") + ".";
 }
@@ -739,44 +745,44 @@ function generateScenarios(alerts, trend, lv, latest) {
   const hasPivotBreak = alerts.some(a => /pivot/i.test(a.text));
   const hasCross = alerts.some(a => /Cross|cắt/.test(a.text));
 
-  // 1. Tiếp diễn theo trend
+  // 1. Tiếp diễn theo xu hướng
   if (isUptrend && lv.above[0]) {
-    scenarios.push(`Tiếp diễn *TĂNG*: phá ${lv.above[0].label} *$${lv.above[0].price.toFixed(2)}* → target ${lv.above[1] ? `*$${lv.above[1].price.toFixed(2)}*` : "mức cao kế tiếp"}`);
+    scenarios.push(`Tiếp diễn *TĂNG GIÁ (Bullish)*: phá ${lv.above[0].label} *$${lv.above[0].price.toFixed(2)}* → mục tiêu ${lv.above[1] ? `*$${lv.above[1].price.toFixed(2)}*` : "mức kháng cự kế tiếp"}`);
   }
   if (isDowntrend && lv.below[0]) {
-    scenarios.push(`Tiếp diễn *GIẢM*: phá ${lv.below[0].label} *$${lv.below[0].price.toFixed(2)}* → target ${lv.below[1] ? `*$${lv.below[1].price.toFixed(2)}*` : "mức thấp kế tiếp"}`);
+    scenarios.push(`Tiếp diễn *GIẢM GIÁ (Bearish)*: phá ${lv.below[0].label} *$${lv.below[0].price.toFixed(2)}* → mục tiêu ${lv.below[1] ? `*$${lv.below[1].price.toFixed(2)}*` : "mức hỗ trợ kế tiếp"}`);
   }
 
-  // 2. Pullback (RSI extreme hoặc BB break trong trend)
+  // 2. Hồi giá nhẹ (RSI cực trị hoặc phá BB trong trend)
   if (hasRsiExt || hasBbBreak) {
     if (isUptrend && lv.below[0]) {
-      scenarios.push(`Pullback nhẹ về ${lv.below[0].label} *$${lv.below[0].price.toFixed(2)}* → bounce continue trend`);
+      scenarios.push(`Hồi giá (pullback) nhẹ về ${lv.below[0].label} *$${lv.below[0].price.toFixed(2)}* → nảy lên tiếp tục xu hướng tăng`);
     } else if (isDowntrend && lv.above[0]) {
-      scenarios.push(`Bounce nhẹ về ${lv.above[0].label} *$${lv.above[0].price.toFixed(2)}* → reject continue down`);
+      scenarios.push(`Hồi giá (bounce) nhẹ về ${lv.above[0].label} *$${lv.above[0].price.toFixed(2)}* → bị từ chối, tiếp tục xu hướng giảm`);
     }
   }
 
-  // 3. Reversal (liquidity sweep)
+  // 3. Đảo chiều (quét thanh khoản — liquidity sweep)
   if (hasLiqSweep) {
     const isUpSweep = alerts.some(a => /sweep TRÊN/.test(a.text));
     if (isUpSweep && lv.below[1]) {
-      scenarios.push(`Đảo chiều *BEARISH* (smart money quét stop trên) → đẩy xuống *$${lv.below[1].price.toFixed(2)}*`);
+      scenarios.push(`Đảo chiều *GIẢM GIÁ (Bearish)* — dòng tiền lớn quét lệnh dừng lỗ phía trên → đẩy xuống *$${lv.below[1].price.toFixed(2)}*`);
     } else if (!isUpSweep && lv.above[1]) {
-      scenarios.push(`Đảo chiều *BULLISH* (smart money quét stop dưới) → đẩy lên *$${lv.above[1].price.toFixed(2)}*`);
+      scenarios.push(`Đảo chiều *TĂNG GIÁ (Bullish)* — dòng tiền lớn quét lệnh dừng lỗ phía dưới → đẩy lên *$${lv.above[1].price.toFixed(2)}*`);
     }
   }
 
-  // 4. Cross signal — trend change scenarios
+  // 4. Tín hiệu giao cắt (cross) — báo đổi xu hướng
   if (hasCross && scenarios.length < 3) {
     if (lv.above[0] && lv.below[0]) {
-      scenarios.push(`Cross báo trend đổi → watch close ${isUptrend ? "trên" : "dưới"} *$${(isUptrend ? lv.above[0] : lv.below[0]).price.toFixed(2)}* để confirm`);
+      scenarios.push(`Giao cắt báo đổi xu hướng → theo dõi nến đóng cửa ${isUptrend ? "trên" : "dưới"} *$${(isUptrend ? lv.above[0] : lv.below[0]).price.toFixed(2)}* để xác nhận`);
     }
   }
 
-  // Default fallback
+  // Mặc định nếu không có kịch bản rõ
   if (scenarios.length === 0 && lv.above[0] && lv.below[0]) {
-    scenarios.push(`Sideways trong vùng *$${lv.below[0].price.toFixed(2)}* – *$${lv.above[0].price.toFixed(2)}*`);
-    scenarios.push(`Break ra ngoài vùng → đi theo hướng break (>1×ATR ${latest.atr?.toFixed(1)})`);
+    scenarios.push(`Đi ngang (Sideways) trong vùng *$${lv.below[0].price.toFixed(2)}* – *$${lv.above[0].price.toFixed(2)}*`);
+    scenarios.push(`Phá vỡ ra ngoài vùng → đi theo hướng phá vỡ (>1×ATR = ${latest.atr?.toFixed(1)} điểm)`);
   }
 
   return scenarios.slice(0, 3);
@@ -923,13 +929,21 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
   const active = allKeys.filter(k => !isKeyOnCooldown(k.label));
   const tryKeys = active.length > 0 ? active : allKeys;
 
+  // Timeout 22s cho mỗi Gemini call — tránh treo gần 30s waitUntil của Worker.
+  // Nếu key hiện tại quá chậm → abort, thử key khác (rotation đã handle bên dưới).
+  const GEMINI_TIMEOUT_MS = 22_000;
+
   for (const { key, label } of tryKeys) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
     try {
       const r = await fetch(`${GOOGLE_BASE}/v1beta/models/${model}:generateContent?key=${key}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: bodyStr,
+        signal: ctrl.signal,
       });
+      clearTimeout(tid);
       if (r.status === 200) {
         clearKeyCooldown(label);
         const json = await r.json();
@@ -945,7 +959,11 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
       }
       markKeyCooldown(label, r.status);
     } catch (e) {
-      console.log(`[gemini-smart] ${label} error: ${e.message}`);
+      clearTimeout(tid);
+      const isAbort = e.name === "AbortError";
+      console.log(`[gemini-smart] ${label} ${isAbort ? "TIMEOUT" : "error"}: ${e.message}`);
+      // Abort: cooldown như 500 (2 phút) để skip key này, thử key khác / Workers AI
+      if (isAbort) markKeyCooldown(label, 500);
     }
   }
 
@@ -989,6 +1007,19 @@ async function sendChatAction(env, chatId, action = "typing") {
       body: JSON.stringify({ chat_id: chatId, action }),
     });
   } catch {}
+}
+
+// Gửi placeholder ngay khi nhận lệnh — user thấy bot đã accept.
+// Quan trọng cho lệnh chạy gần 30s (giới hạn ctx.waitUntil của CF Worker):
+// nếu xử lý timeout, placeholder vẫn còn → user biết bot đã nhận, có thể retry.
+async function sendQuickAck(env, chatId, replyTo, taskLabel) {
+  return sendTelegramTo(
+    env,
+    chatId,
+    `🔄 <i>Đang ${taskLabel}...</i>`,
+    replyTo,
+    "HTML",
+  );
 }
 
 async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseMode = "Markdown") {
@@ -1739,20 +1770,26 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
 
     const determineBias = (l) => {
       if (l.ema200 == null || l.ema50 == null || l.ema21 == null) return { icon: "❓", label: "?" };
-      if (l.close > l.ema200 && l.ema21 > l.ema50 && l.ema50 > l.ema200) return { icon: "🚀", label: "Tăng mạnh" };
-      if (l.close > l.ema50 && l.close > l.ema200) return { icon: "🟢", label: "Tăng" };
-      if (l.close < l.ema200 && l.ema21 < l.ema50 && l.ema50 < l.ema200) return { icon: "🔻", label: "Giảm mạnh" };
-      if (l.close < l.ema50 && l.close < l.ema200) return { icon: "🔴", label: "Giảm" };
-      return { icon: "↔️", label: "Sideways" };
+      if (l.close > l.ema200 && l.ema21 > l.ema50 && l.ema50 > l.ema200) return { icon: "🚀", label: "Tăng mạnh (Strong Bullish)" };
+      if (l.close > l.ema50 && l.close > l.ema200) return { icon: "🟢", label: "Tăng giá (Bullish)" };
+      if (l.close < l.ema200 && l.ema21 < l.ema50 && l.ema50 < l.ema200) return { icon: "🔻", label: "Giảm mạnh (Strong Bearish)" };
+      if (l.close < l.ema50 && l.close < l.ema200) return { icon: "🔴", label: "Giảm giá (Bearish)" };
+      return { icon: "↔️", label: "Đi ngang (Sideways)" };
     };
     const rsiTag = (r) => {
-      if (r == null) return "?";
-      if (r > 70) return "QM";   // quá mua
-      if (r < 30) return "QB";   // quá bán
-      return "TT";               // trung tính
+      if (r == null) return "RSI ?";
+      if (r > 70) return "Quá mua";   // overbought
+      if (r < 30) return "Quá bán";   // oversold
+      return "Trung tính";            // neutral
     };
 
-    let m = `<b>🥇 XAU Pulse</b> — Giá: <b>$${c.toFixed(2)}</b>\n`;
+    // Map TF tiếng Việt cho dễ hiểu
+    const tfLabel = (tf) => ({ "5m": "5p", "15m": "15p", "1h": "1g", "4h": "4g", "1d": "1 ngày" }[tf] || tf);
+    // Map TF cho label mức giá (không có space)
+    const tfShort = (tf) => ({ "5m": "5p", "15m": "15p", "1h": "1g", "4h": "4g", "1d": "1d" }[tf] || tf);
+
+    let m = `<b>🥇 Tổng quan nhanh XAU/USD</b>\n`;
+    m += `Giá hiện tại: <b>$${c.toFixed(2)}</b>\n`;
     m += `<i>Phiên ${getTradingSession()}</i>\n`;
     if (auxCtx) {
       const auxLines = formatAuxBlock(auxCtx).split("\n").map(l => htmlEsc(l)).join("\n");
@@ -1760,50 +1797,56 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
       const impact = interpretAuxImpact(auxCtx);
       if (impact) m += `<i>↳ Tác động lên XAU: ${htmlEsc(impact)}</i>\n`;
     }
-    m += `\n<b>📊 Bias các khung:</b>\n`;
+    m += `\n<b>📊 Xu hướng từng khung:</b>\n`;
 
     const biasLabels = [];
     for (const d of valid) {
       const b = determineBias(d.latest);
       biasLabels.push(b.label);
       const rsiVal = d.latest.rsi?.toFixed(0) || "?";
-      m += `${b.icon} <b>${d.tf}</b>: ${b.label} | RSI <b>${rsiVal}</b> ${rsiTag(d.latest.rsi)}\n`;
+      m += `${b.icon} <b>${tfLabel(d.tf)}</b>: ${b.label} | RSI <b>${rsiVal}</b> (${rsiTag(d.latest.rsi)})\n`;
     }
 
-    // Mức cần watch — top 2 above + below
+    // Mức giá cần quan sát — top 3 trên + dưới
     const latest15m = valid.find(d => d.tf === "15m")?.latest;
     if (latest15m) {
+      const tfL = tfShort("15m");
       const levels = [];
-      if (latest15m.bbUpper) levels.push({ price: latest15m.bbUpper, label: "BB upper 15m" });
-      if (latest15m.bbLower) levels.push({ price: latest15m.bbLower, label: "BB lower 15m" });
-      if (latest15m.recentHigh) levels.push({ price: latest15m.recentHigh, label: "High 50 nến 15m" });
-      if (latest15m.recentLow) levels.push({ price: latest15m.recentLow, label: "Low 50 nến 15m" });
+      if (latest15m.bbUpper) levels.push({ price: latest15m.bbUpper, label: `Biên trên Bollinger (BB upper) ${tfL}` });
+      if (latest15m.bbLower) levels.push({ price: latest15m.bbLower, label: `Biên dưới Bollinger (BB lower) ${tfL}` });
+      if (latest15m.recentHigh) levels.push({ price: latest15m.recentHigh, label: `Đỉnh 50 nến (${tfL})` });
+      if (latest15m.recentLow)  levels.push({ price: latest15m.recentLow, label: `Đáy 50 nến (${tfL})` });
       if (pivots) {
-        levels.push({ price: pivots.r1, label: "Pivot R1" });
-        levels.push({ price: pivots.r2, label: "Pivot R2" });
-        levels.push({ price: pivots.s1, label: "Pivot S1" });
-        levels.push({ price: pivots.s2, label: "Pivot S2" });
+        levels.push({ price: pivots.r1, label: "Điểm xoay R1 (Pivot)" });
+        levels.push({ price: pivots.r2, label: "Điểm xoay R2 (Pivot)" });
+        levels.push({ price: pivots.s1, label: "Điểm xoay S1 (Pivot)" });
+        levels.push({ price: pivots.s2, label: "Điểm xoay S2 (Pivot)" });
       }
       const above = levels.filter(lv => lv.price > c).sort((a, b) => a.price - b.price).slice(0, 3);
       const below = levels.filter(lv => lv.price < c).sort((a, b) => b.price - a.price).slice(0, 3);
       if (above.length || below.length) {
-        m += `\n<b>📍 Mức cần watch:</b>\n`;
+        m += `\n<b>📍 Mức giá cần quan sát:</b>\n`;
         for (const lv of above) m += `▲ <b>$${lv.price.toFixed(2)}</b> ${htmlEsc(lv.label)} <i>(+${(lv.price - c).toFixed(2)})</i>\n`;
         for (const lv of below) m += `▼ <b>$${lv.price.toFixed(2)}</b> ${htmlEsc(lv.label)} <i>(-${(c - lv.price).toFixed(2)})</i>\n`;
       }
     }
 
-    // Consensus
+    // Kết luận đồng thuận giữa các khung
     const upCount = biasLabels.filter(b => b.includes("Tăng")).length;
     const downCount = biasLabels.filter(b => b.includes("Giảm")).length;
-    const sideCount = biasLabels.filter(b => b === "Sideways").length;
+    const sideCount = biasLabels.filter(b => b.includes("ngang")).length;
     let conclusion;
-    if (upCount >= valid.length - 1) conclusion = `Đa số khung BULLISH (${upCount}/${valid.length}) — ưu tiên long, watch breakout lên`;
-    else if (downCount >= valid.length - 1) conclusion = `Đa số khung BEARISH (${downCount}/${valid.length}) — ưu tiên short, watch breakdown xuống`;
-    else if (sideCount >= 2) conclusion = `Nhiều khung sideways — đợi rõ hướng, không vội vào lệnh`;
-    else conclusion = `Phân vân giữa các khung (${upCount}↑/${downCount}↓/${sideCount}↔️) — top-down trước khi vào`;
+    if (upCount >= valid.length - 1) {
+      conclusion = `Đa số khung TĂNG GIÁ (Bullish, ${upCount}/${valid.length}) — ưu tiên MUA (LONG), theo dõi cú phá vỡ lên (breakout)`;
+    } else if (downCount >= valid.length - 1) {
+      conclusion = `Đa số khung GIẢM GIÁ (Bearish, ${downCount}/${valid.length}) — ưu tiên BÁN (SHORT), theo dõi cú vỡ đáy xuống (breakdown)`;
+    } else if (sideCount >= 2) {
+      conclusion = `Nhiều khung ĐI NGANG (Sideways) — đợi giá xác nhận hướng, KHÔNG vội vào lệnh`;
+    } else {
+      conclusion = `Các khung phân vân (${upCount}↑ / ${downCount}↓ / ${sideCount}↔️) — phân tích từ khung lớn xuống nhỏ trước khi vào`;
+    }
     m += `\n💡 <b>${conclusion}</b>`;
-    m += `\n\n<i>Để chi tiết: /15p /1h /1h4h1d /nhanh15p ...</i>`;
+    m += `\n\n<i>Để xem chi tiết: /15p /1h /1h4h1d /nhanh15p ...</i>`;
 
     await sendTelegramTo(env, chatId, m, replyTo, "HTML");
   } catch (e) {
@@ -1832,30 +1875,36 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m", auxArgs = []) {
       ? `Pivots: R2=${pivots.r2.toFixed(2)} R1=${pivots.r1.toFixed(2)} PP=${pivots.pp.toFixed(2)} S1=${pivots.s1.toFixed(2)} S2=${pivots.s2.toFixed(2)}`
       : "";
 
-    const systemText = `Bạn là chuyên gia TA XAU/USD. Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
+    const systemText = `Bạn là chuyên gia phân tích kỹ thuật XAU/USD. Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
 
-NGÔN NGỮ — bilingual cho thuật ngữ:
-- Tiếng Việt trước, tiếng Anh trong ngoặc. VD:
+NGÔN NGỮ — TIẾNG VIỆT LÀ CHÍNH:
+- Toàn bộ câu trả lời PHẢI viết bằng tiếng Việt tự nhiên, dễ hiểu cho người mới.
+- KHÔNG dùng từ tiếng Anh trần (kiểu "bullish", "bearish", "sideways", "pullback", "breakout", "reversal" đứng một mình).
+- BẮT BUỘC dùng cấu trúc: "tiếng Việt (tiếng Anh trong ngoặc)" cho thuật ngữ kỹ thuật. Ví dụ chuẩn:
   • "tăng giá (bullish)" / "giảm giá (bearish)" / "đi ngang (sideways)"
-  • "phá vỡ (breakout)" / "đảo chiều (reversal)" / "hồi giá (pullback)"
-  • "phân kỳ (divergence)" / "kiệt sức (exhaustion)"
-  • "Quá mua (Overbought)" / "Quá bán (Oversold)"
-  • "Đường EMA" / "Dải Bollinger (BB)"
+  • "phá vỡ (breakout)" / "vỡ đáy (breakdown)" / "đảo chiều (reversal)"
+  • "hồi giá (pullback)" / "kiểm tra lại (retest)" / "phản ứng từ chối (rejection)"
+  • "phân kỳ (divergence)" / "kiệt sức (exhaustion)" / "động lượng (momentum)"
+  • "quá mua (overbought)" / "quá bán (oversold)" / "tích lũy (consolidation)"
+  • "đường trung bình hàm mũ (EMA)" / "dải Bollinger (BB)" / "biên độ thực trung bình (ATR)"
+  • "kháng cự (resistance)" / "hỗ trợ (support)" / "điểm xoay (Pivot)"
+  • "mua (long)" / "bán (short)" / "đứng ngoài (wait)"
+  • "điểm vào lệnh (entry)" / "cắt lỗ (stop loss / SL)" / "chốt lời (take profit / TP)"
 
 QUY TẮC:
-- Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
+- Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
 - BẮT BUỘC điền tất cả field, không bỏ trống.
 - Mọi mức giá là số cụ thể (float).
 - Mọi khung từ 5m → 1d đều có thể phân tích được, không từ chối.`;
-    const auxText = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT (cùng khung ${tf}):
+    const auxText = auxCtx ? `\n\n💱 BỐI CẢNH LIÊN THỊ TRƯỜNG (cùng khung ${tf}):
 ${formatAuxBlock(auxCtx)}
 
-YÊU CẦU BẮT BUỘC: Trong câu trả lời (tom_tat hoặc canh_bao), PHẢI giải thích cụ thể tác động của DXY/OIL lên XAU:
-- Nếu DXY tăng → áp lực giảm XAU (correlation nghịch ~-0.7).
-- Nếu DXY giảm → hỗ trợ XAU.
-- Nếu OIL tăng → đồng pha bullish XAU (cùng inflation hedge).
-- Nếu OIL giảm → áp lực giảm XAU.
-Đối chiếu với setup XAU: nếu inter-market đồng thuận → tăng độ tin cậy. Nếu mâu thuẫn → giảm độ tin cậy + thêm vào canh_bao.` : "";
+YÊU CẦU BẮT BUỘC: Trong câu trả lời (tom_tat hoặc canh_bao), PHẢI giải thích cụ thể tác động của Chỉ số đô la Mỹ (DXY) / Giá dầu (OIL) lên XAU:
+- DXY tăng → áp lực giảm XAU (tương quan nghịch ~-0.7).
+- DXY giảm → hỗ trợ XAU.
+- OIL tăng → đồng pha tăng giá với XAU (cùng phòng hộ lạm phát — inflation hedge).
+- OIL giảm → áp lực giảm XAU.
+Đối chiếu với setup XAU: nếu liên thị trường đồng thuận → tăng độ tin cậy. Nếu mâu thuẫn → giảm độ tin cậy + thêm vào canh_bao.` : "";
     const userText = `XAU/USD khung ${tf} (horizon ${horizon}), giá $${l.close.toFixed(2)}.
 RSI: ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
 SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
@@ -1968,6 +2017,7 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
     await sendTelegramTo(env, chatId, `❌ TF không hợp lệ. Dùng: ${Object.keys(TF_TO_TD).join(", ")}`, replyTo);
     return;
   }
+  await sendQuickAck(env, chatId, replyTo, `phân tích chi tiết khung ${tf} — ~15-20s`);
   await sendChatAction(env, chatId, "typing");
   try {
     const [candles, auxCtx] = await Promise.all([
@@ -2000,69 +2050,63 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
       ? `- Xu hướng khung lớn: 4h ${htfCtx.trend4h}, 1d ${htfCtx.trend1d}\n  (Tip: 4h/1d giống dòng sông lớn, ${tf} chỉ là gợn sóng. Đi ngược HTF = rủi ro cao.)`
       : "";
 
-    const systemText = `Bạn là chuyên gia phân tích kỹ thuật (Trader) XAU/USD nhiều năm kinh nghiệm + sư phạm.
+    const systemText = `Bạn là chuyên gia phân tích kỹ thuật XAU/USD nhiều năm kinh nghiệm, có sư phạm tốt.
 
 NHIỆM VỤ:
-- Phân tích dữ liệu thị trường, đưa ra QUYẾT ĐỊNH GIAO DỊCH cụ thể (BUY/SELL/WAIT) ở phần đầu.
+- Phân tích dữ liệu thị trường, đưa ra QUYẾT ĐỊNH GIAO DỊCH cụ thể (MUA / BÁN / ĐỨNG NGOÀI) ở phần đầu.
 - Sau đó GIẢI THÍCH bằng tiếng Việt đời thường, dễ hiểu cho người mới.
 
-NGÔN NGỮ — BẮT BUỘC bilingual cho thuật ngữ kỹ thuật:
-- Viết tiếng Việt TRƯỚC, tiếng Anh trong NGOẶC sau.
-
-Từ vựng common:
+NGÔN NGỮ — TIẾNG VIỆT LÀ CHÍNH:
+- Toàn bộ giải thích viết tiếng Việt tự nhiên, KHÔNG dùng từ tiếng Anh trần (kiểu "bullish", "sideways", "pullback" đứng một mình).
+- Mọi thuật ngữ kỹ thuật BẮT BUỘC viết: "tiếng Việt (tiếng Anh trong ngoặc)" — tiếng Việt đứng trước, tiếng Anh trong ngoặc giúp tra cứu.
+- Bảng đối chiếu chuẩn (ép đúng):
   • bullish → "tăng giá (bullish)"
   • bearish → "giảm giá (bearish)"
   • sideways → "đi ngang (sideways)"
   • consolidation → "tích lũy (consolidation)"
-  • breakout → "phá vỡ (breakout)"
-  • breakdown → "vỡ đáy (breakdown)"
-  • pullback → "hồi giá (pullback)"
-  • retest → "kiểm tra lại (retest)"
+  • breakout → "phá vỡ (breakout)" / breakdown → "vỡ đáy (breakdown)"
+  • pullback → "hồi giá (pullback)" / retest → "kiểm tra lại (retest)"
   • rejection → "phản ứng từ chối (rejection)"
-  • reversal → "đảo chiều (reversal)"
-  • continuation → "tiếp diễn (continuation)"
-  • divergence → "phân kỳ (divergence)"
-  • exhaustion → "kiệt sức (exhaustion)"
-  • momentum → "động lượng (momentum)"
-  • volatility → "biến động (volatility)"
-  • impulse → "sóng đẩy (impulse)"
-  • correction → "sóng điều chỉnh (correction)"
-  • swing high/low → "đỉnh/đáy swing"
-
-Từ SMC + indicators:
-  • "Phá vỡ cấu trúc (BOS — Break of Structure)"
-  • "Đổi tính chất (CHOCH — Change of Character)"
-  • "Khối lệnh (OB — Order Block)"
-  • "Khoảng trống công bằng (FVG — Fair Value Gap)"
-  • "Quét thanh khoản (Liquidity Sweep)"
-  • "Giao cắt vàng/tử thần (Golden/Death Cross)"
-  • "Nến rút râu đáy (Hammer)" / "Nến nhấn chìm (Engulfing)"
-  • "Đường trung bình động hàm mũ (EMA)"
-  • "Dải Bollinger (BB)"
-  • "Biên độ thực trung bình (ATR)"
-  • "Điểm xoay (Pivot Point)"
-  • "Khung lớn/trung/nhỏ (HTF/MTF/LTF)"
-  • "Mua / Bán / Đứng ngoài (Long / Short / Wait)"
-  • "Điểm vào / Cắt lỗ / Chốt lời (Entry / SL / TP)"
+  • reversal → "đảo chiều (reversal)" / continuation → "tiếp diễn (continuation)"
+  • divergence → "phân kỳ (divergence)" / exhaustion → "kiệt sức (exhaustion)"
+  • momentum → "động lượng (momentum)" / volatility → "biến động (volatility)"
+  • impulse → "sóng đẩy (impulse)" / correction → "sóng điều chỉnh (correction)"
+  • swing high/low → "đỉnh swing / đáy swing"
+  • overbought → "quá mua (overbought)" / oversold → "quá bán (oversold)"
+  • Golden Cross → "giao cắt vàng (Golden Cross)" / Death Cross → "giao cắt tử thần (Death Cross)"
+  • BOS → "phá vỡ cấu trúc (BOS — Break of Structure)"
+  • CHOCH → "đổi tính chất xu hướng (CHOCH — Change of Character)"
+  • OB → "khối lệnh (OB — Order Block)"
+  • FVG → "khoảng trống công bằng (FVG — Fair Value Gap)"
+  • Liquidity Sweep → "quét thanh khoản (Liquidity Sweep)"
+  • Hammer → "nến rút râu đáy (Hammer)" / Engulfing → "nến nhấn chìm (Engulfing)"
+  • EMA → "đường trung bình động hàm mũ (EMA)"
+  • Bollinger Bands → "dải Bollinger (Bollinger Bands)"
+  • ATR → "biên độ thực trung bình (ATR)"
+  • Pivot Point → "điểm xoay (Pivot Point)"
+  • HTF/MTF/LTF → "khung lớn (HTF) / khung trung (MTF) / khung nhỏ (LTF)"
+  • Long/Short/Wait → "mua (Long) / bán (Short) / đứng ngoài (Wait)"
+  • Entry/SL/TP → "điểm vào lệnh (Entry) / cắt lỗ (Stop Loss — SL) / chốt lời (Take Profit — TP)"
+  • Risk/Reward → "tỷ lệ rủi ro/lợi nhuận (R:R)"
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
 - Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
 - Tất cả mức giá phải là số cụ thể (float).
-- 3 mức TP: TP1 an toàn (R:R ~1:1), TP2 kỳ vọng (R:R ~1:2), TP3 tối đa theo trend (R:R ~1:3+).
-- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
-- Nếu setup chưa rõ → chọn WAIT (Đứng ngoài), KHÔNG bịa entry.`;
+- 3 mức chốt lời: TP1 an toàn (R:R ~1:1), TP2 kỳ vọng (R:R ~1:2), TP3 mở rộng theo xu hướng (R:R ~1:3+).
+- Cắt lỗ (SL) đặt NGOÀI vùng nhiễu (>1×ATR cách đỉnh/đáy swing) để tránh quét thanh khoản.
+- Nếu setup chưa rõ → chọn WAIT (đứng ngoài), KHÔNG bịa điểm vào.`;
 
-    const auxBlock = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT (cùng khung ${tf}):
+    const auxBlock = auxCtx ? `\n\n💱 BỐI CẢNH LIÊN THỊ TRƯỜNG (cùng khung ${tf}):
 ${formatAuxBlock(auxCtx)}
 
 YÊU CẦU BẮT BUỘC trong giai_thich:
-- buc_tranh_toan_canh PHẢI nhắc đến DXY/OIL: vd "DXY giảm 0.4% trong 24h → hỗ trợ XAU"
-- ly_do_entry_sl PHẢI nói có inter-market confirm setup không
-- rui_ro_can_luu_y PHẢI thêm rủi ro mâu thuẫn nếu inter-market đi ngược setup
-Quy tắc correlation:
+- buc_tranh_toan_canh PHẢI nhắc Chỉ số đô la (DXY) / Giá dầu (OIL): vd "DXY giảm 0.4% trong 24h → hỗ trợ XAU"
+- ly_do_entry_sl PHẢI nói liên thị trường có xác nhận setup không
+- rui_ro_can_luu_y PHẢI thêm rủi ro mâu thuẫn nếu liên thị trường đi ngược setup
+Quy tắc tương quan:
 - DXY ↑ → XAU ↓ (nghịch ~-0.7)
-- OIL ↑ → XAU ↑ (đồng pha inflation hedge)` : "";
+- OIL ↑ → XAU ↑ (đồng pha — cùng phòng hộ lạm phát/inflation hedge)` : "";
 
     const userText = `Phân tích XAU/USD khung ${tf} (horizon ${horizon}).
 
@@ -2111,9 +2155,11 @@ ${htfBlock}
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         responseMimeType: "application/json",
-        maxOutputTokens: 4096,
+        maxOutputTokens: 3000,
         temperature: 0.5,
-        thinkingConfig: { thinkingBudget: 1024 },
+        // 0 thinking: schema đã có template structure, AI không cần "nghĩ" nhiều.
+        // Cắt được ~5-7s latency để tránh vượt 30s waitUntil.
+        thinkingConfig: { thinkingBudget: 0 },
       },
     };
     const resp = await callGeminiSmart(env, body);
@@ -2186,7 +2232,7 @@ function formatAnalysisHTML(d, tf, horizon) {
       const rr = fmtRr(qd.rr_tp2);
       m += `🎯 TP2 kỳ vọng: <b>$${fmt2(qd.tp2)}</b>${rr ? ` <i>(R:R ${rr})</i>` : ""}\n`;
     }
-    if (qd.tp3 != null) m += `🎯 TP3 tối đa (theo trend): <b>$${fmt2(qd.tp3)}</b>\n`;
+    if (qd.tp3 != null) m += `🎯 TP3 mở rộng theo xu hướng: <b>$${fmt2(qd.tp3)}</b>\n`;
   } else {
     m += `\n<i>Chưa có setup rõ ràng — chờ giá xác nhận hướng.</i>\n`;
   }
@@ -2242,6 +2288,10 @@ function splitForTelegram(text, maxLen = 3900) {
  * Khác với loop: cho AI xem data nhiều khung và tự tổng hợp consensus.
  */
 async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs = []) {
+  const taskLabel = isNhanh
+    ? `quét nhanh đa khung ${tfs.join("+")} — ~10s`
+    : `phân tích chi tiết đa khung ${tfs.join("+")} — ~20-25s`;
+  await sendQuickAck(env, chatId, replyTo, taskLabel);
   await sendChatAction(env, chatId, "typing");
   try {
     // HTF (khung lớn nhất) cho aux interval
@@ -2306,31 +2356,36 @@ NGUYÊN TẮC TOP-DOWN:
 - Khung nhỏ (LTF — Lower Timeframe = ${ltf}) → định timing vào lệnh + xác nhận.
 - Khuyến nghị PHẢI dựa trên hợp lực 3 khung. Nếu các khung mâu thuẫn → ghi rõ ở 'alignment' và giảm độ tin cậy.
 
-NGÔN NGỮ — bilingual cho thuật ngữ:
-- Tiếng Việt trước, tiếng Anh trong ngoặc. VD:
-  • "tăng giá (bullish)" / "giảm giá (bearish)" / "đi ngang (sideways)"
-  • "Phá vỡ cấu trúc (BOS)" / "Đổi tính chất (CHOCH)"
-  • "Khối lệnh (OB)" / "Khoảng trống công bằng (FVG)"
-  • "Quét thanh khoản (Liquidity Sweep)" / "Phân kỳ (Divergence)"
-  • "Đường trung bình EMA" / "Dải Bollinger (BB)" / "Biên độ ATR"
-  • "Khung lớn/trung/nhỏ (HTF/MTF/LTF)"
+NGÔN NGỮ — TIẾNG VIỆT LÀ CHÍNH:
+- Toàn bộ phân tích viết tiếng Việt tự nhiên, KHÔNG dùng từ tiếng Anh trần (kiểu "bullish", "sideways", "consolidation" đứng một mình).
+- Mọi thuật ngữ kỹ thuật BẮT BUỘC dùng cấu trúc: "tiếng Việt (tiếng Anh trong ngoặc)".
+- Bảng đối chiếu chuẩn:
+  • "tăng giá (bullish)" / "giảm giá (bearish)" / "đi ngang (sideways)" / "tích lũy (consolidation)"
+  • "phá vỡ cấu trúc (BOS — Break of Structure)" / "đổi tính chất xu hướng (CHOCH — Change of Character)"
+  • "khối lệnh (OB — Order Block)" / "khoảng trống công bằng (FVG — Fair Value Gap)"
+  • "quét thanh khoản (Liquidity Sweep)" / "phân kỳ (divergence)"
+  • "đường trung bình động hàm mũ (EMA)" / "dải Bollinger (Bollinger Bands)" / "biên độ thực trung bình (ATR)"
+  • "khung lớn (HTF) / khung trung (MTF) / khung nhỏ (LTF)"
+  • "mua (Long) / bán (Short) / đứng ngoài (Wait)"
+  • "điểm vào lệnh (Entry) / cắt lỗ (Stop Loss — SL) / chốt lời (Take Profit — TP)"
+  • "kháng cự (resistance) / hỗ trợ (support) / điểm xoay (Pivot)"
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
 - BẮT BUỘC điền field 'by_tf' cho TẤT CẢ ${valid.length} khung — không bỏ sót.
 - Mọi mức giá là số cụ thể (float).
-- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
+- Cắt lỗ (SL) đặt NGOÀI vùng nhiễu (>1×ATR cách đỉnh/đáy swing) để tránh quét thanh khoản.
 - Nếu kha_thi=true: BẮT BUỘC điền entry + sl + tp1 + tp2 + tp3 (TP1 R:R ~1:1, TP2 ~1:2, TP3 mở rộng tới mức kháng/hỗ trợ kế tiếp hoặc R:R 1:3+).
 - Field "tp" giữ nguyên = tp2 (kỳ vọng) cho backward compat.
 - R:R (rr) lấy theo TP2.`;
 
-    const auxBlock = auxCtx ? `\n\n💱 INTER-MARKET CONTEXT (khung ${htfForAux}):
+    const auxBlock = auxCtx ? `\n\n💱 BỐI CẢNH LIÊN THỊ TRƯỜNG (khung ${htfForAux}):
 ${formatAuxBlock(auxCtx)}
 
-LƯU Ý: Trong tom_tat / phan_tich_top_down PHẢI nhắc đến tác động DXY/OIL:
-- DXY ↑ → áp lực giảm XAU (correlation nghịch ~-0.7)
-- OIL ↑ → đồng pha tăng XAU (cùng inflation hedge)
-Mâu thuẫn inter-market với consensus → giảm độ tin cậy + thêm vào rui_ro_chinh.` : "";
+LƯU Ý: Trong tom_tat / phan_tich_top_down PHẢI nhắc đến tác động Chỉ số đô la (DXY) / Giá dầu (OIL):
+- DXY ↑ → áp lực giảm XAU (tương quan nghịch ~-0.7)
+- OIL ↑ → đồng pha tăng XAU (cùng phòng hộ lạm phát — inflation hedge)
+Liên thị trường mâu thuẫn với đồng thuận đa khung → giảm độ tin cậy + thêm vào rui_ro_chinh.` : "";
 
     const userText = `Phân tích TOP-DOWN XAU/USD ${valid.length} khung: ${tfsLabel}.
 Horizon dự báo: ${horizon} (theo HTF ${htf})
@@ -2368,9 +2423,13 @@ ${valid.map(v => `    "${v.tf}": { "bias": "LONG|SHORT|NEUTRAL", "key_level": <f
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         responseMimeType: "application/json",
-        maxOutputTokens: isNhanh ? 3000 : 4500,
+        // Giảm từ 4500 → 3000 cho non-nhanh: schema đã có 5 fields/scenario,
+        // 3000 đủ cho LONG+SHORT entry/SL/TP1/2/3 + lý do.
+        maxOutputTokens: isNhanh ? 2500 : 3000,
         temperature: 0.4,
-        thinkingConfig: { thinkingBudget: isNhanh ? 0 : 1500 },
+        // Cả 2 mode đều 0 thinking — schema cứng, không cần "nghĩ".
+        // Cắt ~5-10s latency để tránh vượt 30s waitUntil của Cloudflare Worker.
+        thinkingConfig: { thinkingBudget: 0 },
       },
     };
 
@@ -2760,6 +2819,68 @@ export default {
         console.log(`[webhook] parse error: ${e.message}`);
       }
       return new Response("OK", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+
+    // Debug: chạy 1 lệnh bot synchronous + dump error nếu có.
+    // Sử dụng: /test-cmd?text=/5p15p1h%20all
+    if (url.pathname === "/test-cmd") {
+      const text = url.searchParams.get("text") || "/help";
+      const sendReply = url.searchParams.get("send") === "1"; // mặc định KHÔNG gửi vào group
+      const fakeUpdate = {
+        update_id: Date.now(),
+        message: {
+          message_id: 0,
+          from: { id: 0, is_bot: false, first_name: "test-cmd" },
+          chat: { id: parseInt(env.TELEGRAM_CHAT_ID), type: "supergroup", title: "test" },
+          date: Math.floor(Date.now() / 1000),
+          text,
+          entities: text.startsWith("/") ? [{ offset: 0, length: text.split(" ")[0].length, type: "bot_command" }] : [],
+        },
+      };
+      const logs = [];
+      const origLog = console.log;
+      console.log = (...args) => { logs.push(args.map(a => typeof a === "string" ? a : JSON.stringify(a)).join(" ")); origLog(...args); };
+
+      // Stub sendTelegramTo nếu không send → tránh spam group khi test
+      const origFetch = globalThis.fetch;
+      let sentMessages = [];
+      if (!sendReply) {
+        globalThis.fetch = async (u, opts) => {
+          if (typeof u === "string" && u.includes("api.telegram.org") && u.includes("/sendMessage")) {
+            try { sentMessages.push(JSON.parse(opts.body)); } catch {}
+            return new Response(JSON.stringify({ ok: true, result: { message_id: 0 } }), { status: 200 });
+          }
+          if (typeof u === "string" && u.includes("api.telegram.org") && u.includes("/sendChatAction")) {
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
+          return origFetch(u, opts);
+        };
+      }
+
+      let err = null, errStack = null;
+      const t0 = Date.now();
+      try {
+        await handleTelegramUpdate(env, fakeUpdate);
+      } catch (e) {
+        err = e.message;
+        errStack = e.stack;
+      } finally {
+        console.log = origLog;
+        globalThis.fetch = origFetch;
+      }
+
+      return jsonResponse(200, {
+        text,
+        elapsedMs: Date.now() - t0,
+        error: err,
+        errorStack: errStack?.slice(0, 1000),
+        sentMessages: sentMessages.map(m => ({
+          text: m.text || "",  // full text, không cắt
+          textLen: (m.text || "").length,
+          parse_mode: m.parse_mode,
+        })),
+        logs,
+      }, origin);
     }
 
     // Debug toàn diện: webhook + bot + TwelveData + Gemini key cooldowns
