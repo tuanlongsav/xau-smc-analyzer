@@ -1152,13 +1152,49 @@ async function sendChatAction(env, chatId, action = "typing") {
 }
 
 // ──────────────────────────────────────────────────────────
-// Auto-delete: lưu KV { del:{ts}:{chatId}:{messageId} = "1" } với TTL 1h+buffer.
+// Auto-delete: lưu KV { del:{ts}:{chatId}:{messageId} = "1" } với TTL = delay+buffer.
 // Cron 5p quét list prefix "del:", với key có ts <= now → call deleteMessage + xoá KV entry.
+//
+// Thời gian delay user-configurable qua /xoa <time>. KV "config:auto_delete_min"
+// lưu số phút (vd "60", "120") hoặc "off" để tắt auto-delete.
 // ──────────────────────────────────────────────────────────
-const AUTO_DELETE_DELAY_MS = 60 * 60 * 1000; // 1 giờ
+const DEFAULT_AUTO_DELETE_MIN = 60; // mặc định 1 giờ
 
-async function scheduleAutoDelete(env, chatId, messageId, delayMs = AUTO_DELETE_DELAY_MS) {
+/**
+ * Đọc config auto-delete (phút) từ KV. Trả về delayMs (số mili-giây).
+ * Trả 0 nếu user đã tắt (/xoa off).
+ */
+async function getAutoDeleteMs(env) {
+  if (!env.CACHE) return DEFAULT_AUTO_DELETE_MIN * 60 * 1000;
+  try {
+    const v = await env.CACHE.get("config:auto_delete_min");
+    if (v === "off") return 0;
+    if (v) {
+      const n = parseInt(v);
+      if (!isNaN(n) && n > 0) return n * 60 * 1000;
+    }
+  } catch {}
+  return DEFAULT_AUTO_DELETE_MIN * 60 * 1000;
+}
+
+async function setAutoDeleteMin(env, minOrOff) {
+  if (!env.CACHE) return false;
+  await env.CACHE.put("config:auto_delete_min", String(minOrOff));
+  return true;
+}
+
+function msToReadable(ms) {
+  if (ms <= 0) return "TẮT";
+  const min = Math.round(ms / 60000);
+  if (min < 60) return `${min} phút`;
+  const h = min / 60;
+  return Number.isInteger(h) ? `${h} giờ` : `${h.toFixed(1)} giờ`;
+}
+
+async function scheduleAutoDelete(env, chatId, messageId, delayMsOverride = null) {
   if (!env.CACHE || !messageId) return;
+  const delayMs = delayMsOverride != null ? delayMsOverride : await getAutoDeleteMs(env);
+  if (delayMs <= 0) return; // user đã /xoa off
   const ts = Date.now() + delayMs;
   const key = `del:${ts}:${chatId}:${messageId}`;
   // TTL = delay + 10 phút buffer (phòng cron lệch hoặc delete fail tạm)
@@ -1399,8 +1435,10 @@ Thêm \`oil\` hoặc \`dxy\` (hoặc \`all\`) sau lệnh để kèm context giá
 
 *Khác:*
 \`/tudien\` — Từ điển thuật ngữ Việt-Anh
+\`/xoa <time>\` — Cấu hình thời gian tự xoá tin (vd \`/xoa 30p\`, \`/xoa 1h\`, \`/xoa off\`)
 
-ℹ️ _Tin phân tích + cảnh báo giá tự xoá sau 1 giờ để khỏi nhiễu group. /help và /tudien giữ lại._
+ℹ️ _Bot tự xoá tin (cả phân tích và lệnh user) sau 1 giờ mặc định để khỏi nhiễu group._
+_/help, /tudien, /xoa giữ lại không tự xoá. Đổi thời gian: \`/xoa 30p|1h|2h|4h|6h|8h|off\`._
 
 App đầy đủ: [xau-smc-analyzer.pages.dev](https://xau-smc-analyzer.pages.dev)`;
 }
@@ -1458,6 +1496,69 @@ function parseMultiTfCommand(cmd) {
   }
   if (tfs.length < 2) return null;  // single TF đã có handler riêng
   return { isNhanh, tfs };
+}
+
+/**
+ * Handler /xoa <time> — cấu hình thời gian tự xoá tin của bot.
+ * Param: 30p, 1h, 2h, 4h, 6h, 8h, off
+ * Không param → hiện cấu hình hiện tại.
+ */
+async function handleXoaCmd(env, chatId, replyTo, args) {
+  // Reply của /xoa KHÔNG auto-delete (config-related, user cần xem rõ)
+  const send = (text) => sendTelegramTo(env, chatId, text, replyTo, "HTML", false);
+
+  if (args.length === 0) {
+    const ms = await getAutoDeleteMs(env);
+    const status = ms === 0 ? "<b>TẮT</b> (tin bot không tự xoá)" : `sau <b>${msToReadable(ms)}</b>`;
+    await send(
+      `ℹ️ <b>Tự xoá tin:</b> ${status}\n\n` +
+      `<b>Đổi cấu hình:</b>\n` +
+      `<code>/xoa 30p</code> — xoá sau 30 phút\n` +
+      `<code>/xoa 1h</code> — xoá sau 1 giờ (mặc định)\n` +
+      `<code>/xoa 2h</code> — xoá sau 2 giờ\n` +
+      `<code>/xoa 4h</code> — xoá sau 4 giờ\n` +
+      `<code>/xoa 6h</code> — xoá sau 6 giờ\n` +
+      `<code>/xoa 8h</code> — xoá sau 8 giờ\n` +
+      `<code>/xoa off</code> — TẮT tự xoá\n\n` +
+      `<i>Áp dụng cho cả tin bot trả lời + lệnh user gửi (trừ /help, /tudien, /xoa).</i>`
+    );
+    return;
+  }
+
+  const param = args[0].toLowerCase().replace(/[áàảãạâấầẩẫậăắằẳẵặ]/g, "a").replace(/[íìỉĩị]/g, "i");
+  const validMap = {
+    "off": "off", "tat": "off",
+    "30p": 30, "30m": 30, "30min": 30,
+    "1h": 60, "1g": 60, "1gio": 60,
+    "2h": 120, "2g": 120, "2gio": 120,
+    "4h": 240, "4g": 240, "4gio": 240,
+    "6h": 360, "6g": 360, "6gio": 360,
+    "8h": 480, "8g": 480, "8gio": 480,
+  };
+
+  if (!(param in validMap)) {
+    await send(
+      `❌ Tham số <code>${htmlEsc(args[0])}</code> không hợp lệ.\n` +
+      `Dùng: <code>/xoa 30p</code> | <code>1h</code> | <code>2h</code> | <code>4h</code> | <code>6h</code> | <code>8h</code> | <code>off</code>`
+    );
+    return;
+  }
+
+  const value = validMap[param];
+  await setAutoDeleteMin(env, value);
+
+  if (value === "off") {
+    await send(
+      `✅ Đã <b>TẮT</b> tự xoá tin.\n` +
+      `Tin bot sẽ giữ lại không tự xoá. Tin đang trong queue (đặt trước đó) vẫn bị xoá theo lịch cũ.\n` +
+      `Bật lại bằng <code>/xoa 1h</code>.`
+    );
+  } else {
+    await send(
+      `✅ Đã đặt tự xoá tin sau <b>${msToReadable(value * 60 * 1000)}</b>.\n` +
+      `Áp dụng cho lệnh kế tiếp. Tin đã đặt lịch trước vẫn theo lịch cũ.`
+    );
+  }
 }
 
 async function handlePriceCmd(env, chatId, replyTo) {
@@ -2873,6 +2974,17 @@ async function _handleTelegramUpdate(env, update) {
 
   console.log(`[bot] receive type=${updateType} from=${fromUser} cmd=${cmd} args=[${args.join(",")}] textLen=${text.length}`);
 
+  // Schedule xoá tin lệnh CỦA USER — bot phải có quyền 'Delete messages' trong group.
+  // Trừ các lệnh muốn giữ lâu (help/tudien/xoa) — user thường xem lại.
+  const KEEP_USER_CMD = new Set([
+    "/help", "/start", "/trogiup",
+    "/tudien", "/glossary",
+    "/xoa", "/xóa", "/del", "/delete",
+  ]);
+  if (!KEEP_USER_CMD.has(cmd)) {
+    await scheduleAutoDelete(env, chatId, msg.message_id);
+  }
+
   // Help / start — KHÔNG auto-delete (reference dài hạn)
   if (cmd === "/start" || cmd === "/help" || cmd === "/trogiup") {
     await sendTelegramTo(env, chatId, helpMessage(), replyTo, "Markdown", false);
@@ -2881,6 +2993,11 @@ async function _handleTelegramUpdate(env, update) {
   // Dictionary thuật ngữ — KHÔNG auto-delete (reference dài hạn)
   if (cmd === "/tudien" || cmd === "/glossary") {
     await sendTelegramTo(env, chatId, glossaryMessage(), replyTo, "Markdown", false);
+    return;
+  }
+  // /xoa <time> — cấu hình thời gian tự xoá tin
+  if (cmd === "/xoa" || cmd === "/xóa" || cmd === "/del" || cmd === "/delete") {
+    await handleXoaCmd(env, chatId, replyTo, args);
     return;
   }
   // /tin — tổng hợp tin tức 7 ngày + AI dự đoán
@@ -3339,6 +3456,7 @@ export default {
         { command: "tin",      description: "Tin tức XAU 7 ngày + dự báo catalyst" },
         { command: "ai",       description: "Tư vấn risk + lot size + TP/SL" },
         { command: "tudien",   description: "Từ điển thuật ngữ Việt-Anh" },
+        { command: "xoa",      description: "Cấu hình thời gian tự xoá tin (vd /xoa 30p, /xoa 1h, /xoa off)" },
         { command: "help",     description: "Hướng dẫn lệnh" },
       ];
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
