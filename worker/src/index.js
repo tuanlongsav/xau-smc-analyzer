@@ -2,11 +2,12 @@
 // Gemini API proxy — Cloudflare Worker
 // ============================================================
 //
-// Mục đích: giữ GEMINI_API_KEY trong Worker secret, frontend không bao giờ chạm vào key.
+// Mục đích: giữ Gemini API keys trong Worker secret, frontend không bao giờ chạm vào key.
 // Frontend gọi `${WORKER_URL}/v1beta/models/{model}:generateContent` (mirror path Google),
 // Worker chèn `?key=...` rồi forward sang generativelanguage.googleapis.com.
 //
-// Set key: wrangler secret put GEMINI_API_KEY
+// Set key: wrangler secret put GEMINI_API_KEY_1 (rồi _2, _3, _4, _5 cho rotation)
+// Backward compat: GEMINI_API_KEY (= _1), GEMINI_API_KEY_BACKUP (= _2) vẫn được đọc.
 
 const GOOGLE_BASE = "https://generativelanguage.googleapis.com";
 
@@ -45,18 +46,23 @@ function jsonResponse(status, obj, origin) {
 
 /**
  * Gom các Gemini key có cấu hình thành mảng theo thứ tự ưu tiên.
- * Hỗ trợ: GEMINI_API_KEY, GEMINI_API_KEY_BACKUP, GEMINI_API_KEY_3..5
+ * Tên chuẩn: GEMINI_API_KEY_1..5
+ * Backward compat: GEMINI_API_KEY (= _1), GEMINI_API_KEY_BACKUP (= _2)
+ *   — nếu có cả 2 tên cho cùng slot, ưu tiên tên mới (_1 / _2).
  */
 function collectGeminiKeys(env) {
   const slots = [
-    { name: "GEMINI_API_KEY",        label: "primary" },
-    { name: "GEMINI_API_KEY_BACKUP", label: "backup"  },
-    { name: "GEMINI_API_KEY_3",      label: "key_3"   },
-    { name: "GEMINI_API_KEY_4",      label: "key_4"   },
-    { name: "GEMINI_API_KEY_5",      label: "key_5"   },
+    { names: ["GEMINI_API_KEY_1", "GEMINI_API_KEY"],        label: "key_1" },
+    { names: ["GEMINI_API_KEY_2", "GEMINI_API_KEY_BACKUP"], label: "key_2" },
+    { names: ["GEMINI_API_KEY_3"],                          label: "key_3" },
+    { names: ["GEMINI_API_KEY_4"],                          label: "key_4" },
+    { names: ["GEMINI_API_KEY_5"],                          label: "key_5" },
   ];
   return slots
-    .map(s => ({ key: env[s.name], label: s.label }))
+    .map(s => {
+      const found = s.names.find(n => env[n]);
+      return { key: found ? env[found] : null, label: s.label, source: found || null };
+    })
     .filter(s => !!s.key);
 }
 
@@ -2770,11 +2776,15 @@ export default {
           TELEGRAM_BOT_TOKEN: !!env.TELEGRAM_BOT_TOKEN,
           TELEGRAM_CHAT_ID: env.TELEGRAM_CHAT_ID || null,
           TWELVEDATA_API_KEY: !!env.TWELVEDATA_API_KEY,
-          GEMINI_API_KEY: !!env.GEMINI_API_KEY,
+          // Tên chuẩn (mới)
+          GEMINI_API_KEY_1: !!env.GEMINI_API_KEY_1,
           GEMINI_API_KEY_2: !!env.GEMINI_API_KEY_2,
           GEMINI_API_KEY_3: !!env.GEMINI_API_KEY_3,
           GEMINI_API_KEY_4: !!env.GEMINI_API_KEY_4,
           GEMINI_API_KEY_5: !!env.GEMINI_API_KEY_5,
+          // Tên cũ (backward compat) — có thể xoá sau khi migrate xong
+          GEMINI_API_KEY:        !!env.GEMINI_API_KEY,
+          GEMINI_API_KEY_BACKUP: !!env.GEMINI_API_KEY_BACKUP,
         },
       };
 
@@ -2807,21 +2817,14 @@ export default {
         }
       }
 
-      // Gemini key cooldown state (KV) — biết key nào đang bị 429 cooldown
-      if (env.CACHE) {
-        const ks = ["", "_2", "_3", "_4", "_5"];
-        out.geminiCooldowns = {};
-        for (const suf of ks) {
-          const v = await env.CACHE.get(`gemini_cooldown${suf}`);
-          if (v) {
-            const ts = parseInt(v);
-            const remainSec = Math.max(0, Math.floor((ts - Date.now()) / 1000));
-            out.geminiCooldowns[`KEY${suf || "_1"}`] = remainSec > 0 ? `${remainSec}s remaining` : "expired";
-          } else {
-            out.geminiCooldowns[`KEY${suf || "_1"}`] = "available";
-          }
-        }
-      }
+      // Cooldown của Gemini keys lưu trong in-memory Map (per isolate),
+      // không lưu KV → /diag không read được. Chỉ đếm số key có cấu hình:
+      const keys = collectGeminiKeys(env);
+      out.geminiKeysActive = {
+        count: keys.length,
+        slots: keys.map(k => ({ label: k.label, source: k.source })),
+        note: "Cooldown 429 lưu in-memory per isolate, không readable từ /diag. Xem qua wrangler tail.",
+      };
 
       return jsonResponse(200, out, origin);
     }
@@ -3103,7 +3106,7 @@ export default {
     const allKeys = collectGeminiKeys(env);
     if (allKeys.length === 0) {
       return jsonResponse(500, {
-        error: "Worker chưa cấu hình GEMINI_API_KEY. Chạy: wrangler secret put GEMINI_API_KEY",
+        error: "Worker chưa cấu hình Gemini API key. Chạy: wrangler secret put GEMINI_API_KEY_1 (rồi _2, _3, _4, _5).",
       }, origin);
     }
 
