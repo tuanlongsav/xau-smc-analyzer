@@ -2487,16 +2487,58 @@ function formatMultiTfHTML(d, valid, horizon, isNhanh) {
 }
 
 async function handleTelegramUpdate(env, update) {
+  // Outer try/catch — bảo đảm không bao giờ silent fail trong waitUntil()
+  try {
+    return await _handleTelegramUpdate(env, update);
+  } catch (e) {
+    console.log(`[bot] FATAL handler error: ${e.message}\n${e.stack || ""}`);
+    // Cố gắng báo user biết bot đã nhận lệnh nhưng lỗi
+    try {
+      const msg = update?.message || update?.channel_post;
+      if (msg?.chat?.id && String(msg.chat.id) === String(env.TELEGRAM_CHAT_ID)) {
+        await sendTelegramTo(
+          env,
+          msg.chat.id,
+          `❌ <b>Lỗi xử lý lệnh:</b> <code>${htmlEsc(e.message).slice(0, 300)}</code>\nThử lại hoặc /help.`,
+          msg.message_id,
+          "HTML",
+        );
+      }
+    } catch {}
+  }
+}
+
+async function _handleTelegramUpdate(env, update) {
+  // Log mọi update tới webhook (để debug "bot không trả lời")
+  const updateType = update.message
+    ? "message"
+    : update.edited_message
+    ? "edited_message"
+    : update.channel_post
+    ? "channel_post"
+    : update.edited_channel_post
+    ? "edited_channel_post"
+    : Object.keys(update).find(k => k !== "update_id") || "unknown";
+
   const msg = update.message || update.channel_post;
-  if (!msg?.text) return;
+  if (!msg) {
+    // Edited message / callback / khác → bot không xử lý (Telegram thường gửi update kiểu này khi user sửa msg cũ)
+    console.log(`[bot] skip update type=${updateType} (không phải message mới)`);
+    return;
+  }
+  if (!msg.text) {
+    console.log(`[bot] skip non-text message (sticker/photo/...) chat=${msg.chat?.id}`);
+    return;
+  }
 
   const chatId = String(msg.chat.id);
   const text = msg.text.trim();
   const replyTo = msg.message_id;
+  const fromUser = msg.from?.username || msg.from?.first_name || "?";
 
   // Auth: chỉ chấp nhận từ chat đã configure (defense against random chats finding webhook)
   if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
-    console.log(`[bot] ignore from chat ${chatId}`);
+    console.log(`[bot] ignore chat=${chatId} (configured=${env.TELEGRAM_CHAT_ID}) from=${fromUser} text="${text.slice(0, 60)}"`);
     return;
   }
 
@@ -2505,7 +2547,8 @@ async function handleTelegramUpdate(env, update) {
   const cmd = tokens[0].toLowerCase().split("@")[0];
   const args = tokens.slice(1);
 
-  console.log(`[bot] cmd=${cmd} args=${args.join(",")}`);
+  console.log(`[bot] receive type=${updateType} from=${fromUser} cmd=${cmd} args=[${args.join(",")}] textLen=${text.length}`);
+
   // Help / start
   if (cmd === "/start" || cmd === "/help" || cmd === "/trogiup") {
     await sendTelegramTo(env, chatId, helpMessage(), replyTo);
@@ -2562,7 +2605,20 @@ async function handleTelegramUpdate(env, update) {
     await handleAnalyzeCmd(env, chatId, replyTo, args[0] || "15m");
     return;
   }
-  // Bỏ qua các message khác (không spam group)
+  // Lệnh bắt đầu với "/" nhưng không match → reply nhẹ để user biết bot đã nhận
+  // (text thường không phải command thì silent — không spam group)
+  if (cmd.startsWith("/")) {
+    console.log(`[bot] unknown cmd=${cmd}`);
+    await sendTelegramTo(
+      env,
+      chatId,
+      `❓ Lệnh <code>${htmlEsc(cmd)}</code> chưa hỗ trợ. Gõ /help để xem danh sách.`,
+      replyTo,
+      "HTML",
+    );
+    return;
+  }
+  // Text bình thường (không phải command) — bỏ qua, không spam group
 }
 
 // Main cron handler
@@ -2704,6 +2760,96 @@ export default {
         console.log(`[webhook] parse error: ${e.message}`);
       }
       return new Response("OK", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+
+    // Debug toàn diện: webhook + bot + TwelveData + Gemini key cooldowns
+    if (url.pathname === "/diag") {
+      const out = {
+        timestamp: new Date().toISOString(),
+        secrets: {
+          TELEGRAM_BOT_TOKEN: !!env.TELEGRAM_BOT_TOKEN,
+          TELEGRAM_CHAT_ID: env.TELEGRAM_CHAT_ID || null,
+          TWELVEDATA_API_KEY: !!env.TWELVEDATA_API_KEY,
+          GEMINI_API_KEY: !!env.GEMINI_API_KEY,
+          GEMINI_API_KEY_2: !!env.GEMINI_API_KEY_2,
+          GEMINI_API_KEY_3: !!env.GEMINI_API_KEY_3,
+          GEMINI_API_KEY_4: !!env.GEMINI_API_KEY_4,
+          GEMINI_API_KEY_5: !!env.GEMINI_API_KEY_5,
+        },
+      };
+
+      // Telegram webhook + bot info
+      if (env.TELEGRAM_BOT_TOKEN) {
+        try {
+          const [whR, meR] = await Promise.all([
+            fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`),
+            fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`),
+          ]);
+          out.webhook = (await whR.json()).result;
+          out.bot = (await meR.json()).result;
+        } catch (e) { out.telegramErr = e.message; }
+      }
+
+      // TwelveData rate-limit probe
+      if (env.TWELVEDATA_API_KEY) {
+        const t0 = Date.now();
+        try {
+          const r = await fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=15min&outputsize=2&apikey=${env.TWELVEDATA_API_KEY}`);
+          const j = await r.json();
+          out.twelvedata = {
+            status: r.status,
+            ok: j.status !== "error",
+            message: j.status === "error" ? j.message : "OK",
+            elapsedMs: Date.now() - t0,
+          };
+        } catch (e) {
+          out.twelvedata = { error: e.message };
+        }
+      }
+
+      // Gemini key cooldown state (KV) — biết key nào đang bị 429 cooldown
+      if (env.CACHE) {
+        const ks = ["", "_2", "_3", "_4", "_5"];
+        out.geminiCooldowns = {};
+        for (const suf of ks) {
+          const v = await env.CACHE.get(`gemini_cooldown${suf}`);
+          if (v) {
+            const ts = parseInt(v);
+            const remainSec = Math.max(0, Math.floor((ts - Date.now()) / 1000));
+            out.geminiCooldowns[`KEY${suf || "_1"}`] = remainSec > 0 ? `${remainSec}s remaining` : "expired";
+          } else {
+            out.geminiCooldowns[`KEY${suf || "_1"}`] = "available";
+          }
+        }
+      }
+
+      return jsonResponse(200, out, origin);
+    }
+
+    // Debug: get webhook health từ Telegram (có pending updates / lỗi delivery không)
+    if (url.pathname === "/webhook-info") {
+      if (!env.TELEGRAM_BOT_TOKEN) {
+        return jsonResponse(500, { error: "TELEGRAM_BOT_TOKEN chưa set" }, origin);
+      }
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+      const info = await r.json();
+      const meR = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`);
+      const me = await meR.json();
+      return jsonResponse(200, {
+        chatIdConfigured: env.TELEGRAM_CHAT_ID,
+        botInfo: me.result,
+        webhookInfo: info.result,
+        diagnostics: {
+          pendingUpdates: info.result?.pending_update_count || 0,
+          lastErrorDate: info.result?.last_error_date
+            ? new Date(info.result.last_error_date * 1000).toISOString()
+            : null,
+          lastErrorMessage: info.result?.last_error_message || null,
+          lastSyncErrorDate: info.result?.last_synchronization_error_date
+            ? new Date(info.result.last_synchronization_error_date * 1000).toISOString()
+            : null,
+        },
+      }, origin);
     }
 
     // Setup webhook (chạy 1 lần sau deploy để register URL với Telegram)
