@@ -667,7 +667,11 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
 // ──────────────────────────────────────────────────────────
 // Telegram send
 // ──────────────────────────────────────────────────────────
-async function sendTelegram(env, text) {
+/**
+ * Gửi message tới chat đã configure (cho cron alert).
+ * autoDelete mặc định true — cảnh báo giá sẽ tự xoá sau 1h.
+ */
+async function sendTelegram(env, text, autoDelete = true) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
@@ -684,6 +688,13 @@ async function sendTelegram(env, text) {
     if (!r.ok) {
       console.log(`[telegram] send failed ${r.status}: ${(await r.text()).slice(0, 200)}`);
       return false;
+    }
+    if (autoDelete) {
+      try {
+        const data = await r.json();
+        const messageId = data?.result?.message_id;
+        if (messageId) await scheduleAutoDelete(env, env.TELEGRAM_CHAT_ID, messageId);
+      } catch {}
     }
     return true;
   } catch (e) {
@@ -1140,20 +1151,72 @@ async function sendChatAction(env, chatId, action = "typing") {
   } catch {}
 }
 
-// Gửi placeholder ngay khi nhận lệnh — user thấy bot đã accept.
-// Quan trọng cho lệnh chạy gần 30s (giới hạn ctx.waitUntil của CF Worker):
-// nếu xử lý timeout, placeholder vẫn còn → user biết bot đã nhận, có thể retry.
-async function sendQuickAck(env, chatId, replyTo, taskLabel) {
-  return sendTelegramTo(
-    env,
-    chatId,
-    `🔄 <i>Đang ${taskLabel}...</i>`,
-    replyTo,
-    "HTML",
-  );
+// ──────────────────────────────────────────────────────────
+// Auto-delete: lưu KV { del:{ts}:{chatId}:{messageId} = "1" } với TTL 1h+buffer.
+// Cron 5p quét list prefix "del:", với key có ts <= now → call deleteMessage + xoá KV entry.
+// ──────────────────────────────────────────────────────────
+const AUTO_DELETE_DELAY_MS = 60 * 60 * 1000; // 1 giờ
+
+async function scheduleAutoDelete(env, chatId, messageId, delayMs = AUTO_DELETE_DELAY_MS) {
+  if (!env.CACHE || !messageId) return;
+  const ts = Date.now() + delayMs;
+  const key = `del:${ts}:${chatId}:${messageId}`;
+  // TTL = delay + 10 phút buffer (phòng cron lệch hoặc delete fail tạm)
+  try {
+    await env.CACHE.put(key, "1", { expirationTtl: Math.ceil(delayMs / 1000) + 600 });
+  } catch (e) {
+    console.log(`[auto-delete] schedule fail: ${e.message}`);
+  }
 }
 
-async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseMode = "Markdown") {
+async function cleanupExpiredMessages(env) {
+  if (!env.CACHE || !env.TELEGRAM_BOT_TOKEN) return 0;
+  try {
+    let cursor;
+    let deleted = 0, skipped = 0;
+    do {
+      const list = await env.CACHE.list({ prefix: "del:", cursor });
+      const now = Date.now();
+      for (const item of list.keys) {
+        const parts = item.name.split(":");
+        if (parts.length < 4) { await env.CACHE.delete(item.name); continue; }
+        const ts = parseInt(parts[1]);
+        if (isNaN(ts) || ts > now) { skipped++; continue; }
+        const chatId = parts[2];
+        const messageId = parseInt(parts[3]);
+        try {
+          const r = await fetch(
+            `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+            }
+          );
+          if (r.ok) deleted++;
+          // Xoá KV bất kể delete thành công (Telegram trả 400 nếu message đã bị xoá thủ công)
+          await env.CACHE.delete(item.name);
+        } catch (e) {
+          console.log(`[auto-delete] fail msg ${messageId}: ${e.message}`);
+        }
+      }
+      cursor = list.list_complete ? null : list.cursor;
+    } while (cursor);
+    if (deleted > 0 || skipped > 0) {
+      console.log(`[auto-delete] xoá ${deleted} message, ${skipped} đang đợi`);
+    }
+    return deleted;
+  } catch (e) {
+    console.log(`[auto-delete] cleanup error: ${e.message}`);
+    return 0;
+  }
+}
+
+/**
+ * Gửi message Telegram + (mặc định) tự động xoá sau 1 giờ để khỏi nhiễu group.
+ * Pass autoDelete=false cho message dài hạn (vd /help, /tudien).
+ */
+async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseMode = "Markdown", autoDelete = true) {
   if (!env.TELEGRAM_BOT_TOKEN) return false;
   const buildBody = (mode) => {
     const b = { chat_id: chatId, text, disable_web_page_preview: true };
@@ -1170,17 +1233,29 @@ async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseM
   };
   try {
     let r = await post(parseMode);
+    let bodyText = null;
     // Nếu parse mode fail (Markdown/HTML) → retry plain text
     if (!r.ok && (parseMode === "Markdown" || parseMode === "HTML")) {
-      const errText = await r.text();
-      if (errText.includes("can't parse entities") || errText.includes("parse_mode")) {
-        console.log(`[tg-reply] ${parseMode} fail, retry plain. Err: ${errText.slice(0, 150)}`);
+      bodyText = await r.text();
+      if (bodyText.includes("can't parse entities") || bodyText.includes("parse_mode")) {
+        console.log(`[tg-reply] ${parseMode} fail, retry plain. Err: ${bodyText.slice(0, 150)}`);
         r = await post(null);
+        bodyText = null;
       } else {
-        console.log(`[tg-reply] ${r.status}: ${errText.slice(0, 200)}`);
+        console.log(`[tg-reply] ${r.status}: ${bodyText.slice(0, 200)}`);
       }
     } else if (!r.ok) {
-      console.log(`[tg-reply] ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      bodyText = await r.text();
+      console.log(`[tg-reply] ${r.status}: ${bodyText.slice(0, 200)}`);
+    }
+
+    // Schedule auto-delete sau 1h nếu gửi thành công + opt-in
+    if (r.ok && autoDelete) {
+      try {
+        const data = await r.json();
+        const messageId = data?.result?.message_id;
+        if (messageId) await scheduleAutoDelete(env, chatId, messageId);
+      } catch {}
     }
     return r.ok;
   } catch (e) {
@@ -1324,6 +1399,8 @@ Thêm \`oil\` hoặc \`dxy\` (hoặc \`all\`) sau lệnh để kèm context giá
 
 *Khác:*
 \`/tudien\` — Từ điển thuật ngữ Việt-Anh
+
+ℹ️ _Tin phân tích + cảnh báo giá tự xoá sau 1 giờ để khỏi nhiễu group. /help và /tudien giữ lại._
 
 App đầy đủ: [xau-smc-analyzer.pages.dev](https://xau-smc-analyzer.pages.dev)`;
 }
@@ -2199,7 +2276,8 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
     await sendTelegramTo(env, chatId, `❌ TF không hợp lệ. Dùng: ${Object.keys(TF_TO_TD).join(", ")}`, replyTo);
     return;
   }
-  await sendQuickAck(env, chatId, replyTo, `phân tích chi tiết khung ${tf} — ~15-20s`);
+  // sendChatAction → Telegram hiện 'typing...' indicator ~5s, đủ để user biết bot đang xử lý.
+  // (Trước có sendQuickAck riêng nhưng gây nhiễu — đã bỏ, dựa vào typing indicator.)
   await sendChatAction(env, chatId, "typing");
   try {
     const [candles, auxCtx] = await Promise.all([
@@ -2470,11 +2548,7 @@ function splitForTelegram(text, maxLen = 3900) {
 async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs = []) {
   const t0 = Date.now();
   const log = (label) => console.log(`[multi-tf] ${tfs.join("+")} t+${((Date.now() - t0)/1000).toFixed(1)}s ${label}`);
-  const taskLabel = isNhanh
-    ? `quét nhanh đa khung ${tfs.join("+")} — ~10s`
-    : `phân tích chi tiết đa khung ${tfs.join("+")} — ~20-25s`;
-  await sendQuickAck(env, chatId, replyTo, taskLabel);
-  log("ack sent");
+  // sendChatAction → typing indicator (đã bỏ sendQuickAck "Đang phân tích..." riêng)
   await sendChatAction(env, chatId, "typing");
   try {
     // HTF (khung lớn nhất) cho aux interval
@@ -2799,14 +2873,14 @@ async function _handleTelegramUpdate(env, update) {
 
   console.log(`[bot] receive type=${updateType} from=${fromUser} cmd=${cmd} args=[${args.join(",")}] textLen=${text.length}`);
 
-  // Help / start
+  // Help / start — KHÔNG auto-delete (reference dài hạn)
   if (cmd === "/start" || cmd === "/help" || cmd === "/trogiup") {
-    await sendTelegramTo(env, chatId, helpMessage(), replyTo);
+    await sendTelegramTo(env, chatId, helpMessage(), replyTo, "Markdown", false);
     return;
   }
-  // Dictionary thuật ngữ
+  // Dictionary thuật ngữ — KHÔNG auto-delete (reference dài hạn)
   if (cmd === "/tudien" || cmd === "/glossary") {
-    await sendTelegramTo(env, chatId, glossaryMessage(), replyTo);
+    await sendTelegramTo(env, chatId, glossaryMessage(), replyTo, "Markdown", false);
     return;
   }
   // /tin — tổng hợp tin tức 7 ngày + AI dự đoán
@@ -2871,8 +2945,12 @@ async function _handleTelegramUpdate(env, update) {
   // Text bình thường (không phải command) — bỏ qua, không spam group
 }
 
-// Main cron handler
+// Main cron handler — chạy mỗi 5 phút.
+// Luôn dọn auto-delete trước, ngay cả khi không có alert mới.
 async function runAlertCheck(env) {
+  // Dọn message hết hạn — ALWAYS chạy (kể cả thiếu Telegram secret).
+  await cleanupExpiredMessages(env);
+
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.log("[cron] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID chưa set, skip");
     return;
@@ -3303,6 +3381,31 @@ export default {
     if (url.pathname === "/run-alert-check") {
       await runAlertCheck(env);
       return jsonResponse(200, { ok: true, message: "Đã chạy kiểm tra cảnh báo giá, xem console log" }, origin);
+    }
+
+    // Trigger cleanup auto-delete thủ công
+    if (url.pathname === "/cleanup-now") {
+      const deleted = await cleanupExpiredMessages(env);
+      return jsonResponse(200, { ok: true, deleted, message: `Đã dọn ${deleted} message hết hạn` }, origin);
+    }
+
+    // List queue auto-delete (debug — xem có bao nhiêu message đang chờ xoá)
+    if (url.pathname === "/cleanup-queue") {
+      if (!env.CACHE) return jsonResponse(500, { error: "KV not configured" }, origin);
+      const list = await env.CACHE.list({ prefix: "del:", limit: 100 });
+      const now = Date.now();
+      const items = list.keys.map(k => {
+        const parts = k.name.split(":");
+        const ts = parseInt(parts[1]);
+        const remainingSec = Math.max(0, Math.floor((ts - now) / 1000));
+        return {
+          chatId: parts[2],
+          messageId: parts[3],
+          deleteAt: new Date(ts).toISOString(),
+          remainingMin: Math.floor(remainingSec / 60),
+        };
+      });
+      return jsonResponse(200, { count: items.length, items }, origin);
     }
 
     // Debug news fetching
