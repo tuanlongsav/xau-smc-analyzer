@@ -619,31 +619,110 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     }
   }
 
-  // ── 6. Biến động giá mạnh (Strong move) ──
-  if (latest.open && latest.close) {
+  // ── 6. Biến động giá mạnh (Strong move) — DÙNG ATR-RELATIVE ──
+  // Nến hiện tại di chuyển > 1.3 × ATR là bất thường (~30 phút giá vàng).
+  if (latest.open && latest.close && latest.atr > 0) {
     const change = latest.close - latest.open;
-    const changePct = Math.abs(change / latest.open) * 100;
-    if (changePct > 0.4) {
+    const changeAbs = Math.abs(change);
+    const changePct = (changeAbs / latest.open) * 100;
+    const atrRatio = changeAbs / latest.atr;
+    if (atrRatio > 1.3 || changePct > 0.3) {
       const direction = change > 0 ? "TĂNG" : "GIẢM";
       const icon = change > 0 ? "🚀" : "💥";
       await push(`big_move_${change > 0 ? "up" : "dn"}`, icon,
-        `Biến động mạnh: ${direction} *${changePct.toFixed(2)}%* nến gần nhất ($${prev.close.toFixed(2)} → $${latest.close.toFixed(2)})`,
+        `Biến động mạnh: ${direction} *${changePct.toFixed(2)}%* (${atrRatio.toFixed(1)}× ATR) — nến đóng $${latest.close.toFixed(2)} từ $${latest.open.toFixed(2)}`,
         change > 0
-          ? "Theo dõi 1-2 nến kế tiếp xem có tiếp diễn không. Có thể continue hoặc thoái lui (retrace) 50%."
-          : "Theo dõi vùng hỗ trợ gần nhất. Có thể nảy ngược (oversold bounce) hoặc tiếp tục giảm.");
+          ? "Theo dõi 1-2 nến kế tiếp xem có tiếp diễn (continuation) không. Có thể đẩy tiếp hoặc thoái lui (retrace) 50% trước khi continue."
+          : "Theo dõi vùng hỗ trợ gần. Có thể nảy ngược (oversold bounce) hoặc tiếp tục giảm sâu.");
     }
   }
 
-  // ── 7. ATR tăng vọt (Volatility spike — biên độ thực trung bình) ──
+  // ── 6b. Biến động đa nến (3 nến gần nhất) — XU HƯỚNG MẠNH BẤT THƯỜNG ──
+  // Tổng % thay đổi 3 nến > 2.0 × ATR → trend ấn mạnh, có thể impulse wave.
+  if (latest.atr > 0 && Array.isArray(candlesEnriched) && candlesEnriched.length >= 4) {
+    const c0 = candlesEnriched[candlesEnriched.length - 4]; // 4 nến trước
+    const c1 = latest;
+    if (c0?.close && c1?.close) {
+      const totalMove = c1.close - c0.close;
+      const totalAtrRatio = Math.abs(totalMove) / latest.atr;
+      const totalPct = (Math.abs(totalMove) / c0.close) * 100;
+      if (totalAtrRatio > 2.5 && totalPct > 0.5) {
+        const dir = totalMove > 0 ? "TĂNG" : "GIẢM";
+        const icon = totalMove > 0 ? "🔥" : "❄️";
+        await push(`multi_move_${totalMove > 0 ? "up" : "dn"}`, icon,
+          `Sóng đẩy ${dir} 3 nến: *${totalPct.toFixed(2)}%* (${totalAtrRatio.toFixed(1)}× ATR) trong ${3 * 15} phút — *xu hướng đang ấn mạnh bất thường*`,
+          totalMove > 0
+            ? "Đà tăng (impulse) mạnh. Cẩn trọng đuổi mua giá — đợi pullback về EMA21 hoặc breakout retest."
+            : "Đà giảm (impulse) mạnh. Cẩn trọng cắt đuổi — đợi bounce về EMA21 hoặc breakdown retest.");
+      }
+    }
+  }
+
+  // ── 7. ATR tăng vọt (Volatility spike) — ngưỡng 1.3× thay vì 1.5× ──
   if (latest.atr != null && Array.isArray(candlesEnriched) && candlesEnriched.length >= 30) {
     const recentAtrs = candlesEnriched.slice(-30, -1).map(c => c.atr).filter(a => a != null);
     if (recentAtrs.length > 10) {
       const avgAtr = recentAtrs.reduce((s, a) => s + a, 0) / recentAtrs.length;
-      if (latest.atr > avgAtr * 1.5) {
+      if (latest.atr > avgAtr * 1.3) {
         await push("vol_spike", "⚡",
-          `ATR tăng vọt (Volatility Spike): *${latest.atr.toFixed(2)}* (${(latest.atr / avgAtr).toFixed(1)}x trung bình)`,
-          "Biến động cao bất thường — đợi nến đóng cửa trước khi vào lệnh, mở rộng dừng lỗ (SL).");
+          `ATR tăng vọt (Volatility Spike): *${latest.atr.toFixed(2)}* (${(latest.atr / avgAtr).toFixed(1)}× trung bình 30 nến)`,
+          "Biến động cao bất thường — đợi nến đóng cửa trước khi vào lệnh, mở rộng dừng lỗ (SL) tối thiểu 1.5× ATR.");
       }
+    }
+  }
+
+  // ── 7b. Bollinger giãn nở đột biến (BB squeeze release) ──
+  // BB width hiện tại > 1.7× width trung bình 20 nến → vừa hết tích luỹ, breakout/breakdown.
+  if (latest.bbUpper != null && latest.bbLower != null
+      && Array.isArray(candlesEnriched) && candlesEnriched.length >= 25) {
+    const widths = candlesEnriched.slice(-25, -1)
+      .map(c => (c.bbUpper != null && c.bbLower != null) ? c.bbUpper - c.bbLower : null)
+      .filter(w => w != null);
+    if (widths.length >= 15) {
+      const avgWidth = widths.reduce((s, w) => s + w, 0) / widths.length;
+      const currWidth = latest.bbUpper - latest.bbLower;
+      if (currWidth > avgWidth * 1.7) {
+        await push("bb_expand", "🌊",
+          `Dải Bollinger giãn nở đột biến: width *${currWidth.toFixed(2)}* (${(currWidth / avgWidth).toFixed(1)}× trung bình) — *vừa hết tích luỹ, breakout đang xảy ra*`,
+          "Sau giai đoạn tích luỹ (consolidation), volatility expansion thường kéo dài 5-10 nến. Đi theo hướng phá vỡ.");
+      }
+    }
+  }
+
+  // ── 7c. Râu nến từ chối mạnh (Strong wick rejection) ──
+  // Râu (wick) > 1.5× thân + range > 0.7× ATR = phản ứng từ chối mạnh tại vùng cản/hỗ trợ.
+  if (latest.high != null && latest.low != null && latest.open != null && latest.close != null && latest.atr > 0) {
+    const range = latest.high - latest.low;
+    const body = Math.abs(latest.close - latest.open);
+    const upperWick = latest.high - Math.max(latest.open, latest.close);
+    const lowerWick = Math.min(latest.open, latest.close) - latest.low;
+    if (range > 0.7 * latest.atr && body > 0) {
+      if (upperWick > 1.5 * body && upperWick > lowerWick * 1.5) {
+        await push("wick_top", "🪶",
+          `Râu nến TRÊN dài bất thường tại $${latest.high.toFixed(2)}: ${upperWick.toFixed(2)} điểm (${(upperWick/body).toFixed(1)}× thân) — *phản ứng từ chối (rejection) ở đỉnh*`,
+          "Tín hiệu đảo chiều giảm — phe bán đẩy giá xuống mạnh sau khi giá thử vượt đỉnh. Theo dõi đóng cửa dưới EMA21.");
+      }
+      if (lowerWick > 1.5 * body && lowerWick > upperWick * 1.5) {
+        await push("wick_bottom", "🪶",
+          `Râu nến DƯỚI dài bất thường tại $${latest.low.toFixed(2)}: ${lowerWick.toFixed(2)} điểm (${(lowerWick/body).toFixed(1)}× thân) — *phản ứng từ chối (rejection) ở đáy*`,
+          "Tín hiệu đảo chiều tăng — phe mua đẩy giá lên mạnh sau khi giá thử phá đáy. Theo dõi đóng cửa trên EMA21.");
+      }
+    }
+  }
+
+  // ── 7d. Khoảng trống giá (Price gap) ──
+  // Open của nến hiện tại cách close nến trước > 0.3× ATR → có gap (thường do tin tức).
+  if (prev.close != null && latest.open != null && latest.atr > 0) {
+    const gap = latest.open - prev.close;
+    const gapAbs = Math.abs(gap);
+    if (gapAbs > 0.3 * latest.atr) {
+      const dir = gap > 0 ? "LÊN" : "XUỐNG";
+      const icon = gap > 0 ? "📈" : "📉";
+      await push(`gap_${gap > 0 ? "up" : "dn"}`, icon,
+        `Gap ${dir} *${gapAbs.toFixed(2)}* điểm (${(gapAbs/latest.atr).toFixed(1)}× ATR): nến đóng $${prev.close.toFixed(2)} → mở $${latest.open.toFixed(2)}`,
+        gap > 0
+          ? "Gap up thường do tin tức tích cực hoặc thiếu thanh khoản. 70% gap được lấp lại trong 1-3 nến."
+          : "Gap down thường do tin xấu. Theo dõi vùng hỗ trợ; 70% gap được lấp lại nếu không có đà tiếp diễn.");
     }
   }
 
@@ -1206,10 +1285,11 @@ async function scheduleAutoDelete(env, chatId, messageId, delayMsOverride = null
 }
 
 async function cleanupExpiredMessages(env) {
-  if (!env.CACHE || !env.TELEGRAM_BOT_TOKEN) return 0;
+  if (!env.CACHE || !env.TELEGRAM_BOT_TOKEN) return { deleted: 0, failed: 0, errors: [] };
+  const errors = [];
   try {
     let cursor;
-    let deleted = 0, skipped = 0;
+    let deleted = 0, failed = 0, skipped = 0;
     do {
       const list = await env.CACHE.list({ prefix: "del:", cursor });
       const now = Date.now();
@@ -1218,7 +1298,9 @@ async function cleanupExpiredMessages(env) {
         if (parts.length < 4) { await env.CACHE.delete(item.name); continue; }
         const ts = parseInt(parts[1]);
         if (isNaN(ts) || ts > now) { skipped++; continue; }
-        const chatId = parts[2];
+        // chat_id phải là INTEGER cho Telegram API. KV split giữ string,
+        // parseInt để chuyển. Supergroup id âm (vd -1003960272432) — parseInt giữ dấu.
+        const chatId = parts[2].startsWith("-") ? parseInt(parts[2]) : parts[2];
         const messageId = parseInt(parts[3]);
         try {
           const r = await fetch(
@@ -1229,22 +1311,31 @@ async function cleanupExpiredMessages(env) {
               body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
             }
           );
-          if (r.ok) deleted++;
-          // Xoá KV bất kể delete thành công (Telegram trả 400 nếu message đã bị xoá thủ công)
+          if (r.ok) {
+            deleted++;
+          } else {
+            failed++;
+            const body = await r.text();
+            const err = `msg ${messageId}: HTTP ${r.status} ${body.slice(0, 150)}`;
+            errors.push(err);
+            console.log(`[auto-delete] fail ${err}`);
+          }
           await env.CACHE.delete(item.name);
         } catch (e) {
+          failed++;
+          errors.push(`msg ${messageId}: ${e.message}`);
           console.log(`[auto-delete] fail msg ${messageId}: ${e.message}`);
         }
       }
       cursor = list.list_complete ? null : list.cursor;
     } while (cursor);
-    if (deleted > 0 || skipped > 0) {
-      console.log(`[auto-delete] xoá ${deleted} message, ${skipped} đang đợi`);
+    if (deleted > 0 || failed > 0) {
+      console.log(`[auto-delete] xoá ${deleted} OK, ${failed} fail, ${skipped} đợi`);
     }
-    return deleted;
+    return { deleted, failed, errors };
   } catch (e) {
     console.log(`[auto-delete] cleanup error: ${e.message}`);
-    return 0;
+    return { deleted: 0, failed: 0, errors: [e.message] };
   }
 }
 
@@ -3501,10 +3592,116 @@ export default {
       return jsonResponse(200, { ok: true, message: "Đã chạy kiểm tra cảnh báo giá, xem console log" }, origin);
     }
 
-    // Trigger cleanup auto-delete thủ công
+    // Trigger cleanup auto-delete thủ công + trả chi tiết errors
     if (url.pathname === "/cleanup-now") {
-      const deleted = await cleanupExpiredMessages(env);
-      return jsonResponse(200, { ok: true, deleted, message: `Đã dọn ${deleted} message hết hạn` }, origin);
+      const result = await cleanupExpiredMessages(env);
+      return jsonResponse(200, {
+        ok: true,
+        ...result,
+        message: `Xoá ${result.deleted} OK, ${result.failed} fail`,
+      }, origin);
+    }
+
+    // Send + delete IMMEDIATELY (sanity check Telegram API works)
+    if (url.pathname === "/test-instant-delete") {
+      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+        return jsonResponse(500, { error: "Token/ChatID chưa set" }, origin);
+      }
+      const sendR = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: env.TELEGRAM_CHAT_ID,
+          text: `🧪 Instant delete test ${new Date().toISOString().slice(11, 19)}`,
+        }),
+      });
+      const sendData = await sendR.json();
+      const messageId = sendData?.result?.message_id;
+
+      // Delete ngay không đợi
+      const delR = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: parseInt(env.TELEGRAM_CHAT_ID), // try as int
+          message_id: messageId,
+        }),
+      });
+      const delData = await delR.json();
+
+      return jsonResponse(200, {
+        sent: sendR.ok,
+        messageId,
+        chatIdFromSend: sendData?.result?.chat?.id,
+        chatIdSentAs: parseInt(env.TELEGRAM_CHAT_ID),
+        deleteOk: delR.ok,
+        deleteResp: delData,
+      }, origin);
+    }
+
+    // Test auto-delete end-to-end: gửi 1 test message + schedule xoá sau 60s + trả msg_id
+    if (url.pathname === "/test-auto-delete") {
+      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+        return jsonResponse(500, { error: "Token/ChatID chưa set" }, origin);
+      }
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: env.TELEGRAM_CHAT_ID,
+          text: `🧪 Test auto-delete ${new Date().toISOString().slice(11, 19)} — tự xoá sau 60s`,
+        }),
+      });
+      const data = await r.json();
+      const messageId = data?.result?.message_id;
+      if (messageId) {
+        // Schedule xoá sau 60s thay vì 1h
+        await scheduleAutoDelete(env, env.TELEGRAM_CHAT_ID, messageId, 60_000);
+      }
+      return jsonResponse(200, {
+        sent: r.ok,
+        messageId,
+        scheduledDelete: messageId ? "60 giây sau" : null,
+        note: "Đợi 65s rồi gọi /cleanup-now để verify",
+      }, origin);
+    }
+
+    // Check chat info (auto-delete timer, message_auto_delete_time, ...)
+    if (url.pathname === "/chat-info") {
+      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+        return jsonResponse(500, { error: "Token/ChatID chưa set" }, origin);
+      }
+      const r = await fetch(
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getChat?chat_id=${env.TELEGRAM_CHAT_ID}`
+      );
+      const data = await r.json();
+      return jsonResponse(200, data, origin);
+    }
+
+    // Check bot permissions trong group (cần Delete messages cho auto-delete)
+    if (url.pathname === "/bot-permissions") {
+      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+        return jsonResponse(500, { error: "Token/ChatID chưa set" }, origin);
+      }
+      try {
+        const meR = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`);
+        const me = (await meR.json()).result;
+        const memR = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getChatMember?chat_id=${env.TELEGRAM_CHAT_ID}&user_id=${me.id}`
+        );
+        const mem = (await memR.json()).result;
+        return jsonResponse(200, {
+          botId: me.id,
+          username: me.username,
+          status: mem?.status,
+          can_delete_messages: mem?.can_delete_messages,
+          can_post_messages: mem?.can_post_messages,
+          can_edit_messages: mem?.can_edit_messages,
+          allMember: mem,
+        }, origin);
+      } catch (e) {
+        return jsonResponse(500, { error: e.message }, origin);
+      }
     }
 
     // List queue auto-delete (debug — xem có bao nhiêu message đang chờ xoá)
@@ -3591,7 +3788,10 @@ export default {
         "alert:ema_up", "alert:ema_dn",
         "alert:piv_up_r1", "alert:piv_up_r2", "alert:piv_dn_s1", "alert:piv_dn_s2",
         "alert:big_move_up", "alert:big_move_dn",
-        "alert:vol_spike",
+        "alert:multi_move_up", "alert:multi_move_dn",
+        "alert:vol_spike", "alert:bb_expand",
+        "alert:wick_top", "alert:wick_bottom",
+        "alert:gap_up", "alert:gap_dn",
         "alert:liq_sweep_up", "alert:liq_sweep_dn",
       ];
       let cleared = 0;
