@@ -1976,8 +1976,59 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
     } else {
       conclusion = `Các khung phân vân (${upCount}↑ / ${downCount}↓ / ${sideCount}↔️) — phân tích từ khung lớn xuống nhỏ trước khi vào`;
     }
-    m += `\n💡 <b>${conclusion}</b>`;
-    m += `\n\n<i>Để xem chi tiết: /15p /1h /1h4h1d /nhanh15p ...</i>`;
+    m += `\n💡 <b>${conclusion}</b>\n`;
+
+    // 🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH (rule-based, từ khung 15p + ATR + đồng thuận đa khung)
+    if (latest15m && latest15m.atr > 0) {
+      let dir = null;
+      if (upCount >= valid.length - 1) dir = "BUY";
+      else if (downCount >= valid.length - 1) dir = "SELL";
+
+      if (dir) {
+        const c15 = latest15m.close;
+        const atr15 = latest15m.atr;
+        // SL: 1.5 × ATR — practical cho intraday (15-20 điểm với XAU). KHÔNG dùng
+        // recentLow/High vì swing 50 nến có thể quá xa khi giá đã chạy mạnh.
+        // Nếu cần SL theo swing: dùng /15p (AI phân tích) thay vì /nhanh (quick).
+        const slDist = 1.5 * atr15;
+        const entry = c15;
+        const sl  = dir === "BUY" ? entry - slDist : entry + slDist;
+        const tp1 = dir === "BUY" ? entry + slDist     : entry - slDist;
+        const tp2 = dir === "BUY" ? entry + 2 * slDist : entry - 2 * slDist;
+        const tp3 = dir === "BUY" ? entry + 3 * slDist : entry - 3 * slDist;
+
+        // Tin cậy theo số khung align
+        const aligned = dir === "BUY" ? upCount : downCount;
+        let confidence;
+        if (aligned === valid.length) confidence = `<b>CAO</b> (${aligned}/${valid.length} khung đồng thuận)`;
+        else if (aligned >= valid.length - 1) confidence = `trung bình-cao (${aligned}/${valid.length} khung)`;
+        else confidence = `trung bình (${aligned}/${valid.length} khung)`;
+
+        const dirLabel = dir === "BUY" ? "MUA (LONG)" : "BÁN (SHORT)";
+        const dirIcon = dir === "BUY" ? "🟢" : "🔴";
+        const fmt = (n) => n.toFixed(2);
+
+        m += `\n━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n`;
+        m += `${dirIcon} <b>${dirLabel}</b> | Tin cậy: ${confidence}\n\n`;
+        m += `📍 Điểm vào (Entry): <b>$${fmt(entry)}</b>\n`;
+        m += `🛑 Cắt lỗ (SL): <b>$${fmt(sl)}</b> <i>(rủi ro ~${slDist.toFixed(2)} điểm)</i>\n`;
+        m += `🎯 Chốt lời 1 (TP1, R:R 1:1 — an toàn): <b>$${fmt(tp1)}</b>\n`;
+        m += `🎯 Chốt lời 2 (TP2, R:R 1:2 — kỳ vọng): <b>$${fmt(tp2)}</b>\n`;
+        m += `🎯 Chốt lời 3 (TP3, R:R 1:3 — mở rộng): <b>$${fmt(tp3)}</b>\n`;
+        // Cảnh báo nếu RSI 15p quá mua/bán đi ngược hướng
+        if (dir === "BUY" && latest15m.rsi != null && latest15m.rsi > 75) {
+          m += `<i>⚠️ RSI 15p ${latest15m.rsi.toFixed(0)} đang quá mua — đợi hồi giá (pullback) về EMA21 trước khi vào.</i>\n`;
+        } else if (dir === "SELL" && latest15m.rsi != null && latest15m.rsi < 25) {
+          m += `<i>⚠️ RSI 15p ${latest15m.rsi.toFixed(0)} đang quá bán — đợi hồi giá (bounce) về EMA21 trước khi vào.</i>\n`;
+        }
+        m += `<i>💡 Gợi ý theo quy tắc, không phải khuyến nghị đầu tư. Xác nhận thêm bằng /15p hoặc /1h trước khi vào lệnh.</i>\n`;
+      } else {
+        m += `\n━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n`;
+        m += `⚪ <b>Đứng ngoài (Wait)</b> — các khung phân vân, chờ xác nhận hướng rõ ràng.\n`;
+      }
+    }
+
+    m += `\n<i>Để xem chi tiết: /15p /1h /1h4h1d /nhanh15p ...</i>`;
 
     await sendTelegramTo(env, chatId, m, replyTo, "HTML");
   } catch (e) {
