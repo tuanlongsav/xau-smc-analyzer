@@ -86,6 +86,123 @@ function clearKeyCooldown(label) {
 }
 
 // ──────────────────────────────────────────────────────────
+// TwelveData multi-key rotation
+// Tên chuẩn: TWELVEDATA_API_KEY_1..3. Legacy single TWELVEDATA_API_KEY
+// vẫn được nhận (treat như slot bổ sung) để rolling deploy không downtime.
+// ──────────────────────────────────────────────────────────
+function collectTdKeys(env) {
+  const slots = [
+    { name: "TWELVEDATA_API_KEY_1", label: "td_1" },
+    { name: "TWELVEDATA_API_KEY_2", label: "td_2" },
+    { name: "TWELVEDATA_API_KEY_3", label: "td_3" },
+  ];
+  const keys = slots
+    .map(s => ({ key: env[s.name], label: s.label, source: s.name }))
+    .filter(s => !!s.key);
+  // Legacy fallback — bỏ sau khi migrate xong
+  if (env.TWELVEDATA_API_KEY) {
+    const dup = keys.some(k => k.key === env.TWELVEDATA_API_KEY);
+    if (!dup) keys.push({ key: env.TWELVEDATA_API_KEY, label: "td_legacy", source: "TWELVEDATA_API_KEY" });
+  }
+  return keys;
+}
+
+function hasAnyTdKey(env) {
+  return collectTdKeys(env).length > 0;
+}
+
+// In-memory cooldown (per Worker isolate, mất khi cold-start nhưng OK).
+//   daily quota → cooldown đến 00:01 UTC hôm sau (TD reset theo UTC).
+//   per-minute rate limit → 60s.
+//   network/HTTP error khác → 120s.
+const tdKeyState = new Map();
+
+function msUntilNextUtcMidnight() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 1, 0, 0
+  ));
+  return next.getTime() - now.getTime();
+}
+
+function isTdKeyOnCooldown(label) {
+  const s = tdKeyState.get(label);
+  return s && Date.now() < s.until;
+}
+
+function markTdCooldown(label, kind, message) {
+  let dur;
+  if (kind === "daily") dur = msUntilNextUtcMidnight();
+  else if (kind === "rate_limit") dur = 60_000;
+  else dur = 120_000;
+  tdKeyState.set(label, { until: Date.now() + dur, kind, message: (message || "").slice(0, 120) });
+}
+
+function clearTdCooldown(label) {
+  tdKeyState.delete(label);
+}
+
+function classifyTdError(httpStatus, jsonBody) {
+  const msg = ((jsonBody && jsonBody.message) || "").toString().toLowerCase();
+  if (msg.includes("for the day") || msg.includes("daily limit") || msg.includes("daily quota")) {
+    return { kind: "daily", message: jsonBody.message };
+  }
+  if (httpStatus === 429 || msg.includes("per minute") || msg.includes("rate limit") || msg.includes("too many requests")) {
+    return { kind: "rate_limit", message: jsonBody?.message || `HTTP ${httpStatus}` };
+  }
+  return { kind: "other", message: jsonBody?.message || `HTTP ${httpStatus}` };
+}
+
+/**
+ * Gọi TwelveData với rotation. Trả về { ok, json, status, headers, attempts, lastError }.
+ * - ok=true: ít nhất 1 key thành công, json là body parse được.
+ * - ok=false: tất cả keys đều fail (cooldown hoặc lỗi). attempts list từng key đã thử.
+ * Cache CF edge 30s vẫn giữ (URL chứa apikey nên cache khác nhau theo key — chấp nhận).
+ */
+async function tdFetch(env, path, paramsObj) {
+  const keys = collectTdKeys(env);
+  if (keys.length === 0) {
+    return { ok: false, json: null, status: 0, attempts: [], lastError: "Không có TWELVEDATA_API_KEY nào được cấu hình" };
+  }
+  const attempts = [];
+  let firstError = null;
+  for (const k of keys) {
+    if (isTdKeyOnCooldown(k.label)) {
+      const s = tdKeyState.get(k.label);
+      attempts.push({ label: k.label, skipped: `cooldown ${s.kind}` });
+      continue;
+    }
+    const fwd = new URLSearchParams(paramsObj);
+    fwd.set("apikey", k.key);
+    const url = `https://api.twelvedata.com${path}?${fwd}`;
+    let resp;
+    try {
+      resp = await fetch(url, { cf: { cacheEverything: true, cacheTtl: 30 } });
+    } catch (e) {
+      markTdCooldown(k.label, "other", `fetch fail: ${e.message}`);
+      attempts.push({ label: k.label, error: `fetch fail: ${e.message}` });
+      if (!firstError) firstError = e.message;
+      continue;
+    }
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    // TD trả 200 với body {status:"error"} cho daily quota — phải parse body để biết.
+    const isErr = !resp.ok || (json && json.status === "error");
+    if (!isErr) {
+      clearTdCooldown(k.label);
+      return { ok: true, json, text, status: resp.status, headers: resp.headers, label: k.label, attempts };
+    }
+    const cls = classifyTdError(resp.status, json);
+    markTdCooldown(k.label, cls.kind, cls.message);
+    attempts.push({ label: k.label, kind: cls.kind, error: cls.message });
+    if (!firstError) firstError = cls.message;
+  }
+  return { ok: false, json: null, status: 0, attempts, lastError: firstError || "Tất cả TD keys đều cooldown" };
+}
+
+// ──────────────────────────────────────────────────────────
 // KV cache helpers
 // ──────────────────────────────────────────────────────────
 const CACHE_TTL_S = 300; // 5 phút
@@ -373,14 +490,14 @@ async function getCachedDailyPivots(env) {
 }
 
 // ──────────────────────────────────────────────────────────
-// TwelveData fetch (cron context — direct call, không qua /twelvedata route)
+// TwelveData fetch (cron + aux context — đi qua tdFetch để được rotation)
 // ──────────────────────────────────────────────────────────
 async function fetchTdCandles(env, interval, outputsize, symbol = "XAU/USD") {
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputsize}&apikey=${env.TWELVEDATA_API_KEY}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`TD ${r.status}`);
-  const d = await r.json();
-  if (d.status === "error") throw new Error(`TD ${symbol}: ${d.message}`);
+  const result = await tdFetch(env, "/time_series", { symbol, interval, outputsize });
+  if (!result.ok) {
+    throw new Error(`TD ${symbol}: ${result.lastError}`);
+  }
+  const d = result.json;
   if (!Array.isArray(d.values)) return [];
   return d.values.reverse().map(v => ({
     time: Math.floor(new Date(v.datetime + "Z").getTime() / 1000),
@@ -3163,8 +3280,8 @@ async function runAlertCheck(env) {
     console.log("[cron] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID chưa set, skip");
     return;
   }
-  if (!env.TWELVEDATA_API_KEY) {
-    console.log("[cron] TWELVEDATA_API_KEY chưa set, skip");
+  if (!hasAnyTdKey(env)) {
+    console.log("[cron] Chưa có TWELVEDATA_API_KEY_* nào, skip");
     return;
   }
   try {
@@ -3311,12 +3428,22 @@ export default {
           ? `cooldown ${remaining}s (last status ${s.lastStatus})`
           : "active";
       }
+      const tdKeys = collectTdKeys(env);
+      const tdCooldownState = {};
+      for (const k of tdKeys) {
+        const s = tdKeyState.get(k.label);
+        const remaining = s ? Math.max(0, Math.floor((s.until - Date.now()) / 1000)) : 0;
+        tdCooldownState[k.label] = remaining > 0
+          ? `cooldown ${remaining}s (${s.kind})`
+          : "active";
+      }
       return jsonResponse(200, {
         ok: true,
         service: "xau-gemini-proxy",
         gemini_keys_count: allKeys.length,
         gemini_keys_state: cooldownState,
-        hasTwelveDataKey: !!env.TWELVEDATA_API_KEY,
+        td_keys_count: tdKeys.length,
+        td_keys_state: tdCooldownState,
         worker_dc: request.cf?.colo || "unknown",
         worker_country: request.cf?.country || "unknown",
         endpoints: [
@@ -3434,7 +3561,10 @@ export default {
         secrets: {
           TELEGRAM_BOT_TOKEN: !!env.TELEGRAM_BOT_TOKEN,
           TELEGRAM_CHAT_ID: env.TELEGRAM_CHAT_ID || null,
-          TWELVEDATA_API_KEY: !!env.TWELVEDATA_API_KEY,
+          TWELVEDATA_API_KEY_1: !!env.TWELVEDATA_API_KEY_1,
+          TWELVEDATA_API_KEY_2: !!env.TWELVEDATA_API_KEY_2,
+          TWELVEDATA_API_KEY_3: !!env.TWELVEDATA_API_KEY_3,
+          TWELVEDATA_API_KEY_legacy: !!env.TWELVEDATA_API_KEY,
           GEMINI_API_KEY_1: !!env.GEMINI_API_KEY_1,
           GEMINI_API_KEY_2: !!env.GEMINI_API_KEY_2,
           GEMINI_API_KEY_3: !!env.GEMINI_API_KEY_3,
@@ -3455,21 +3585,35 @@ export default {
         } catch (e) { out.telegramErr = e.message; }
       }
 
-      // TwelveData rate-limit probe
-      if (env.TWELVEDATA_API_KEY) {
+      // TwelveData: probe từng key riêng để biết key nào còn quota.
+      // Mỗi probe consume 1 credit, nên check cẩn thận khi gần hết.
+      const tdKeys = collectTdKeys(env);
+      out.twelvedata = { keys_count: tdKeys.length, per_key: [] };
+      for (const k of tdKeys) {
         const t0 = Date.now();
         try {
-          const r = await fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=15min&outputsize=2&apikey=${env.TWELVEDATA_API_KEY}`);
+          const r = await fetch(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=15min&outputsize=2&apikey=${k.key}`);
           const j = await r.json();
-          out.twelvedata = {
+          out.twelvedata.per_key.push({
+            label: k.label,
+            source: k.source,
             status: r.status,
             ok: j.status !== "error",
             message: j.status === "error" ? j.message : "OK",
             elapsedMs: Date.now() - t0,
-          };
+          });
         } catch (e) {
-          out.twelvedata = { error: e.message };
+          out.twelvedata.per_key.push({ label: k.label, source: k.source, error: e.message });
         }
+      }
+      // Cooldown state in-memory
+      out.twelvedata.cooldown = {};
+      for (const k of tdKeys) {
+        const s = tdKeyState.get(k.label);
+        const remaining = s ? Math.max(0, Math.floor((s.until - Date.now()) / 1000)) : 0;
+        out.twelvedata.cooldown[k.label] = remaining > 0
+          ? { remaining_s: remaining, kind: s.kind, message: s.message }
+          : "active";
       }
 
       // Cooldown của Gemini keys lưu trong in-memory Map (per isolate),
@@ -3843,14 +3987,15 @@ export default {
     // ──────────────────────────────────────────────────────────
     // TwelveData proxy: GET /twelvedata/{time_series|price}?symbol=...&interval=...
     // ──────────────────────────────────────────────────────────
-    // Free 800 req/ngày, real-time XAU/USD. Worker chèn apikey từ secret TWELVEDATA_API_KEY.
+    // Free 800 req/ngày/key, real-time XAU/USD. Worker xoay nhiều keys
+    // (TWELVEDATA_API_KEY_1..3) khi key trước hết quota daily / per-minute.
     if (url.pathname.startsWith("/twelvedata/")) {
       if (request.method !== "GET") {
         return jsonResponse(405, { error: "TwelveData chỉ accept GET" }, origin);
       }
-      if (!env.TWELVEDATA_API_KEY) {
+      if (!hasAnyTdKey(env)) {
         return jsonResponse(500, {
-          error: "Worker chưa cấu hình TWELVEDATA_API_KEY. Chạy: wrangler secret put TWELVEDATA_API_KEY",
+          error: "Worker chưa cấu hình TWELVEDATA_API_KEY_*. Chạy: wrangler secret put TWELVEDATA_API_KEY_1",
         }, origin);
       }
 
@@ -3863,32 +4008,31 @@ export default {
 
       // Whitelist params
       const ALLOWED_PARAMS = ["symbol", "interval", "outputsize", "format", "timezone", "start_date", "end_date"];
-      const fwd = new URLSearchParams();
+      const params = {};
       for (const k of ALLOWED_PARAMS) {
         const v = url.searchParams.get(k);
-        if (v) fwd.set(k, v);
+        if (v) params[k] = v;
       }
       // Validate symbol (chữ + số + slash, vd "XAU/USD")
-      const symbol = fwd.get("symbol") || "";
+      const symbol = params.symbol || "";
       if (!/^[A-Za-z0-9/]+$/.test(symbol)) {
         return jsonResponse(400, { error: "symbol không hợp lệ" }, origin);
       }
-      // Worker chèn apikey
-      fwd.set("apikey", env.TWELVEDATA_API_KEY);
 
-      const tdUrl = `https://api.twelvedata.com${tdPath}?${fwd}`;
-      let upstream;
-      try {
-        upstream = await fetch(tdUrl, {
-          cf: { cacheEverything: true, cacheTtl: 30 },
-        });
-      } catch (e) {
-        return jsonResponse(502, { error: `Không gọi được TwelveData: ${e.message}` }, origin);
+      const result = await tdFetch(env, tdPath, params);
+      if (!result.ok) {
+        // Tất cả keys fail — trả lỗi giữ format giống TD để frontend xử lý quen
+        return jsonResponse(429, {
+          status: "error",
+          message: result.lastError || "Tất cả TD keys đều cooldown",
+          attempts: result.attempts,
+        }, origin);
       }
       const respHeaders = new Headers(corsHeaders(origin));
-      respHeaders.set("Content-Type", upstream.headers.get("Content-Type") || "application/json");
+      respHeaders.set("Content-Type", result.headers.get("Content-Type") || "application/json");
       respHeaders.set("Cache-Control", "public, max-age=30");
-      return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
+      respHeaders.set("X-TD-Key", result.label);
+      return new Response(result.text, { status: result.status, headers: respHeaders });
     }
 
     // ──────────────────────────────────────────────────────────
