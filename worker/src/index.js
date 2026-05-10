@@ -3272,9 +3272,20 @@ async function _handleTelegramUpdate(env, update) {
 
 // Main cron handler — chạy mỗi 5 phút.
 // Luôn dọn auto-delete trước, ngay cả khi không có alert mới.
-async function runAlertCheck(env) {
-  // Dọn message hết hạn — ALWAYS chạy (kể cả thiếu Telegram secret).
+async function runAlertCheck(env, { force = false } = {}) {
+  // Dọn message hết hạn — ALWAYS chạy (kể cả thiếu Telegram secret, kể cả cuối tuần).
   await cleanupExpiredMessages(env);
+
+  // Vàng (XAU/USD) đóng cửa cuối tuần: thị trường ngừng giao dịch từ Sat 00 UTC
+  // đến hết Sun 21 UTC. Skip alert check để tiết kiệm quota TwelveData và tránh
+  // gửi cảnh báo trên dữ liệu nến cũ. Manual trigger ({force:true}) vẫn chạy.
+  if (!force) {
+    const utcDay = new Date().getUTCDay(); // 0=CN, 6=T7
+    if (utcDay === 0 || utcDay === 6) {
+      console.log(`[cron] cuối tuần (UTC day=${utcDay}) — vàng nghỉ, skip alert check`);
+      return;
+    }
+  }
 
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.log("[cron] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID chưa set, skip");
@@ -3730,9 +3741,9 @@ export default {
       }
     }
 
-    // Trigger alert check thủ công (real data — bypass cron schedule)
+    // Trigger alert check thủ công (real data — bypass cron schedule + weekend gate)
     if (url.pathname === "/run-alert-check") {
-      await runAlertCheck(env);
+      await runAlertCheck(env, { force: true });
       return jsonResponse(200, { ok: true, message: "Đã chạy kiểm tra cảnh báo giá, xem console log" }, origin);
     }
 
