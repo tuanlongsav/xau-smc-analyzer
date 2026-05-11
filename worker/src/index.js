@@ -374,16 +374,26 @@ function computePivots(candle) {
 }
 
 /**
- * Phiên giao dịch hiện tại theo UTC (XAU: Á thấp, Âu/Mỹ cao).
+ * Phiên giao dịch hiện tại theo UTC.
+ * Trả về {code, name, volMult} — volMult dùng để adjust threshold cảnh báo:
+ *  - <1.0: nới ngưỡng (nhạy hơn) vì phiên đang ở giai đoạn vol cao thật
+ *  - >1.0: siết ngưỡng (bớt noise) vì phiên đang ở giai đoạn vol thấp
+ * Ý tưởng: dùng cùng "% di chuyển bình thường của phiên" làm baseline,
+ * cảnh báo chỉ kêu khi vượt baseline → giảm false positive phiên Á + tăng nhạy phiên NY.
  */
+function getSessionInfo(date) {
+  const h = (date || new Date()).getUTCHours();
+  if (h >= 0 && h < 7)   return { code: "asia",        name: "Á (biến động thấp, thường đi ngang)",        volMult: 1.25 };
+  if (h >= 7 && h < 8)   return { code: "asia_eu",     name: "giao thoa Á-Âu (biến động bắt đầu tăng)",     volMult: 1.10 };
+  if (h >= 8 && h < 13)  return { code: "europe",      name: "Âu (biến động tăng, có xu hướng rõ)",         volMult: 1.00 };
+  if (h >= 13 && h < 16) return { code: "eu_ny",       name: "giao thoa Âu-Mỹ (biến động cao nhất)",        volMult: 0.80 };
+  if (h >= 16 && h < 21) return { code: "ny",          name: "Mỹ (biến động cao, hay có đảo chiều)",        volMult: 0.85 };
+  return { code: "after_hours", name: "ngoài giờ chính (thanh khoản thấp)", volMult: 1.15 };
+}
+
+// Backward-compat — các nơi dùng getTradingSession() chỉ cần chuỗi tên.
 function getTradingSession() {
-  const h = new Date().getUTCHours();
-  if (h >= 0 && h < 7)  return "Á (biến động thấp, thường đi ngang)";
-  if (h >= 7 && h < 8)  return "giao thoa Á-Âu (biến động bắt đầu tăng)";
-  if (h >= 8 && h < 13) return "Âu (biến động tăng, có xu hướng rõ)";
-  if (h >= 13 && h < 16) return "giao thoa Âu-Mỹ (biến động cao nhất trong ngày)";
-  if (h >= 16 && h < 21) return "Mỹ (biến động cao, hay có đảo chiều)";
-  return "ngoài giờ chính (thanh khoản thấp)";
+  return getSessionInfo().name;
 }
 
 /**
@@ -671,12 +681,19 @@ async function markAlerted(env, key) {
 
 async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
   const out = [];
+  // Giữ `key` trong object để cron logic có thể filter redundant alerts khi MEGA-MOVE active
   const push = async (key, icon, text, suggestion = null) => {
     if (await alertCooldownOk(env, key)) {
-      out.push({ icon, text, suggestion });
+      out.push({ key, icon, text, suggestion });
       await markAlerted(env, key);
     }
   };
+
+  // Session-aware threshold modifier — phiên NY/overlap nhạy hơn, phiên Á siết.
+  // Áp dụng cho các threshold biến động (strong move, impulse, ATR spike, BB expansion,
+  // wick range, gap). KHÔNG áp dụng cho RSI/MA cross/pivot vì những thứ đó là level-based.
+  const session = getSessionInfo();
+  const M = session.volMult;
 
   // ── 1. RSI quá mua / quá bán (Overbought/Oversold) ──
   if (latest.rsi != null) {
@@ -737,13 +754,13 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
   }
 
   // ── 6. Biến động giá mạnh (Strong move) — DÙNG ATR-RELATIVE ──
-  // Nến hiện tại di chuyển > 1.3 × ATR là bất thường (~30 phút giá vàng).
+  // Nến hiện tại di chuyển > (1.3 × ATR × volMult) là bất thường so với baseline phiên.
   if (latest.open && latest.close && latest.atr > 0) {
     const change = latest.close - latest.open;
     const changeAbs = Math.abs(change);
     const changePct = (changeAbs / latest.open) * 100;
     const atrRatio = changeAbs / latest.atr;
-    if (atrRatio > 1.3 || changePct > 0.3) {
+    if (atrRatio > 1.3 * M || changePct > 0.3 * M) {
       const direction = change > 0 ? "TĂNG" : "GIẢM";
       const icon = change > 0 ? "🚀" : "💥";
       await push(`big_move_${change > 0 ? "up" : "dn"}`, icon,
@@ -763,7 +780,7 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
       const totalMove = c1.close - c0.close;
       const totalAtrRatio = Math.abs(totalMove) / latest.atr;
       const totalPct = (Math.abs(totalMove) / c0.close) * 100;
-      if (totalAtrRatio > 2.5 && totalPct > 0.5) {
+      if (totalAtrRatio > 2.5 * M && totalPct > 0.5 * M) {
         const dir = totalMove > 0 ? "TĂNG" : "GIẢM";
         const icon = totalMove > 0 ? "🔥" : "❄️";
         await push(`multi_move_${totalMove > 0 ? "up" : "dn"}`, icon,
@@ -780,7 +797,7 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     const recentAtrs = candlesEnriched.slice(-30, -1).map(c => c.atr).filter(a => a != null);
     if (recentAtrs.length > 10) {
       const avgAtr = recentAtrs.reduce((s, a) => s + a, 0) / recentAtrs.length;
-      if (latest.atr > avgAtr * 1.3) {
+      if (latest.atr > avgAtr * 1.3 * M) {
         await push("vol_spike", "⚡",
           `ATR tăng vọt (Volatility Spike): *${latest.atr.toFixed(2)}* (${(latest.atr / avgAtr).toFixed(1)}× trung bình 30 nến)`,
           "Biến động cao bất thường — đợi nến đóng cửa trước khi vào lệnh, mở rộng dừng lỗ (SL) tối thiểu 1.5× ATR.");
@@ -798,7 +815,7 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     if (widths.length >= 15) {
       const avgWidth = widths.reduce((s, w) => s + w, 0) / widths.length;
       const currWidth = latest.bbUpper - latest.bbLower;
-      if (currWidth > avgWidth * 1.7) {
+      if (currWidth > avgWidth * 1.7 * M) {
         await push("bb_expand", "🌊",
           `Dải Bollinger giãn nở đột biến: width *${currWidth.toFixed(2)}* (${(currWidth / avgWidth).toFixed(1)}× trung bình) — *vừa hết tích luỹ, breakout đang xảy ra*`,
           "Sau giai đoạn tích luỹ (consolidation), volatility expansion thường kéo dài 5-10 nến. Đi theo hướng phá vỡ.");
@@ -813,7 +830,7 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     const body = Math.abs(latest.close - latest.open);
     const upperWick = latest.high - Math.max(latest.open, latest.close);
     const lowerWick = Math.min(latest.open, latest.close) - latest.low;
-    if (range > 0.7 * latest.atr && body > 0) {
+    if (range > 0.7 * latest.atr * M && body > 0) {
       if (upperWick > 1.5 * body && upperWick > lowerWick * 1.5) {
         await push("wick_top", "🪶",
           `Râu nến TRÊN dài bất thường tại $${latest.high.toFixed(2)}: ${upperWick.toFixed(2)} điểm (${(upperWick/body).toFixed(1)}× thân) — *phản ứng từ chối (rejection) ở đỉnh*`,
@@ -832,7 +849,7 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
   if (prev.close != null && latest.open != null && latest.atr > 0) {
     const gap = latest.open - prev.close;
     const gapAbs = Math.abs(gap);
-    if (gapAbs > 0.3 * latest.atr) {
+    if (gapAbs > 0.3 * latest.atr * M) {
       const dir = gap > 0 ? "LÊN" : "XUỐNG";
       const icon = gap > 0 ? "📈" : "📉";
       await push(`gap_${gap > 0 ? "up" : "dn"}`, icon,
@@ -861,13 +878,601 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
 }
 
 // ──────────────────────────────────────────────────────────
+// Volatility regime tracking — phân loại trạng thái biến động hiện tại
+// dựa trên ATR hiện tại / ATR baseline (96 nến gần nhất, ~24h trên 15m).
+// Lưu KV để detect regime shift giữa các cron run.
+// ──────────────────────────────────────────────────────────
+const VOL_REGIME_KEY = "vol_regime:current";
+
+function classifyVolRegime(candlesEnriched) {
+  if (!Array.isArray(candlesEnriched) || candlesEnriched.length < 50) {
+    return { code: "unknown", ratio: null, currentAtr: null, baselineAtr: null };
+  }
+  const last = candlesEnriched[candlesEnriched.length - 1];
+  const currentAtr = last.atr;
+  if (currentAtr == null) return { code: "unknown", ratio: null, currentAtr: null, baselineAtr: null };
+
+  // Baseline: 96 nến gần nhất (24h), bỏ 5 nến cuối để không bias với current spike
+  const slice = candlesEnriched.slice(-101, -5).map(c => c.atr).filter(a => a != null);
+  if (slice.length < 30) return { code: "unknown", ratio: null, currentAtr, baselineAtr: null };
+  const baselineAtr = slice.reduce((s, a) => s + a, 0) / slice.length;
+  const ratio = currentAtr / baselineAtr;
+
+  let code;
+  if (ratio < 0.65)       code = "low";
+  else if (ratio < 1.25)  code = "normal";
+  else if (ratio < 1.85)  code = "high";
+  else                    code = "extreme";
+
+  return { code, ratio, currentAtr, baselineAtr };
+}
+
+const REGIME_LABEL = {
+  low: { icon: "🟢", text: "THẤP", desc: "biên động dưới mức bình thường — sideways/tích luỹ" },
+  normal: { icon: "🟡", text: "BÌNH THƯỜNG", desc: "biên động trong baseline 24h" },
+  high: { icon: "🟠", text: "CAO", desc: "biên động trên trung bình — cẩn trọng vào lệnh, nới SL" },
+  extreme: { icon: "🔴", text: "RẤT CAO", desc: "biên động cực mạnh — có thể đang có tin / breakout / phân phối lớn" },
+};
+
+/**
+ * Trả về regime hiện tại + alert nếu vừa shift.
+ * Push regime-shift alert BYPASS cooldown (hiếm, đáng spam).
+ */
+async function trackVolRegime(env, currentRegime) {
+  if (!env.CACHE || currentRegime.code === "unknown") return null;
+  let prevState = null;
+  try {
+    const raw = await env.CACHE.get(VOL_REGIME_KEY);
+    if (raw) prevState = JSON.parse(raw);
+  } catch {}
+
+  const now = Date.now();
+  if (!prevState || prevState.code !== currentRegime.code) {
+    // Regime shift (hoặc lần đầu)
+    const newState = {
+      code: currentRegime.code,
+      since: now,
+      ratio: currentRegime.ratio,
+    };
+    try {
+      await env.CACHE.put(VOL_REGIME_KEY, JSON.stringify(newState), { expirationTtl: 7 * 86400 });
+    } catch {}
+    if (prevState) {
+      // Chỉ alert khi từ low/normal → high/extreme HOẶC ngược lại (down-shift cũng quan trọng để biết phân phối ổn lại)
+      const escalation = (
+        (prevState.code === "low" || prevState.code === "normal") &&
+        (currentRegime.code === "high" || currentRegime.code === "extreme")
+      );
+      const deescalation = (
+        (prevState.code === "high" || prevState.code === "extreme") &&
+        (currentRegime.code === "low" || currentRegime.code === "normal")
+      );
+      if (escalation || deescalation) {
+        const L = REGIME_LABEL[currentRegime.code];
+        const P = REGIME_LABEL[prevState.code];
+        const directionIcon = escalation ? "⬆️" : "⬇️";
+        return {
+          icon: `${directionIcon}${L.icon}`,
+          text: `*Chuyển vùng biến động:* ${P.text} → ${L.text} (ATR ${currentRegime.ratio.toFixed(2)}× nền 24 giờ) — ${L.desc}`,
+          suggestion: escalation
+            ? "Hệ thống sẽ nhạy hơn với cảnh báo kế tiếp. Cân nhắc thu nhỏ khối lượng, mở rộng SL tối thiểu 2× ATR, ưu tiên chốt từng phần (scale-out) sớm."
+            : "Biến động đang co lại — phù hợp giao dịch lướt sóng / dao động trong vùng. SL có thể siết lại 1× ATR.",
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// ──────────────────────────────────────────────────────────
+// MEGA-MOVE detection — biến động cực mạnh trong 1 nến (15p)
+// hoặc cluster 3 nến (45p). Trigger sâu hơn để chạy reversal-probe + AI.
+// ──────────────────────────────────────────────────────────
+const MEGA_MOVE_DOLLAR = 20;
+const MEGA_MOVE_SINGLE_ATR = 2.0;
+const MEGA_MOVE_CLUSTER_ATR = 3.0;
+
+function detectMegaMove(candlesEnriched) {
+  if (!Array.isArray(candlesEnriched) || candlesEnriched.length < 4) {
+    return { triggered: false };
+  }
+  const latest = candlesEnriched[candlesEnriched.length - 1];
+  if (!latest.atr || !latest.open || !latest.close) return { triggered: false };
+
+  // 1 nến: |close - open|
+  const singleMove = latest.close - latest.open;
+  const singleAbs = Math.abs(singleMove);
+  const singleAtr = singleAbs / latest.atr;
+  if (singleAbs >= MEGA_MOVE_DOLLAR || singleAtr >= MEGA_MOVE_SINGLE_ATR) {
+    return {
+      triggered: true,
+      type: "single",
+      direction: singleMove > 0 ? "up" : "down",
+      dollarMove: singleAbs,
+      atrRatio: singleAtr,
+      pctMove: (singleAbs / latest.open) * 100,
+      windowMinutes: 15,
+    };
+  }
+
+  // 3 nến: close[-1] - close[-4]
+  const c0 = candlesEnriched[candlesEnriched.length - 4];
+  if (c0?.close) {
+    const cluster = latest.close - c0.close;
+    const clusterAbs = Math.abs(cluster);
+    const clusterAtr = clusterAbs / latest.atr;
+    if (clusterAbs >= MEGA_MOVE_DOLLAR || clusterAtr >= MEGA_MOVE_CLUSTER_ATR) {
+      return {
+        triggered: true,
+        type: "cluster",
+        direction: cluster > 0 ? "up" : "down",
+        dollarMove: clusterAbs,
+        atrRatio: clusterAtr,
+        pctMove: (clusterAbs / c0.close) * 100,
+        windowMinutes: 45,
+      };
+    }
+  }
+
+  return { triggered: false };
+}
+
+// Tìm local extremes (đỉnh/đáy) trong window 3-3 — dùng cho RSI divergence.
+function findLocalExtremes(candles, kind) {
+  const out = [];
+  for (let i = 3; i < candles.length - 3; i++) {
+    const v = kind === "high" ? candles[i].high : candles[i].low;
+    if (v == null) continue;
+    let isExtreme = true;
+    for (let j = i - 3; j <= i + 3; j++) {
+      if (j === i) continue;
+      const cmp = kind === "high" ? candles[j].high : candles[j].low;
+      if (cmp == null) { isExtreme = false; break; }
+      if (kind === "high" ? cmp > v : cmp < v) { isExtreme = false; break; }
+    }
+    if (isExtreme) out.push({ idx: i, value: v, rsi: candles[i].rsi });
+  }
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────
+// Reversal signal scanner — chấm điểm xác suất quay đầu sau mega-move.
+// Trả { score (0-145), factors, verdict }.
+// ──────────────────────────────────────────────────────────
+function scanReversalSignals(e15m, e1h, e4h, mega) {
+  const latest = e15m[e15m.length - 1];
+  const prev = e15m[e15m.length - 2];
+  const last1h = e1h?.[e1h.length - 1];
+  const last4h = e4h?.[e4h.length - 1];
+  const dir = mega.direction;
+  const factors = [];
+  let score = 0;
+
+  // 1. RSI extreme 15m
+  if (latest.rsi != null) {
+    if (dir === "up" && latest.rsi > 75) {
+      factors.push(`RSI 15p quá mua (${latest.rsi.toFixed(1)})`);
+      score += 20;
+    } else if (dir === "down" && latest.rsi < 25) {
+      factors.push(`RSI 15p quá bán (${latest.rsi.toFixed(1)})`);
+      score += 20;
+    }
+  }
+
+  // 2. HTF RSI exhaustion (1h)
+  if (last1h?.rsi != null) {
+    if (dir === "up" && last1h.rsi > 70) {
+      factors.push(`RSI 1g quá mua (${last1h.rsi.toFixed(1)})`);
+      score += 15;
+    } else if (dir === "down" && last1h.rsi < 30) {
+      factors.push(`RSI 1g quá bán (${last1h.rsi.toFixed(1)})`);
+      score += 15;
+    }
+  }
+
+  // 3. HTF RSI exhaustion (4h)
+  if (last4h?.rsi != null) {
+    if (dir === "up" && last4h.rsi > 70) {
+      factors.push(`RSI 4g quá mua (${last4h.rsi.toFixed(1)})`);
+      score += 12;
+    } else if (dir === "down" && last4h.rsi < 30) {
+      factors.push(`RSI 4g quá bán (${last4h.rsi.toFixed(1)})`);
+      score += 12;
+    }
+  }
+
+  // 4. Distance from EMA50 (mean reversion)
+  if (latest.ema50 && latest.atr) {
+    const distAtr = Math.abs(latest.close - latest.ema50) / latest.atr;
+    if (distAtr > 3) {
+      factors.push(`giá xa EMA50 ${distAtr.toFixed(1)}× ATR (có khả năng hồi về trung bình)`);
+      score += 15;
+    }
+  }
+
+  // 5. BB extreme
+  if (latest.bbUpper && latest.bbLower) {
+    const bw = latest.bbUpper - latest.bbLower;
+    if (bw > 0) {
+      if (dir === "up" && latest.close > latest.bbUpper) {
+        const beyond = ((latest.close - latest.bbUpper) / bw) * 100;
+        factors.push(`đóng cửa trên biên trên Bollinger (vượt ${beyond.toFixed(0)}% chiều rộng dải)`);
+        score += 15;
+      } else if (dir === "down" && latest.close < latest.bbLower) {
+        const beyond = ((latest.bbLower - latest.close) / bw) * 100;
+        factors.push(`đóng cửa dưới biên dưới Bollinger (vượt ${beyond.toFixed(0)}% chiều rộng dải)`);
+        score += 15;
+      }
+    }
+  }
+
+  // 6. Wick rejection trong 2 nến gần nhất
+  for (const c of e15m.slice(-2)) {
+    if (!c.high || !c.low || !c.open || !c.close || !c.atr) continue;
+    const range = c.high - c.low;
+    const body = Math.abs(c.close - c.open);
+    if (body === 0 || range < 0.5 * c.atr) continue;
+    const upperWick = c.high - Math.max(c.open, c.close);
+    const lowerWick = Math.min(c.open, c.close) - c.low;
+    if (dir === "up" && upperWick > 1.5 * body && upperWick > lowerWick * 1.5) {
+      factors.push(`râu nến TRÊN dài tại $${c.high.toFixed(2)} (phản ứng từ chối)`);
+      score += 20;
+      break;
+    }
+    if (dir === "down" && lowerWick > 1.5 * body && lowerWick > upperWick * 1.5) {
+      factors.push(`râu nến DƯỚI dài tại $${c.low.toFixed(2)} (phản ứng từ chối)`);
+      score += 20;
+      break;
+    }
+  }
+
+  // 7. Liquidity sweep — nến hiện tại quét đỉnh/đáy 50 nến rồi đóng cửa lại trong
+  if (prev?.recentHigh && prev?.recentLow) {
+    if (dir === "up" && latest.high > prev.recentHigh && latest.close < prev.recentHigh) {
+      factors.push(`quét thanh khoản TRÊN $${prev.recentHigh.toFixed(2)} rồi đóng cửa lại trong vùng`);
+      score += 25;
+    }
+    if (dir === "down" && latest.low < prev.recentLow && latest.close > prev.recentLow) {
+      factors.push(`quét thanh khoản DƯỚI $${prev.recentLow.toFixed(2)} rồi đóng cửa lại trong vùng`);
+      score += 25;
+    }
+  }
+
+  // 8. RSI divergence (đơn giản: 2 swing extremes gần nhất trong 30 nến)
+  if (e15m.length >= 30) {
+    const recent = e15m.slice(-30);
+    if (dir === "up") {
+      const highs = findLocalExtremes(recent, "high");
+      if (highs.length >= 2) {
+        const [h1, h2] = highs.slice(-2);
+        if (h2.value > h1.value && h2.rsi != null && h1.rsi != null && h2.rsi < h1.rsi - 2) {
+          factors.push(`phân kỳ GIẢM RSI (giá đỉnh mới cao hơn nhưng RSI đỉnh mới thấp hơn)`);
+          score += 25;
+        }
+      }
+    } else {
+      const lows = findLocalExtremes(recent, "low");
+      if (lows.length >= 2) {
+        const [l1, l2] = lows.slice(-2);
+        if (l2.value < l1.value && l2.rsi != null && l1.rsi != null && l2.rsi > l1.rsi + 2) {
+          factors.push(`phân kỳ TĂNG RSI (giá đáy mới thấp hơn nhưng RSI đáy mới cao hơn)`);
+          score += 25;
+        }
+      }
+    }
+  }
+
+  let verdict;
+  if (score >= 70) verdict = "reversal_strong";
+  else if (score >= 45) verdict = "reversal_likely";
+  else if (score >= 25) verdict = "mixed";
+  else verdict = "continuation_likely";
+
+  return { score, factors, verdict };
+}
+
+// ──────────────────────────────────────────────────────────
+// News fetch cho mega-move — reuse getCachedNews() + isGoldRelevant()
+// đã có sẵn trong worker (15-min cache, 3 feeds: fxstreet/investing/marketwatch).
+// ──────────────────────────────────────────────────────────
+async function fetchTopGoldNews(env, limit = 5) {
+  try {
+    const all = await getCachedNews(env);
+    const filtered = (all || [])
+      .filter(isGoldRelevant)
+      .sort((a, b) => (b.ts || 0) - (a.ts || 0))
+      .slice(0, limit);
+    console.log(`[mega-news] total=${all?.length || 0} gold-relevant=${filtered.length}`);
+    return filtered;
+  } catch (e) {
+    console.log(`[mega-news] fail: ${e.message}`);
+    return [];
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// Mega-move orchestrator — scan reversal + fetch news + gọi Gemini + gửi TG.
+// Cooldown 30p qua KV để tránh spam trong giai đoạn vol kéo dài.
+// ──────────────────────────────────────────────────────────
+const MEGA_MOVE_COOLDOWN_MS = 30 * 60 * 1000;
+
+async function megaMoveCooldownOk(env) {
+  if (!env.CACHE) return true;
+  const last = await env.CACHE.get("mega_move:last");
+  if (!last) return true;
+  return Date.now() - parseInt(last) > MEGA_MOVE_COOLDOWN_MS;
+}
+
+async function markMegaMoveSent(env) {
+  if (!env.CACHE) return;
+  await env.CACHE.put("mega_move:last", String(Date.now()), { expirationTtl: 7200 });
+}
+
+async function runMegaMoveAnalysis(env, ctx) {
+  const { mega, e15m, e1h, e4h, regime, session, extraAlerts = [] } = ctx;
+  if (!mega?.triggered) {
+    console.log(`[mega-move] no trigger, skip`);
+    return { skipped: "no_trigger" };
+  }
+  if (!(await megaMoveCooldownOk(env))) {
+    console.log(`[mega-move] cooldown 30p, skip`);
+    return { skipped: "cooldown" };
+  }
+
+  const latest = e15m[e15m.length - 1];
+  const reversal = scanReversalSignals(e15m, e1h, e4h, mega);
+  const news = await fetchTopGoldNews(env, 5).catch(e => {
+    console.log(`[mega-move] news fetch fail: ${e.message}`);
+    return [];
+  });
+
+  // Map các code → tên VN cho dễ đọc trong Telegram
+  const SESSION_VI = {
+    asia: "Á", asia_eu: "Á-Âu", europe: "Âu",
+    eu_ny: "Âu-Mỹ giao thoa", ny: "Mỹ", after_hours: "ngoài giờ chính",
+  };
+  const REGIME_VI = {
+    low: "THẤP", normal: "BÌNH THƯỜNG",
+    high: "CAO", extreme: "RẤT CAO", unknown: "?",
+  };
+  const AI_VERDICT_VI = {
+    continuation: "TIẾP DIỄN",
+    continuation_likely: "CÓ KHẢ NĂNG TIẾP DIỄN",
+    reversal_strong: "ĐẢO CHIỀU MẠNH",
+    reversal_likely: "CÓ KHẢ NĂNG ĐẢO CHIỀU",
+    mixed: "TÍN HIỆU TRỘN",
+  };
+  const sessionVi = SESSION_VI[session.code] || session.code;
+  const regimeVi = REGIME_VI[regime.code] || regime.code;
+  const directionVi = mega.direction === "up" ? "TĂNG" : "GIẢM";
+  const verdictLabel = {
+    reversal_strong: "KHẢ NĂNG QUAY ĐẦU MẠNH",
+    reversal_likely: "có khả năng quay đầu",
+    mixed: "tín hiệu trộn (chưa rõ ràng)",
+    continuation_likely: "có khả năng tiếp diễn",
+  }[reversal.verdict];
+
+  const newsBlock = news.length > 0
+    ? "\n## TIN TỨC MỚI (gốc tiếng Anh — bạn dịch nhanh sang VN trong field headlines_vi):\n" + news.slice(0, 3).map((n, i) =>
+        `${i + 1}. ${n.title}${n.summary && n.summary.length > 30 ? " — " + n.summary.slice(0, 150) : ""}`
+      ).join("\n")
+    : "\n## TIN TỨC: không có tin gold-relevant trong 10p qua";
+
+  const prompt = `XAU/USD vừa biến động ${directionVi} đột biến **$${mega.dollarMove.toFixed(2)}** (${mega.atrRatio.toFixed(1)}× ATR, ${mega.pctMove.toFixed(2)}%) trong ${mega.windowMinutes} phút. Giá hiện tại $${latest.close.toFixed(2)}.
+
+## BỐI CẢNH
+- Phiên: ${session.name} (mã: ${session.code})
+- Vùng biến động: ${regimeVi} (ATR ${regime.ratio?.toFixed(2) || "?"}× baseline 24h)
+- RSI 15p: ${latest.rsi?.toFixed(1) || "?"} | 1g: ${e1h?.[e1h.length-1]?.rsi?.toFixed(1) || "?"} | 4g: ${e4h?.[e4h.length-1]?.rsi?.toFixed(1) || "?"}
+- EMA21/50/200 (15p): ${latest.ema21?.toFixed(2)}/${latest.ema50?.toFixed(2)}/${latest.ema200?.toFixed(2)}
+- BB (15p): ${latest.bbLower?.toFixed(2)} ~ ${latest.bbUpper?.toFixed(2)}
+
+## TÍN HIỆU QUAY ĐẦU (rule-based, ${reversal.score}/145 → ${verdictLabel}):
+${reversal.factors.length > 0 ? reversal.factors.map(f => "- " + f).join("\n") : "- Không có tín hiệu reversal rõ ràng"}
+${newsBlock}
+
+## YÊU CẦU
+Trả **JSON** schema (TOÀN BỘ value là tiếng Việt, không tiếng Anh trừ thuật ngữ kỹ thuật trong ngoặc):
+{
+  "verdict": "reversal_strong" | "reversal_likely" | "mixed" | "continuation",
+  "probability_reversal_pct": 0-100,
+  "key_factors": ["lý do 1 (tiếng Việt)", "lý do 2", "lý do 3"],
+  "watch_levels": {
+    "reversal_trigger": <giá số>,
+    "continuation_trigger": <giá số>,
+    "key_invalidation": <giá số>
+  },
+  "trade_setups": [
+    {
+      "bias": "long" | "short",
+      "scenario": "tên ngắn kịch bản (vd: 'Tiếp diễn breakout', 'Đảo chiều tại đỉnh')",
+      "wait_for": "biểu hiện cần đợi để vào lệnh (vd: 'nến 15p đóng cửa trên $X + RSI > 50' hoặc 'wick rejection + volume tăng tại $Y')",
+      "entry_zone": [<giá số low>, <giá số high>],
+      "sl": <giá số>,
+      "tp1": <giá số>,
+      "tp2": <giá số>,
+      "tp3": <giá số>,
+      "rr_to_tp1": <số: tỉ lệ R:R đến TP1, vd 1.5 nghĩa là 1:1.5>,
+      "confidence": "cao" | "trung bình" | "thấp",
+      "invalidate_note": "nếu giá làm gì thì huỷ setup này (vd: 'đóng cửa dưới $Z')"
+    }
+  ],
+  "news_catalyst": "tóm tắt 1 câu xem có tin nào giải thích biến động không (TIẾNG VIỆT), hoặc null",
+  "headlines_vi": ["dịch headline 1 ra TIẾNG VIỆT, ngắn gọn ~80 ký tự", "dịch headline 2", "dịch headline 3"]
+}
+
+QUY TẮC SETUPS:
+- Tối đa 2 setup. Nếu verdict là reversal/continuation rõ → CHỈ trả 1 setup theo hướng đó.
+- Nếu verdict mixed → trả 2 setup (long + short, mỗi cái có wait_for khác nhau để chỉ 1 setup được kích hoạt tuỳ giá đi đâu).
+- Entry zone hợp lý: cách giá hiện tại 0.2-1.5× ATR. KHÔNG đề xuất entry ngay giá hiện tại nếu đang trong đà mạnh — phải có pullback hoặc xác nhận.
+- SL bắt buộc cách entry tối thiểu 1× ATR (~12 điểm hiện tại), đặt sau swing point gần nhất.
+- TP1 ≈ 1× ATR từ entry (R:R tối thiểu 1:1), TP2 ≈ 2× ATR, TP3 ≈ 3-4× ATR hoặc fib extension.
+- Mọi giá là SỐ THẬP PHÂN (không phải chuỗi), 2 chữ số sau dấu phẩy.
+- confidence "cao" chỉ khi có ≥ 3 yếu tố confluence (RSI extreme + key level + wick rejection chẳng hạn).
+
+QUAN TRỌNG (chung):
+- ĐỪNG bias theo xu hướng vừa di chuyển — cân nhắc xác suất reversal nghiêm túc.
+- RSI extreme + wick rejection + sweep liquidity → ưu tiên reversal.
+- Gần SR major + có news catalyst rõ → cân nhắc continuation.
+- Mọi giải thích viết bằng TIẾNG VIỆT. Thuật ngữ kỹ thuật (RSI, EMA, BB, ATR) giữ nguyên.
+- headlines_vi: dịch 3 tin trên cùng từ block TIN TỨC MỚI sang tiếng Việt ngắn gọn dễ hiểu.`;
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0.4,
+      maxOutputTokens: 1800,
+      thinkingConfig: { thinkingBudget: 0 },
+    },
+  };
+
+  let aiResult = null;
+  try {
+    const resp = await callGeminiSmart(env, body);
+    const text = resp?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (text) {
+      try { aiResult = JSON.parse(text); }
+      catch { aiResult = extractJSON(text); }
+    }
+  } catch (e) {
+    console.log(`[mega-move] gemini fail: ${e.message}`);
+  }
+
+  // HTML mode — an toàn hơn với content động (AI output có thể chứa * hoặc _ break Markdown).
+  // Escape & < > trong text user-facing để không break HTML parser của Telegram.
+  const h = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  const dirIcon = mega.direction === "up" ? "🚀" : "💥";
+  const lines = [];
+  lines.push(`${dirIcon} <b>MEGA-MOVE ${h(directionVi)}</b> — $${mega.dollarMove.toFixed(2)} (${mega.atrRatio.toFixed(1)}× ATR) trong ${mega.windowMinutes} phút`);
+  const ratioText = regime.ratio != null ? ` (ATR ${regime.ratio.toFixed(2)}× nền 24g)` : "";
+  lines.push(`Giá: <b>$${latest.close.toFixed(2)}</b> | Phiên: ${h(sessionVi)} | Biến động: ${h(regimeVi)}${h(ratioText)}`);
+
+  // Cảnh báo song hành (RSI / EMA cross / pivot break / liquidity sweep ...) — non-overlap với mega
+  if (Array.isArray(extraAlerts) && extraAlerts.length > 0) {
+    // Convert Markdown *X* → <b>X</b> sau khi escape HTML, để render đẹp trong HTML mode
+    const mdToHtml = (s) => h(String(s || "")).replace(/\*([^*\n]+)\*/g, "<b>$1</b>");
+    lines.push("");
+    lines.push("🔔 <b>Cảnh báo song hành:</b>");
+    for (const a of extraAlerts.slice(0, 6)) {
+      lines.push(`${a.icon || "•"} ${mdToHtml(a.text)}`);
+    }
+  }
+
+  lines.push("");
+  lines.push(`<b>Rà soát quy tắc: ${reversal.score}/145 → ${h(verdictLabel)}</b>`);
+  if (reversal.factors.length > 0) {
+    lines.push(reversal.factors.slice(0, 5).map(f => "• " + h(f)).join("\n"));
+  } else {
+    lines.push("• Chưa có tín hiệu đảo chiều rõ");
+  }
+
+  if (aiResult) {
+    lines.push("");
+    const verdictKey = (aiResult.verdict || "").toString().toLowerCase();
+    const verdictText = AI_VERDICT_VI[verdictKey] || verdictKey.toUpperCase() || "?";
+    const pReversal = aiResult.probability_reversal_pct;
+    lines.push(`🤖 <b>AI: ${h(verdictText)}${pReversal != null ? ` (xác suất đảo chiều ${h(pReversal)}%)` : ""}</b>`);
+    if (Array.isArray(aiResult.key_factors) && aiResult.key_factors.length > 0) {
+      lines.push(aiResult.key_factors.slice(0, 3).map(f => "• " + h(f)).join("\n"));
+    }
+    if (aiResult.watch_levels && typeof aiResult.watch_levels === "object") {
+      const wl = aiResult.watch_levels;
+      const fmt = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
+      const wlLines = [];
+      const t1 = fmt(wl.reversal_trigger);
+      const t2 = fmt(wl.continuation_trigger);
+      const t3 = fmt(wl.key_invalidation);
+      if (t1) wlLines.push(`• Đảo chiều xác nhận: $${t1}`);
+      if (t2) wlLines.push(`• Tiếp diễn xác nhận: $${t2}`);
+      if (t3) wlLines.push(`• Mức huỷ kịch bản: $${t3}`);
+      if (wlLines.length > 0) {
+        lines.push("");
+        lines.push("📍 <b>Mốc theo dõi:</b>");
+        lines.push(wlLines.join("\n"));
+      }
+    }
+    if (aiResult.action_plan) {
+      lines.push("");
+      lines.push(`🎯 <b>Tổng quan:</b> ${h(aiResult.action_plan)}`);
+    }
+
+    // ── Setup giao dịch cụ thể (entry / SL / TP1-2-3 + trigger biểu hiện) ──
+    if (Array.isArray(aiResult.trade_setups) && aiResult.trade_setups.length > 0) {
+      const fmtNum = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
+      for (const s of aiResult.trade_setups.slice(0, 2)) {
+        const biasIcon = s.bias === "long" ? "📈" : s.bias === "short" ? "📉" : "🎯";
+        const biasText = s.bias === "long" ? "MUA (LONG)" : s.bias === "short" ? "BÁN (SHORT)" : "TRUNG TÍNH";
+        const confText = s.confidence ? ` — độ tin cậy ${h(s.confidence)}` : "";
+
+        const ez = Array.isArray(s.entry_zone) ? s.entry_zone.map(fmtNum).filter(Boolean) : [];
+        const sl = fmtNum(s.sl);
+        const tp1 = fmtNum(s.tp1);
+        const tp2 = fmtNum(s.tp2);
+        const tp3 = fmtNum(s.tp3);
+        const rr = Number.isFinite(Number(s.rr_to_tp1)) ? Number(s.rr_to_tp1).toFixed(1) : null;
+
+        // Bỏ setup không có đủ entry + SL + TP1
+        if (ez.length === 0 || !sl || !tp1) continue;
+
+        lines.push("");
+        lines.push(`${biasIcon} <b>${h(biasText)}${s.scenario ? " — " + h(s.scenario) : ""}${confText}</b>`);
+        if (s.wait_for) {
+          lines.push(`   ⏳ Đợi: ${h(s.wait_for)}`);
+        }
+        const entryStr = ez.length === 2 && ez[0] !== ez[1] ? `$${ez[0]} – $${ez[1]}` : `$${ez[0]}`;
+        lines.push(`   🎯 Vào lệnh: ${entryStr}`);
+        lines.push(`   🛑 Dừng lỗ (SL): $${sl}`);
+        const tpParts = [`TP1 $${tp1}`];
+        if (tp2) tpParts.push(`TP2 $${tp2}`);
+        if (tp3) tpParts.push(`TP3 $${tp3}`);
+        lines.push(`   💰 Chốt lời: ${tpParts.join(" | ")}`);
+        if (rr) lines.push(`   ⚖️ R:R đến TP1 = 1:${rr}`);
+        if (s.invalidate_note) {
+          lines.push(`   ⚠️ Huỷ kịch bản nếu: ${h(s.invalidate_note)}`);
+        }
+      }
+    }
+
+    if (aiResult.news_catalyst && aiResult.news_catalyst !== "null") {
+      lines.push("");
+      lines.push(`📰 <b>Tin liên quan:</b> ${h(aiResult.news_catalyst)}`);
+    }
+  } else {
+    lines.push("");
+    lines.push("⚠️ AI offline — chỉ có rà soát quy tắc ở trên");
+  }
+
+  // Headlines tiếng Việt (do AI dịch) — fallback về tiếng Anh nếu AI không trả
+  const headlinesVi = Array.isArray(aiResult?.headlines_vi) ? aiResult.headlines_vi.filter(Boolean) : [];
+  if (headlinesVi.length > 0) {
+    lines.push("");
+    lines.push("📰 <b>Tin tức mới (dịch nhanh):</b>");
+    lines.push(headlinesVi.slice(0, 3).map((t, i) => `${i + 1}. ${h(t)}`).join("\n"));
+  } else if (news.length > 0) {
+    lines.push("");
+    lines.push("📰 <b>Tin tức mới (gốc):</b>");
+    lines.push(news.slice(0, 3).map((n, i) => `${i + 1}. ${h((n.title || "").slice(0, 120))}`).join("\n"));
+  }
+
+  const msg = lines.join("\n");
+  // KHÔNG auto-delete — quan trọng, user cần xem lại sau
+  // HTML parse mode — robust với dynamic AI output
+  const sent = await sendTelegram(env, msg, false, "HTML");
+  if (sent) await markMegaMoveSent(env);
+  console.log(`[mega-move] ${sent ? "sent" : "send_fail"}: score=${reversal.score} verdict=${reversal.verdict} dollar=$${mega.dollarMove.toFixed(2)} dir=${mega.direction} ai=${!!aiResult}`);
+  return { sent, score: reversal.score, verdict: reversal.verdict };
+}
+
+// ──────────────────────────────────────────────────────────
 // Telegram send
 // ──────────────────────────────────────────────────────────
 /**
  * Gửi message tới chat đã configure (cho cron alert).
  * autoDelete mặc định true — cảnh báo giá sẽ tự xoá sau 1h.
  */
-async function sendTelegram(env, text, autoDelete = true) {
+async function sendTelegram(env, text, autoDelete = true, parseMode = "Markdown") {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
@@ -877,12 +1482,12 @@ async function sendTelegram(env, text, autoDelete = true) {
       body: JSON.stringify({
         chat_id: env.TELEGRAM_CHAT_ID,
         text,
-        parse_mode: "Markdown",
+        parse_mode: parseMode,
         disable_web_page_preview: true,
       }),
     });
     if (!r.ok) {
-      console.log(`[telegram] send failed ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      console.log(`[telegram] send failed ${r.status} (mode=${parseMode}): ${(await r.text()).slice(0, 300)}`);
       return false;
     }
     if (autoDelete) {
@@ -3318,23 +3923,74 @@ async function runAlertCheck(env, { force = false } = {}) {
 
     const pivots = await getCachedDailyPivots(env);
 
-    // Detect alerts trên 15p (primary)
+    // Phân loại regime + track shift (push alert riêng nếu vừa shift)
+    const regime = classifyVolRegime(e15m);
+    const regimeShiftAlert = await trackVolRegime(env, regime);
+
+    // MEGA-MOVE detector — kiểm tra trước alerts thường để biết có cần deep analysis
+    const mega = detectMegaMove(e15m);
+
+    // Detect alerts trên 15p (primary) — thresholds đã được adjust theo session.volMult
     const alerts = await detectFreshAlerts(env, latest, prev, pivots, e15m);
-    if (alerts.length === 0) {
-      console.log(`[cron] no fresh alerts, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)}`);
+
+    // Prepend regime-shift alert (luôn hiển thị đầu, bypass cooldown vì rare event)
+    if (regimeShiftAlert) alerts.unshift(regimeShiftAlert);
+
+    const session = getSessionInfo();
+    if (alerts.length === 0 && !mega.triggered) {
+      console.log(`[cron] no fresh alerts, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)} session=${session.code} M=${session.volMult} regime=${regime.code}(${regime.ratio?.toFixed(2)}x)`);
       return;
     }
 
-    // Build context xác nhận đa khung
     const mtfContext = {
       "5p":  e5m  ? e5m[e5m.length - 1]   : null,
       "15p": latest,
       "1g":  e1h  ? e1h[e1h.length - 1]   : null,
     };
 
-    const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
-    const ok = await sendTelegram(env, msg);
-    console.log(`[cron] sent ${alerts.length} alerts (multi-TF), telegram=${ok}`);
+    if (mega.triggered) {
+      // MEGA-MOVE active → gộp 1 message duy nhất (mega + alerts non-vol-redundant)
+      // Skip alerts trùng nội dung với mega: big_move_*, multi_move_*, vol_spike, bb_expand, wick_*
+      // Giữ: rsi_*, bb_up/dn, golden/death, ema_*, piv_*, gap_*, liq_sweep_*, regime shift
+      const REDUNDANT_WITH_MEGA = new Set([
+        "big_move_up", "big_move_dn",
+        "multi_move_up", "multi_move_dn",
+        "vol_spike", "bb_expand",
+        "wick_top", "wick_bottom",
+      ]);
+      const extraAlerts = alerts.filter(a => !REDUNDANT_WITH_MEGA.has(a.key));
+
+      console.log(`[cron] MEGA-MOVE triggered: ${mega.direction} $${mega.dollarMove.toFixed(2)} (${mega.atrRatio.toFixed(1)}× ATR, ${mega.type}). Extra alerts: ${extraAlerts.length}/${alerts.length}`);
+
+      // Fetch 4h on-demand cho HTF context
+      let e4h = null;
+      try {
+        const c4h = await fetchTdCandles(env, "4h", 220);
+        if (c4h.length >= 50) e4h = enrichIndicators(c4h);
+      } catch (e) {
+        console.log(`[cron] 4h fetch fail: ${e.message}`);
+      }
+
+      let megaResult = null;
+      try {
+        megaResult = await runMegaMoveAnalysis(env, { mega, e15m, e1h, e4h, regime, session, extraAlerts });
+      } catch (e) {
+        console.log(`[cron] mega-move analysis fail: ${e.message}`);
+      }
+
+      // Nếu mega-move bị skip do cooldown (30p) nhưng vẫn có alerts non-redundant đáng kể
+      // → gửi regular alert message để user không miss tín hiệu RSI/pivot/cross
+      if (megaResult?.skipped === "cooldown" && extraAlerts.length > 0) {
+        const msg = formatAlertMessage(latest, extraAlerts, pivots, mtfContext);
+        const ok = await sendTelegram(env, msg);
+        console.log(`[cron] mega cooldown, fallback ${extraAlerts.length} non-redundant alerts, telegram=${ok}`);
+      }
+    } else if (alerts.length > 0) {
+      // Không có mega-move → gửi alerts như cũ
+      const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
+      const ok = await sendTelegram(env, msg);
+      console.log(`[cron] sent ${alerts.length} alerts (multi-TF, no mega), telegram=${ok}`);
+    }
   } catch (e) {
     console.log(`[cron] error: ${e.message}`);
   }
@@ -3448,6 +4104,23 @@ export default {
           ? `cooldown ${remaining}s (${s.kind})`
           : "active";
       }
+
+      // Session + volatility regime (regime đọc từ KV, do cron lưu)
+      const session = getSessionInfo();
+      let volRegime = null;
+      try {
+        const raw = await cacheGet(env, VOL_REGIME_KEY);
+        if (raw) {
+          const s = JSON.parse(raw);
+          volRegime = {
+            code: s.code,
+            ratio: s.ratio,
+            since: new Date(s.since).toISOString(),
+            since_minutes_ago: Math.floor((Date.now() - s.since) / 60000),
+          };
+        }
+      } catch {}
+
       return jsonResponse(200, {
         ok: true,
         service: "xau-gemini-proxy",
@@ -3455,6 +4128,8 @@ export default {
         gemini_keys_state: cooldownState,
         td_keys_count: tdKeys.length,
         td_keys_state: tdCooldownState,
+        session: { code: session.code, name: session.name, vol_multiplier: session.volMult },
+        vol_regime: volRegime,
         worker_dc: request.cf?.colo || "unknown",
         worker_country: request.cf?.country || "unknown",
         endpoints: [
@@ -3563,6 +4238,79 @@ export default {
         })),
         logs,
       }, origin);
+    }
+
+    // Test mega-move analysis: GET /test-megamove?force=1&dry=1
+    //   force=1 — bỏ qua trigger check (chạy dù chưa thực sự mega-move)
+    //   dry=1 — KHÔNG gửi Telegram, trả JSON thay vì
+    // Mục đích: xem format output + verify rule scan + AI call hoạt động.
+    if (url.pathname === "/test-megamove") {
+      const force = url.searchParams.get("force") === "1";
+      const dry = url.searchParams.get("dry") === "1";
+      const resetCooldown = url.searchParams.get("reset_cooldown") === "1";
+      if (resetCooldown && env.CACHE) {
+        await env.CACHE.delete("mega_move:last");
+        console.log(`[test-megamove] cooldown reset`);
+      }
+      try {
+        const [c15m, c1h, c4h] = await Promise.all([
+          fetchTdCandles(env, "15min", 220),
+          fetchTdCandles(env, "1h", 220),
+          fetchTdCandles(env, "4h", 220),
+        ]);
+        if (c15m.length < 50) return jsonResponse(500, { error: `insufficient 15m candles: ${c15m.length}` }, origin);
+        const e15m = enrichIndicators(c15m);
+        const e1h = c1h.length >= 50 ? enrichIndicators(c1h) : null;
+        const e4h = c4h.length >= 50 ? enrichIndicators(c4h) : null;
+        const latest = e15m[e15m.length - 1];
+
+        let mega = detectMegaMove(e15m);
+        if (!mega.triggered && force) {
+          // Force: fake mega-move based on actual last candle direction
+          const prev = e15m[e15m.length - 4];
+          const movement = latest.close - (prev?.close || latest.open);
+          mega = {
+            triggered: true,
+            type: "forced_test",
+            direction: movement >= 0 ? "up" : "down",
+            dollarMove: Math.max(Math.abs(movement), 20),
+            atrRatio: Math.max(Math.abs(movement) / (latest.atr || 1), 2),
+            pctMove: Math.abs(movement) / (prev?.close || latest.close) * 100,
+            windowMinutes: 45,
+          };
+        }
+
+        const regime = classifyVolRegime(e15m);
+        const session = getSessionInfo();
+        const reversal = scanReversalSignals(e15m, e1h, e4h, mega);
+        const news = await fetchTopGoldNews(env, 5).catch(() => []);
+
+        if (dry) {
+          return jsonResponse(200, {
+            mega_detected_naturally: detectMegaMove(e15m).triggered,
+            mega_used: mega,
+            regime,
+            session: { code: session.code, name: session.name, volMult: session.volMult },
+            reversal,
+            news_count: news.length,
+            news_preview: news.slice(0, 3),
+            note: "dry=1: không gửi Telegram. Bỏ dry để gửi thật.",
+          }, origin);
+        }
+
+        // Chạy thật (sẽ gửi Telegram nếu trigger + chưa cooldown)
+        const result = await runMegaMoveAnalysis(env, { mega, e15m, e1h, e4h, regime, session });
+        return jsonResponse(200, {
+          ok: true,
+          mega_triggered: mega.triggered,
+          mega,
+          regime,
+          reversal: { score: reversal.score, verdict: reversal.verdict },
+          orchestrator_result: result || null,
+        }, origin);
+      } catch (e) {
+        return jsonResponse(500, { error: e.message, stack: e.stack?.slice(0, 500) }, origin);
+      }
     }
 
     // Debug toàn diện: webhook + bot + TwelveData + Gemini key cooldowns
