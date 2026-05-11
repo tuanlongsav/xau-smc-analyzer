@@ -1322,7 +1322,7 @@ function looksVietnamese(s) {
 }
 
 async function runDeepAnalysis(env, ctx) {
-  const { mode, mega, alerts = [], e15m, e1h, e4h, regime, session } = ctx;
+  const { mode, mega, alerts = [], e15m, e1h, e4h, regime, session, pivots: pivotsCtx = null } = ctx;
 
   // Validate input
   if (mode === "mega" && !mega?.triggered) {
@@ -1501,35 +1501,50 @@ ${schemaWithExamples}`;
         .map(f => f.length > 140 ? f.slice(0, 137) + "…" : f);
       if (trimmed.length > 0) lines.push(trimmed.map(f => "• " + h(f)).join("\n"));
     }
-    if (aiResult.watch_levels && typeof aiResult.watch_levels === "object") {
-      const wl = aiResult.watch_levels;
-      const fmt = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
-      const wlLines = [];
-      const t1 = fmt(wl.bullish_trigger);
-      const t2 = fmt(wl.bearish_trigger);
-      const t3 = fmt(wl.key_invalidation);
-      if (t1) wlLines.push(`• Tăng xác nhận: $${t1}`);
-      if (t2) wlLines.push(`• Giảm xác nhận: $${t2}`);
-      if (t3) wlLines.push(`• Mức huỷ kịch bản: $${t3}`);
-      if (wlLines.length > 0) {
+    // Mốc theo dõi — ưu tiên AI, fallback rule-based (đảm bảo LUÔN có)
+    const fmtVal = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
+    const wl = aiResult.watch_levels && typeof aiResult.watch_levels === "object" ? aiResult.watch_levels : {};
+    const t1 = fmtVal(wl.bullish_trigger);
+    const t2 = fmtVal(wl.bearish_trigger);
+    const t3 = fmtVal(wl.key_invalidation);
+    const wlLines = [];
+    if (t1) wlLines.push(`• Tăng xác nhận: $${t1}`);
+    if (t2) wlLines.push(`• Giảm xác nhận: $${t2}`);
+    if (t3) wlLines.push(`• Mức huỷ kịch bản: $${t3}`);
+
+    if (wlLines.length > 0) {
+      lines.push("");
+      lines.push("📍 <b>Mốc theo dõi (AI):</b>");
+      lines.push(wlLines.join("\n"));
+    } else {
+      // Fallback rule-based: lấy 2 kháng cự + 2 hỗ trợ gần nhất từ pivots/EMA/swing
+      const kl = getKeyLevelsAround(latest, pivotsCtx, latest.close);
+      const ruleLines = [];
+      for (const lv of (kl.above || []).slice(0, 2)) {
+        ruleLines.push(`▲ <b>$${lv.price.toFixed(2)}</b> ${h(lv.label)} <i>(+${(lv.price - latest.close).toFixed(2)})</i>`);
+      }
+      for (const lv of (kl.below || []).slice(0, 2)) {
+        ruleLines.push(`▼ <b>$${lv.price.toFixed(2)}</b> ${h(lv.label)} <i>(-${(latest.close - lv.price).toFixed(2)})</i>`);
+      }
+      if (ruleLines.length > 0) {
         lines.push("");
-        lines.push("📍 <b>Mốc theo dõi:</b>");
-        lines.push(wlLines.join("\n"));
+        lines.push("📍 <b>Mốc giá cần quan sát:</b>");
+        lines.push(ruleLines.join("\n"));
       }
     }
 
-    // Trade setups (chung) — validate giá phải nằm trong khoảng ±10× ATR từ current price
-    // để loại bỏ AI hallucination (vd: SL=$1.95 khi giá = $4700)
-    if (Array.isArray(aiResult.trade_setups) && aiResult.trade_setups.length > 0) {
-      const fmtNum = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
-      const atrSetup = latest.atr || 10;
-      const minOk = latest.close - atrSetup * 10;
-      const maxOk = latest.close + atrSetup * 10;
-      const inRange = (n) => {
-        const num = Number(n);
-        return Number.isFinite(num) && num >= minOk && num <= maxOk;
-      };
+    // Trade setups — validate giá ±10× ATR + đúng chiều bias
+    const fmtNum = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
+    const atrSetup = latest.atr || 10;
+    const minOk = latest.close - atrSetup * 10;
+    const maxOk = latest.close + atrSetup * 10;
+    const inRange = (n) => {
+      const num = Number(n);
+      return Number.isFinite(num) && num >= minOk && num <= maxOk;
+    };
 
+    let renderedAnySetup = false;
+    if (Array.isArray(aiResult.trade_setups) && aiResult.trade_setups.length > 0) {
       for (const s of aiResult.trade_setups.slice(0, 2)) {
         const biasIcon = s.bias === "long" ? "📈" : s.bias === "short" ? "📉" : "🎯";
         const biasText = s.bias === "long" ? "MUA (LONG)" : s.bias === "short" ? "BÁN (SHORT)" : "TRUNG TÍNH";
@@ -1542,13 +1557,11 @@ ${schemaWithExamples}`;
         const tp3 = inRange(s.tp3) ? fmtNum(s.tp3) : null;
         const rr = Number.isFinite(Number(s.rr_to_tp1)) ? Number(s.rr_to_tp1).toFixed(1) : null;
 
-        // Skip setup hỏng: entry/SL/TP1 phải đầy đủ + trong range
         if (ez.length === 0 || !sl || !tp1) {
-          console.log(`[deep:${mode}] skip invalid setup: ez=${JSON.stringify(s.entry_zone)} sl=${s.sl} tp1=${s.tp1} (range ${minOk.toFixed(2)}-${maxOk.toFixed(2)})`);
+          console.log(`[deep:${mode}] skip invalid setup: ez=${JSON.stringify(s.entry_zone)} sl=${s.sl} tp1=${s.tp1}`);
           continue;
         }
 
-        // Validate hướng SL/TP đúng chiều bias
         const entryAvg = ez.length === 2 ? (parseFloat(ez[0]) + parseFloat(ez[1])) / 2 : parseFloat(ez[0]);
         const slNum = parseFloat(sl), tp1Num = parseFloat(tp1);
         if (s.bias === "long" && (slNum >= entryAvg || tp1Num <= entryAvg)) {
@@ -1571,7 +1584,29 @@ ${schemaWithExamples}`;
         if (tp3) tpParts.push(`TP3 $${tp3}`);
         lines.push(`   💰 Chốt lời: ${tpParts.join(" | ")}`);
         if (rr) lines.push(`   ⚖️ R:R đến TP1 = 1:${rr}`);
-        // Bỏ invalidate_note — thường trùng SL, đã loại khỏi schema
+        renderedAnySetup = true;
+      }
+    }
+
+    // Fallback rule-based: AI không trả setup hợp lệ + có direction rõ
+    // → đảm bảo LUÔN có giá khuyến nghị (entry/SL/TP) khi hướng đủ rõ.
+    if (!renderedAnySetup && aiResult.direction && aiResult.direction !== "neutral") {
+      const dirForRule = aiResult.direction === "long" ? "BUY" : "SELL";
+      const klForRule = getKeyLevelsAround(latest, pivotsCtx, latest.close);
+      const trendForRule = getTrendAssessment(latest);
+      // Tạo alerts giả từ direction để generateTradeSuggestion chấm điểm đúng
+      const fakeAlerts = [{ text: dirForRule === "BUY" ? "TĂNG đẩy lên" : "GIẢM đẩy xuống" }];
+      const ruleSg = generateTradeSuggestion(latest, fakeAlerts, trendForRule, klForRule);
+      if (ruleSg) {
+        const biasIcon = ruleSg.dir === "BUY" ? "📈" : "📉";
+        const biasText = ruleSg.dir === "BUY" ? "MUA (LONG)" : "BÁN (SHORT)";
+        lines.push("");
+        lines.push(`${biasIcon} <b>${biasText} — gợi ý theo quy tắc</b> <i>(AI không trả setup rõ)</i>`);
+        lines.push(`   🎯 Vào lệnh: $${ruleSg.entry.toFixed(2)}`);
+        lines.push(`   🛑 Dừng lỗ (SL): $${ruleSg.sl.toFixed(2)} <i>(rủi ro ~${ruleSg.slDist.toFixed(2)} điểm)</i>`);
+        lines.push(`   💰 Chốt lời: TP1 $${ruleSg.tp1.toFixed(2)} | TP2 $${ruleSg.tp2.toFixed(2)} | TP3 $${ruleSg.tp3.toFixed(2)}`);
+        lines.push(`   ⚖️ R:R 1:1 / 1:2 / 1:3 (TP1/TP2/TP3)`);
+        renderedAnySetup = true;
       }
     }
 
@@ -1583,8 +1618,41 @@ ${schemaWithExamples}`;
       lines.push(`📰 <b>Tin:</b> ${h(ncTrim)}`);
     }
   } else {
+    // AI offline — vẫn render rule-based key levels + trade suggestion
     lines.push("");
-    lines.push("⚠️ AI offline — chỉ có cảnh báo kỹ thuật ở trên");
+    lines.push("⚠️ <b>AI offline</b> — phân tích theo quy tắc:");
+
+    const kl = getKeyLevelsAround(latest, pivotsCtx, latest.close);
+    const klLines = [];
+    for (const lv of (kl.above || []).slice(0, 2)) {
+      klLines.push(`▲ <b>$${lv.price.toFixed(2)}</b> ${h(lv.label)} <i>(+${(lv.price - latest.close).toFixed(2)})</i>`);
+    }
+    for (const lv of (kl.below || []).slice(0, 2)) {
+      klLines.push(`▼ <b>$${lv.price.toFixed(2)}</b> ${h(lv.label)} <i>(-${(latest.close - lv.price).toFixed(2)})</i>`);
+    }
+    if (klLines.length > 0) {
+      lines.push("");
+      lines.push("📍 <b>Mốc giá cần quan sát:</b>");
+      lines.push(klLines.join("\n"));
+    }
+
+    // Rule-based suggestion từ alerts + trend
+    const trendOff = getTrendAssessment(latest);
+    const klOff = kl;
+    const sgOff = generateTradeSuggestion(latest, alerts, trendOff, klOff);
+    if (sgOff) {
+      const biasIcon = sgOff.dir === "BUY" ? "📈" : "📉";
+      const biasText = sgOff.dir === "BUY" ? "MUA (LONG)" : "BÁN (SHORT)";
+      lines.push("");
+      lines.push(`${biasIcon} <b>${biasText} — gợi ý theo quy tắc</b>`);
+      lines.push(`   🎯 Vào lệnh: $${sgOff.entry.toFixed(2)}`);
+      lines.push(`   🛑 Dừng lỗ (SL): $${sgOff.sl.toFixed(2)} <i>(rủi ro ~${sgOff.slDist.toFixed(2)} điểm)</i>`);
+      lines.push(`   💰 Chốt lời: TP1 $${sgOff.tp1.toFixed(2)} | TP2 $${sgOff.tp2.toFixed(2)} | TP3 $${sgOff.tp3.toFixed(2)}`);
+      lines.push(`   ⚖️ R:R 1:1 / 1:2 / 1:3`);
+    } else {
+      lines.push("");
+      lines.push("⚪ Tín hiệu mâu thuẫn — đứng ngoài, đợi xác nhận hướng.");
+    }
   }
 
   const msg = lines.join("\n");
