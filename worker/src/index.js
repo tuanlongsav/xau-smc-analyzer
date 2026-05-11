@@ -3107,10 +3107,22 @@ function formatTimeAgo(ts) {
 async function handleTinCmd(env, chatId, replyTo, topic = null) {
   await sendChatAction(env, chatId, "typing");
   try {
-    const all = await getCachedNews(env);
+    // Fetch song song: tin + giá XAU hiện tại (để AI dùng giá thật trong kịch bản)
+    const [all, c15m] = await Promise.all([
+      getCachedNews(env),
+      fetchTdCandles(env, "15min", 220).catch(() => []),
+    ]);
     if (all.length === 0) {
       await sendTelegramTo(env, chatId, "❌ Không lấy được tin tức (RSS feed lỗi).", replyTo);
       return;
+    }
+    // Giá hiện tại + ATR (cho AI tham chiếu khi dựng kịch bản)
+    let currentPrice = null, currentAtr = null;
+    if (c15m.length >= 50) {
+      const e = enrichIndicators(c15m);
+      const l = e[e.length - 1];
+      currentPrice = l.close;
+      currentAtr = l.atr;
     }
     const sevenDaysAgo = Date.now() - 7 * 24 * 3600 * 1000;
     const recent = all.filter(n => n.ts >= sevenDaysAgo).sort((a, b) => b.ts - a.ts);
@@ -3153,44 +3165,52 @@ KIẾN THỨC SẴN VỀ MAJOR EVENTS:
 - Unemployment Claims: Thứ 5 hàng tuần 19:30. Tác động thấp.
 - Retail Sales: giữa tháng 19:30.
 
-FORMAT OUTPUT (Markdown):
+FORMAT OUTPUT (Markdown) — MỌI TEXT TIẾNG VIỆT:
 **📌 Bối cảnh**
 - ${topicLabel} là gì + ý nghĩa với XAU
 - Lần công bố trước (nếu suy được từ tin)
 
 **📅 Lịch trình sắp tới**
 - Ngày + giờ (GMT+7) ước tính
-- Forecast (dự báo) vs Prior (lần trước) nếu biết
+- Dự báo (Forecast) vs Lần trước (Prior) nếu biết
 
 **🎯 3 KỊCH BẢN PHẢN ỨNG XAU**
-1. Kịch bản BULLISH (số liệu USD yếu hơn dự báo): xác suất X%, biên độ +$Y → +$Z
-   - Action: ưu tiên LONG khi giá phá vùng A, SL B, TP C
-2. Kịch bản TRUNG TÍNH (số liệu sát forecast): xác suất X%, sideways trong vùng D-E
-   - Action: đứng ngoài hoặc scalp 2 chiều
-3. Kịch bản BEARISH (số liệu USD mạnh hơn dự báo): xác suất X%, biên độ -$Y → -$Z
-   - Action: SHORT khi giá break dưới F, SL G, TP H
+1. Kịch bản TĂNG GIÁ (Bullish — số liệu USD yếu hơn dự báo): xác suất X%, biên độ +$Y → +$Z
+   - Hành động: <nếu có giá hiện tại → đề xuất MUA (LONG) khi giá phá $... với SL $... TP $...; nếu KHÔNG có giá → ghi "chờ giá hiện tại để vào kịch bản này", KHÔNG viết "A/B/C" hoặc chữ placeholder>
+2. Kịch bản TRUNG TÍNH (số liệu sát dự báo): xác suất X%, đi ngang (sideways) trong biên độ $...
+   - Hành động: đứng ngoài hoặc lướt sóng (scalp) 2 chiều
+3. Kịch bản GIẢM GIÁ (Bearish — số liệu USD mạnh hơn dự báo): xác suất X%, biên độ -$Y → -$Z
+   - Hành động: <tương tự kịch bản 1 — chỉ ghi giá thật, KHÔNG dùng A/B/C>
 
 **📋 QUẢN LÝ LỆNH**
-- Trước event 30-60p: đóng partial / dời SL về break-even / đứng ngoài hoàn toàn
-- Trong event: KHÔNG vào lệnh (spread giãn 5-10x), KHÔNG sửa SL/TP
-- Sau event 5-15p: đợi candle 1-5p đóng + retest, vào theo hướng break
+- Trước event 30-60p: đóng một phần (partial close) / dời SL về hoà vốn (break-even) / đứng ngoài hoàn toàn
+- Trong event: KHÔNG vào lệnh (biên độ chào giá — spread — giãn 5-10×), KHÔNG sửa SL/TP
+- Sau event 5-15p: đợi nến 1-5p đóng + kiểm tra lại (retest), vào theo hướng phá vỡ
 
-**⚠️ Rủi ro specific cho ${topicLabel}**
-- Stop hunt cả 2 chiều (whipsaw 5-10p đầu)
-- Spread giãn → SL bị quét sớm
-- Slippage có thể $5-20
+**⚠️ Rủi ro riêng cho ${topicLabel}**
+- Săn dừng lỗ (stop hunt) cả 2 chiều — biến động loạn 2 chiều (whipsaw) 5-10p đầu
+- Biên độ chào giá (spread) giãn → SL bị quét sớm
+- Trượt giá (slippage) có thể $5-20
 
-KHÔNG khuyến nghị mua/bán cụ thể, chỉ phân tích kịch bản + chiến lược.`;
+QUY TẮC TUYỆT ĐỐI:
+- KHÔNG dùng chữ cái placeholder (A, B, C, D, E, F, G, H, X, Y, Z, $...) — phải LUÔN là giá tuyệt đối có $ và số.
+- Nếu không có giá hiện tại trong input → BỎ phần "Hành động" cụ thể, chỉ giữ "xác suất X% + biên độ ±$Y → ±$Z" và ghi "(chờ giá để dựng kịch bản chi tiết)".
+- KHÔNG dùng từ EN trần. Mọi thuật ngữ EN phải kèm tiếng Việt: "MUA (LONG)", "BÁN (SHORT)", "phá vỡ (breakout)", "kiểm tra lại (retest)", "lướt sóng (scalp)", "trượt giá (slippage)"...
+- KHÔNG khuyến nghị mua/bán cụ thể, chỉ phân tích kịch bản + chiến lược.`;
+
+      const priceLine = currentPrice != null
+        ? `\n💰 GIÁ XAU/USD HIỆN TẠI: $${currentPrice.toFixed(2)} (ATR 15p ≈ $${currentAtr?.toFixed(2) || "?"}) — DÙNG GIÁ NÀY ĐỂ DỰNG KỊCH BẢN.\n`
+        : `\n⚠️ Không có giá XAU hiện tại → BỎ phần Hành động cụ thể, chỉ ghi xác suất + biên độ.\n`;
 
       userText = `Hôm nay: ${today}
-
+${priceLine}
 🎯 PHÂN TÍCH CHUYÊN SÂU: ${topicLabel}
 
 Tin liên quan đến "${topicLabel}" trong 7 ngày (${filtered.length} tin):
 
 ${newsList}
 
-Phân tích theo format đã quy định.`;
+Phân tích theo format đã quy định. ${currentPrice != null ? "DÙNG GIÁ $" + currentPrice.toFixed(2) + " ± 1-3× ATR cho mọi mức giá trong kịch bản." : "KHÔNG có giá → BỎ phần Hành động chi tiết."}`;
     } else {
       // ── MODE: tổng hợp tuần (như cũ) ──
       filtered = recent.filter(isGoldRelevant);
