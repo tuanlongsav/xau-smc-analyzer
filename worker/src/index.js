@@ -1228,8 +1228,9 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
   "verdict": "reversal_strong|reversal_likely|continuation|continuation_likely|mixed|wait",
   "direction": "long|short|neutral",
   "confidence_pct": 0-100,
+  "summary": "2-3 câu tiếng Việt: phe nào kiểm soát, đang ở giai đoạn nào, có nên hành động gì.",
   "key_factors": [
-    "Lý do BẢN CHẤT, ≤80 ký tự (vd: 'RSI 1g vẫn dưới 70, trend còn space')",
+    "Lý do BẢN CHẤT, ≤100 ký tự (vd: 'RSI 1g vẫn dưới 70, trend còn space để đẩy tiếp')",
     "DIỄN GIẢI hàm ý, KHÔNG dump số (KHÔNG: 'RSI 65.2')"
   ],
   "watch_levels": {
@@ -1256,9 +1257,10 @@ QUY TẮC TUYỆT ĐỐI:
 - Giá là SỐ TUYỆT ĐỐI trong $${(currentPrice - atr * 5).toFixed(0)}-$${(currentPrice + atr * 5).toFixed(0)}. KHÔNG dùng $1.95/$1.00 — đó là sai.
 - Long: SL < entry < TP1 < TP2 < TP3. Short: SL > entry > TP1 > TP2 > TP3.
 - SL-entry ≥ 1× ATR (~$${atr.toFixed(0)}). TP1 ≥ entry ± 1× ATR.
-- Tối đa 2 setup. Verdict rõ → 1 setup; mixed → 2 setup (long+short).
-- key_factors ngắn ≤80 ký tự, là lý do bản chất KHÔNG dump số.
-- news_catalyst tiếng Việt, ≤120 ký tự.
+- **BẮT BUỘC trả ≥1 trade_setup khi direction != "neutral"** (kể cả khi verdict là *_likely). Verdict mixed → 2 setup (long+short).
+- summary: 2-3 câu tự nhiên, hành động cụ thể (vd: "Phe bán có cơ hội tại $X nếu thấy Y. Đợi xác nhận, KHÔNG vào ngay.").
+- key_factors: 2-3 bullet ngắn, bản chất.
+- news_catalyst tiếng Việt ≤120 ký tự.
 - ĐỪNG bias theo đà — cân nhắc reversal nghiêm túc.`;
 }
 
@@ -1411,7 +1413,9 @@ ${schemaWithExamples}`;
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0.4,
-      maxOutputTokens: 1500,
+      // 1800 cho phép: summary 2-3 câu + key_factors 3 bullet + watch_levels + 1-2 setup
+      // + news_catalyst — tổng ~600-1000 output tokens trong thực tế
+      maxOutputTokens: 1800,
       thinkingConfig: { thinkingBudget: 0 },
     },
   };
@@ -1466,21 +1470,35 @@ ${schemaWithExamples}`;
     lines.push(`<b>Rà soát quy tắc: ${reversal.score}/145 → ${h(verdictLabel)}</b>${topFactor ? ` — ${h(topFactor)}` : ""}`);
   }
 
-  // AI block — chung cho cả 2 mode (gọn: bỏ summary để tránh trùng key_factors)
+  // AI block — chung cho cả 2 mode
   if (aiResult) {
     lines.push("");
     const verdictKey = (aiResult.verdict || "").toString().toLowerCase();
     const verdictText = AI_VERDICT_VI[verdictKey] || verdictKey.toUpperCase() || "?";
     const conf = aiResult.confidence_pct;
-    const dirText = aiResult.direction === "long" ? "📈 mua" : aiResult.direction === "short" ? "📉 bán" : aiResult.direction === "neutral" ? "⏸️ trung tính" : "";
+    // Direction label rõ ràng — dùng "MUA (LONG)" / "BÁN (SHORT)" thay vì "mua" / "bán"
+    const dirText = aiResult.direction === "long"
+      ? "📈 MUA (LONG)"
+      : aiResult.direction === "short"
+      ? "📉 BÁN (SHORT)"
+      : aiResult.direction === "neutral"
+      ? "⏸️ ĐỨNG NGOÀI"
+      : "";
     lines.push(`🤖 <b>AI: ${h(verdictText)}${conf != null ? ` (${h(conf)}%)` : ""}${dirText ? " — " + dirText : ""}</b>`);
 
-    // key_factors: tối đa 3 bullet, mỗi cái ≤120 chars (cắt nếu AI trả dài)
+    // Summary 2-3 câu — restore lại để user có context dễ đọc
+    if (aiResult.summary && typeof aiResult.summary === "string") {
+      const s = aiResult.summary.trim();
+      const sTrim = s.length > 400 ? s.slice(0, 397) + "…" : s;
+      lines.push(h(sTrim));
+    }
+
+    // key_factors: tối đa 3 bullet, mỗi cái ≤140 chars
     if (Array.isArray(aiResult.key_factors) && aiResult.key_factors.length > 0) {
       const trimmed = aiResult.key_factors.slice(0, 3)
         .map(f => String(f || "").trim())
         .filter(Boolean)
-        .map(f => f.length > 120 ? f.slice(0, 117) + "…" : f);
+        .map(f => f.length > 140 ? f.slice(0, 137) + "…" : f);
       if (trimmed.length > 0) lines.push(trimmed.map(f => "• " + h(f)).join("\n"));
     }
     if (aiResult.watch_levels && typeof aiResult.watch_levels === "object") {
