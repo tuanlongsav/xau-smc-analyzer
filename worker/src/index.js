@@ -2647,6 +2647,41 @@ function htmlEsc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// Convert Markdown-flavored text (AI output thường có) → Telegram HTML parse mode.
+// Telegram Markdown legacy chỉ hỗ trợ *bold*, _italic_, `code` — không hỗ trợ
+// **bold** (Markdown V2 style) → ta tự convert. Cũng escape HTML special chars
+// đúng cách, không bị inject thẻ ngoài ý muốn.
+function markdownToTgHtml(s) {
+  if (!s) return "";
+  // Placeholder để escape HTML mà không phá tag mình sẽ generate
+  const BO = "BO", BC = "BC";
+  const IO = "IO", IC = "IC";
+  const CO = "CO", CC = "CC";
+
+  let out = String(s);
+  // 1) Bold: **X** / __X__ / *X* (single, không trong word)
+  out = out.replace(/\*\*([^*\n][^*\n]*?)\*\*/g, `${BO}$1${BC}`);
+  out = out.replace(/__([^_\n][^_\n]*?)__/g, `${BO}$1${BC}`);
+  out = out.replace(/(^|[^\w*])\*([^*\n][^*\n]*?)\*(?=[^\w*]|$)/g, `$1${BO}$2${BC}`);
+  // 2) Code: `X`
+  out = out.replace(/`([^`\n]+?)`/g, `${CO}$1${CC}`);
+  // 3) Italic: _X_ (chỉ khi không ở giữa word — phổ biến với placeholder)
+  out = out.replace(/(^|[^\w_])_([^_\n]+?)_(?=[^\w_]|$)/g, `$1${IO}$2${IC}`);
+
+  // Escape HTML
+  out = out.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  // Restore tag
+  out = out
+    .replace(new RegExp(BO, "g"), "<b>")
+    .replace(new RegExp(BC, "g"), "</b>")
+    .replace(new RegExp(IO, "g"), "<i>")
+    .replace(new RegExp(IC, "g"), "</i>")
+    .replace(new RegExp(CO, "g"), "<code>")
+    .replace(new RegExp(CC, "g"), "</code>");
+  return out;
+}
+
 // Extract JSON từ AI response — robust với multiple format quirks
 function extractJSON(text) {
   if (!text) return null;
@@ -3287,20 +3322,23 @@ Tổng hợp theo format:
 
     let m;
     if (topicLabel) {
-      m = `📰 *Phân tích chuyên sâu: ${topicLabel}*\n`;
+      m = `📰 **Phân tích chuyên sâu: ${topicLabel}**\n`;
       m += `_${filtered.length} tin liên quan đến "${topicLabel}" trong 7 ngày_\n\n`;
     } else {
       const highImp = filtered.filter(isHighImpact).length;
-      m = `📰 *Tổng hợp tin XAU 7 ngày*\n`;
+      m = `📰 **Tổng hợp tin XAU 7 ngày**\n`;
       m += `_${filtered.length} tin liên quan, ${highImp} tin high-impact 🚨_\n\n`;
     }
     m += aiText;
     m += `\n\n_Source: FXStreet, Investing.com, MarketWatch_`;
 
-    const parts = splitForTelegram(m, 3900);
+    // Convert Markdown → Telegram HTML (bold/italic/code) — robust hơn parse "Markdown" legacy
+    // Telegram Markdown không hỗ trợ **X** (chỉ *X*) → AI thường output **X** sẽ không bold.
+    const htmlMsg = markdownToTgHtml(m);
+    const parts = splitForTelegram(htmlMsg, 3900);
     for (let i = 0; i < parts.length; i++) {
-      const suffix = parts.length > 1 ? `\n\n_[${i + 1}/${parts.length}]_` : "";
-      await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "Markdown");
+      const suffix = parts.length > 1 ? `\n\n<i>[${i + 1}/${parts.length}]</i>` : "";
+      await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "HTML");
     }
   } catch (e) {
     await sendTelegramTo(env, chatId, `❌ Error: ${e.message}`, replyTo);
