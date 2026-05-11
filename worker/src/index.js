@@ -1208,121 +1208,210 @@ async function markMegaMoveSent(env) {
   await env.CACHE.put("mega_move:last", String(Date.now()), { expirationTtl: 7200 });
 }
 
-async function runMegaMoveAnalysis(env, ctx) {
-  const { mega, e15m, e1h, e4h, regime, session, extraAlerts = [] } = ctx;
-  if (!mega?.triggered) {
-    console.log(`[mega-move] no trigger, skip`);
+// Schema chung cho cả 2 mode (mega + alerts).
+// LƯU Ý CỰC QUAN TRỌNG: AI phải hiểu "giá tuyệt đối" vs "tỉ lệ ATR"
+// — XAU/USD hiện ~$4700, mọi giá trong setup phải nằm trong khoảng $4500-5000.
+// Schema embed example values rõ để AI không nhầm.
+function buildDeepAnalysisSchema(currentPrice, atr) {
+  const px = currentPrice.toFixed(2);
+  // Tính các mức tham chiếu để AI bám theo
+  const slBelow = (currentPrice - atr * 1.5).toFixed(2);
+  const slAbove = (currentPrice + atr * 1.5).toFixed(2);
+  const tp1Above = (currentPrice + atr * 1.5).toFixed(2);
+  const tp1Below = (currentPrice - atr * 1.5).toFixed(2);
+  const tp3Above = (currentPrice + atr * 4).toFixed(2);
+  const tp3Below = (currentPrice - atr * 4).toFixed(2);
+
+  return `Trả JSON. **MỌI TEXT BẮT BUỘC TIẾNG VIỆT**. **MỌI GIÁ TUYỆT ĐỐI** (XAU ~$${px}, range $${(currentPrice - atr * 5).toFixed(0)}-$${(currentPrice + atr * 5).toFixed(0)}; KHÔNG dùng tỉ lệ ATR / số nhỏ).
+
+{
+  "verdict": "reversal_strong|reversal_likely|continuation|continuation_likely|mixed|wait",
+  "direction": "long|short|neutral",
+  "confidence_pct": 0-100,
+  "key_factors": [
+    "Lý do BẢN CHẤT, ≤80 ký tự (vd: 'RSI 1g vẫn dưới 70, trend còn space')",
+    "DIỄN GIẢI hàm ý, KHÔNG dump số (KHÔNG: 'RSI 65.2')"
+  ],
+  "watch_levels": {
+    "bullish_trigger": <vd ${(currentPrice + atr).toFixed(2)}>,
+    "bearish_trigger": <vd ${(currentPrice - atr).toFixed(2)}>,
+    "key_invalidation": <vd ${(currentPrice + atr * 2).toFixed(2)}>
+  },
+  "trade_setups": [{
+    "bias": "long|short",
+    "scenario": "tên ngắn TV (vd: Đảo chiều tại đỉnh)",
+    "wait_for": "biểu hiện cụ thể TV (vd: nến 15p đóng cửa dưới EMA21 + RSI<50)",
+    "entry_zone": [${(currentPrice - atr * 0.3).toFixed(2)}, ${(currentPrice - atr * 0.1).toFixed(2)}],
+    "sl": ${slBelow},      // long ví dụ; short dùng ${slAbove}
+    "tp1": ${tp1Above},    // long; short dùng ${tp1Below}
+    "tp2": <giá>,
+    "tp3": ${tp3Above},    // long; short dùng ${tp3Below}
+    "rr_to_tp1": <số thập phân, vd 1.5>,
+    "confidence": "cao|trung bình|thấp"
+  }],
+  "news_catalyst": "1 CÂU TIẾNG VIỆT ≤120 ký tự về tin nào gây biến động (KHÔNG copy EN nguyên), hoặc null"
+}
+
+QUY TẮC TUYỆT ĐỐI:
+- Giá là SỐ TUYỆT ĐỐI trong $${(currentPrice - atr * 5).toFixed(0)}-$${(currentPrice + atr * 5).toFixed(0)}. KHÔNG dùng $1.95/$1.00 — đó là sai.
+- Long: SL < entry < TP1 < TP2 < TP3. Short: SL > entry > TP1 > TP2 > TP3.
+- SL-entry ≥ 1× ATR (~$${atr.toFixed(0)}). TP1 ≥ entry ± 1× ATR.
+- Tối đa 2 setup. Verdict rõ → 1 setup; mixed → 2 setup (long+short).
+- key_factors ngắn ≤80 ký tự, là lý do bản chất KHÔNG dump số.
+- news_catalyst tiếng Việt, ≤120 ký tự.
+- ĐỪNG bias theo đà — cân nhắc reversal nghiêm túc.`;
+}
+
+// Map các code → tên VN — dùng chung 2 mode
+const SESSION_VI = {
+  asia: "Á", asia_eu: "Á-Âu", europe: "Âu",
+  eu_ny: "Âu-Mỹ giao thoa", ny: "Mỹ", after_hours: "ngoài giờ chính",
+};
+const REGIME_VI = {
+  low: "THẤP", normal: "BÌNH THƯỜNG",
+  high: "CAO", extreme: "RẤT CAO", unknown: "?",
+};
+const AI_VERDICT_VI = {
+  continuation: "TIẾP DIỄN",
+  continuation_likely: "CÓ KHẢ NĂNG TIẾP DIỄN",
+  reversal_strong: "ĐẢO CHIỀU MẠNH",
+  reversal_likely: "CÓ KHẢ NĂNG ĐẢO CHIỀU",
+  mixed: "TÍN HIỆU TRỘN",
+  wait: "ĐỢI XÁC NHẬN",
+};
+
+/**
+ * Deep analysis với AI — dùng cho cả MEGA-MOVE và regular alerts.
+ *   mode = "mega"   → header MEGA-MOVE + rule scan reversal + extraAlerts (non-redundant)
+ *   mode = "alerts" → header TÍN HIỆU + list alerts vừa kích hoạt
+ * Schema AI output giống nhau giữa 2 mode → share format + render code.
+ */
+const DEEP_ANALYSIS_COOLDOWN_MS = 30 * 60 * 1000;
+
+async function deepAnalysisCooldownOk(env, mode) {
+  if (!env.CACHE) return true;
+  const last = await env.CACHE.get(`deep:${mode}:last`);
+  if (!last) return true;
+  return Date.now() - parseInt(last) > DEEP_ANALYSIS_COOLDOWN_MS;
+}
+
+async function markDeepAnalysisSent(env, mode) {
+  if (!env.CACHE) return;
+  await env.CACHE.put(`deep:${mode}:last`, String(Date.now()), { expirationTtl: 7200 });
+  // Cooldown legacy key cho mega-move (backward compat) — giữ để KV cũ vẫn hoạt động
+  if (mode === "mega") {
+    await env.CACHE.put("mega_move:last", String(Date.now()), { expirationTtl: 7200 });
+  }
+}
+
+// Strip Markdown asterisks + escape HTML cho an toàn trong HTML parse mode
+function htmlEscape(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function mdBoldToHtml(s) {
+  return htmlEscape(String(s || "")).replace(/\*([^*\n]+)\*/g, "<b>$1</b>");
+}
+
+// Check tiếng Việt: phải có ít nhất 1 ký tự dấu tiếng Việt
+// (để filter AI không dịch headlines/news_catalyst, vẫn trả nguyên EN).
+const VN_DIACRITIC_RE = /[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]/;
+function looksVietnamese(s) {
+  return typeof s === "string" && VN_DIACRITIC_RE.test(s);
+}
+
+async function runDeepAnalysis(env, ctx) {
+  const { mode, mega, alerts = [], e15m, e1h, e4h, regime, session } = ctx;
+
+  // Validate input
+  if (mode === "mega" && !mega?.triggered) {
     return { skipped: "no_trigger" };
   }
-  if (!(await megaMoveCooldownOk(env))) {
-    console.log(`[mega-move] cooldown 30p, skip`);
+  if (mode === "alerts" && alerts.length === 0) {
+    return { skipped: "no_alerts" };
+  }
+  // Backward compat: kiểm tra cooldown legacy key mega_move:last cho mode mega
+  if (mode === "mega" && !(await megaMoveCooldownOk(env))) {
+    console.log(`[deep:${mode}] cooldown (legacy mega key), skip`);
+    return { skipped: "cooldown" };
+  }
+  if (!(await deepAnalysisCooldownOk(env, mode))) {
+    console.log(`[deep:${mode}] cooldown 30p, skip`);
     return { skipped: "cooldown" };
   }
 
   const latest = e15m[e15m.length - 1];
-  const reversal = scanReversalSignals(e15m, e1h, e4h, mega);
+  const sessionVi = SESSION_VI[session.code] || session.code;
+  const regimeVi = REGIME_VI[regime.code] || regime.code;
+
+  // Mega-specific: reversal scan từ rule-based factors
+  const reversal = mode === "mega" ? scanReversalSignals(e15m, e1h, e4h, mega) : null;
+
+  // News fetch chung
   const news = await fetchTopGoldNews(env, 5).catch(e => {
-    console.log(`[mega-move] news fetch fail: ${e.message}`);
+    console.log(`[deep:${mode}] news fail: ${e.message}`);
     return [];
   });
 
-  // Map các code → tên VN cho dễ đọc trong Telegram
-  const SESSION_VI = {
-    asia: "Á", asia_eu: "Á-Âu", europe: "Âu",
-    eu_ny: "Âu-Mỹ giao thoa", ny: "Mỹ", after_hours: "ngoài giờ chính",
-  };
-  const REGIME_VI = {
-    low: "THẤP", normal: "BÌNH THƯỜNG",
-    high: "CAO", extreme: "RẤT CAO", unknown: "?",
-  };
-  const AI_VERDICT_VI = {
-    continuation: "TIẾP DIỄN",
-    continuation_likely: "CÓ KHẢ NĂNG TIẾP DIỄN",
-    reversal_strong: "ĐẢO CHIỀU MẠNH",
-    reversal_likely: "CÓ KHẢ NĂNG ĐẢO CHIỀU",
-    mixed: "TÍN HIỆU TRỘN",
-  };
-  const sessionVi = SESSION_VI[session.code] || session.code;
-  const regimeVi = REGIME_VI[regime.code] || regime.code;
-  const directionVi = mega.direction === "up" ? "TĂNG" : "GIẢM";
-  const verdictLabel = {
-    reversal_strong: "KHẢ NĂNG QUAY ĐẦU MẠNH",
-    reversal_likely: "có khả năng quay đầu",
-    mixed: "tín hiệu trộn (chưa rõ ràng)",
-    continuation_likely: "có khả năng tiếp diễn",
-  }[reversal.verdict];
+  // ── Build prompt ──
+  // Phần 1: intro (khác nhau theo mode)
+  let intro;
+  if (mode === "mega") {
+    const dirVi = mega.direction === "up" ? "TĂNG" : "GIẢM";
+    intro = `XAU/USD vừa biến động ${dirVi} đột biến $${mega.dollarMove.toFixed(2)} (${mega.atrRatio.toFixed(1)}× ATR, ${mega.pctMove.toFixed(2)}%) trong ${mega.windowMinutes} phút. Giá hiện tại $${latest.close.toFixed(2)}.`;
+  } else {
+    intro = `XAU/USD có ${alerts.length} tín hiệu kỹ thuật vừa kích hoạt. Giá hiện tại $${latest.close.toFixed(2)}.`;
+  }
 
-  const newsBlock = news.length > 0
-    ? "\n## TIN TỨC MỚI (gốc tiếng Anh — bạn dịch nhanh sang VN trong field headlines_vi):\n" + news.slice(0, 3).map((n, i) =>
-        `${i + 1}. ${n.title}${n.summary && n.summary.length > 30 ? " — " + n.summary.slice(0, 150) : ""}`
-      ).join("\n")
-    : "\n## TIN TỨC: không có tin gold-relevant trong 10p qua";
-
-  const prompt = `XAU/USD vừa biến động ${directionVi} đột biến **$${mega.dollarMove.toFixed(2)}** (${mega.atrRatio.toFixed(1)}× ATR, ${mega.pctMove.toFixed(2)}%) trong ${mega.windowMinutes} phút. Giá hiện tại $${latest.close.toFixed(2)}.
-
-## BỐI CẢNH
-- Phiên: ${session.name} (mã: ${session.code})
-- Vùng biến động: ${regimeVi} (ATR ${regime.ratio?.toFixed(2) || "?"}× baseline 24h)
-- RSI 15p: ${latest.rsi?.toFixed(1) || "?"} | 1g: ${e1h?.[e1h.length-1]?.rsi?.toFixed(1) || "?"} | 4g: ${e4h?.[e4h.length-1]?.rsi?.toFixed(1) || "?"}
+  // Phần 2: BỐI CẢNH chung
+  const last1hRsi = e1h?.[e1h.length - 1]?.rsi;
+  const last4hRsi = e4h?.[e4h.length - 1]?.rsi;
+  const context = `## BỐI CẢNH
+- Phiên: ${session.name}
+- Biến động: ${regimeVi}${regime.ratio != null ? ` (ATR ${regime.ratio.toFixed(2)}× nền 24g)` : ""}
+- RSI 15p/1g/4g: ${latest.rsi?.toFixed(1) || "?"}/${last1hRsi?.toFixed(1) || "?"}/${last4hRsi?.toFixed(1) || "?"}
 - EMA21/50/200 (15p): ${latest.ema21?.toFixed(2)}/${latest.ema50?.toFixed(2)}/${latest.ema200?.toFixed(2)}
-- BB (15p): ${latest.bbLower?.toFixed(2)} ~ ${latest.bbUpper?.toFixed(2)}
+- BB (15p): ${latest.bbLower?.toFixed(2)} ~ ${latest.bbUpper?.toFixed(2)}`;
 
-## TÍN HIỆU QUAY ĐẦU (rule-based, ${reversal.score}/145 → ${verdictLabel}):
-${reversal.factors.length > 0 ? reversal.factors.map(f => "- " + f).join("\n") : "- Không có tín hiệu reversal rõ ràng"}
-${newsBlock}
+  // Phần 3: SIGNALS (mega: reversal scan; alerts: list)
+  let signalsBlock = "";
+  if (mode === "mega" && reversal) {
+    const lbl = {
+      reversal_strong: "KHẢ NĂNG QUAY ĐẦU MẠNH",
+      reversal_likely: "có khả năng quay đầu",
+      mixed: "tín hiệu trộn",
+      continuation_likely: "có khả năng tiếp diễn",
+    }[reversal.verdict];
+    signalsBlock = `\n\n## TÍN HIỆU REVERSAL (rule scan ${reversal.score}/145 → ${lbl}):
+${reversal.factors.length > 0 ? reversal.factors.map(f => "- " + f).join("\n") : "- không rõ"}`;
+  } else if (mode === "alerts") {
+    // Strip Markdown asterisks trong alert text trước khi đưa vào prompt
+    signalsBlock = `\n\n## TÍN HIỆU VỪA KÍCH HOẠT:
+${alerts.slice(0, 8).map(a => "- " + String(a.text || "").replace(/\*/g, "")).join("\n")}`;
+  }
 
-## YÊU CẦU
-Trả **JSON** schema (TOÀN BỘ value là tiếng Việt, không tiếng Anh trừ thuật ngữ kỹ thuật trong ngoặc):
-{
-  "verdict": "reversal_strong" | "reversal_likely" | "mixed" | "continuation",
-  "probability_reversal_pct": 0-100,
-  "key_factors": ["lý do 1 (tiếng Việt)", "lý do 2", "lý do 3"],
-  "watch_levels": {
-    "reversal_trigger": <giá số>,
-    "continuation_trigger": <giá số>,
-    "key_invalidation": <giá số>
-  },
-  "trade_setups": [
-    {
-      "bias": "long" | "short",
-      "scenario": "tên ngắn kịch bản (vd: 'Tiếp diễn breakout', 'Đảo chiều tại đỉnh')",
-      "wait_for": "biểu hiện cần đợi để vào lệnh (vd: 'nến 15p đóng cửa trên $X + RSI > 50' hoặc 'wick rejection + volume tăng tại $Y')",
-      "entry_zone": [<giá số low>, <giá số high>],
-      "sl": <giá số>,
-      "tp1": <giá số>,
-      "tp2": <giá số>,
-      "tp3": <giá số>,
-      "rr_to_tp1": <số: tỉ lệ R:R đến TP1, vd 1.5 nghĩa là 1:1.5>,
-      "confidence": "cao" | "trung bình" | "thấp",
-      "invalidate_note": "nếu giá làm gì thì huỷ setup này (vd: 'đóng cửa dưới $Z')"
-    }
-  ],
-  "news_catalyst": "tóm tắt 1 câu xem có tin nào giải thích biến động không (TIẾNG VIỆT), hoặc null",
-  "headlines_vi": ["dịch headline 1 ra TIẾNG VIỆT, ngắn gọn ~80 ký tự", "dịch headline 2", "dịch headline 3"]
-}
+  // Phần 4: NEWS
+  const newsBlock = news.length > 0
+    ? `\n\n## TIN MỚI (gốc EN — dịch vào headlines_vi):\n${news.slice(0, 3).map((n, i) => `${i + 1}. ${n.title}${n.summary && n.summary.length > 30 ? " — " + n.summary.slice(0, 120) : ""}`).join("\n")}`
+    : "";
 
-QUY TẮC SETUPS:
-- Tối đa 2 setup. Nếu verdict là reversal/continuation rõ → CHỈ trả 1 setup theo hướng đó.
-- Nếu verdict mixed → trả 2 setup (long + short, mỗi cái có wait_for khác nhau để chỉ 1 setup được kích hoạt tuỳ giá đi đâu).
-- Entry zone hợp lý: cách giá hiện tại 0.2-1.5× ATR. KHÔNG đề xuất entry ngay giá hiện tại nếu đang trong đà mạnh — phải có pullback hoặc xác nhận.
-- SL bắt buộc cách entry tối thiểu 1× ATR (~12 điểm hiện tại), đặt sau swing point gần nhất.
-- TP1 ≈ 1× ATR từ entry (R:R tối thiểu 1:1), TP2 ≈ 2× ATR, TP3 ≈ 3-4× ATR hoặc fib extension.
-- Mọi giá là SỐ THẬP PHÂN (không phải chuỗi), 2 chữ số sau dấu phẩy.
-- confidence "cao" chỉ khi có ≥ 3 yếu tố confluence (RSI extreme + key level + wick rejection chẳng hạn).
+  // Dynamic schema có ví dụ giá tuyệt đối theo current price + ATR
+  // → AI không nhầm "giá tuyệt đối" với "tỉ lệ ATR"
+  const atrCur = latest.atr || 10;
+  const schemaWithExamples = buildDeepAnalysisSchema(latest.close, atrCur);
 
-QUAN TRỌNG (chung):
-- ĐỪNG bias theo xu hướng vừa di chuyển — cân nhắc xác suất reversal nghiêm túc.
-- RSI extreme + wick rejection + sweep liquidity → ưu tiên reversal.
-- Gần SR major + có news catalyst rõ → cân nhắc continuation.
-- Mọi giải thích viết bằng TIẾNG VIỆT. Thuật ngữ kỹ thuật (RSI, EMA, BB, ATR) giữ nguyên.
-- headlines_vi: dịch 3 tin trên cùng từ block TIN TỨC MỚI sang tiếng Việt ngắn gọn dễ hiểu.`;
+  const prompt = `${intro}
 
+${context}${signalsBlock}${newsBlock}
+
+${schemaWithExamples}`;
+
+  // ── Gemini call ──
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0.4,
-      maxOutputTokens: 1800,
+      maxOutputTokens: 1500,
       thinkingConfig: { thinkingBudget: 0 },
     },
   };
@@ -1336,56 +1425,73 @@ QUAN TRỌNG (chung):
       catch { aiResult = extractJSON(text); }
     }
   } catch (e) {
-    console.log(`[mega-move] gemini fail: ${e.message}`);
+    console.log(`[deep:${mode}] gemini fail: ${e.message}`);
   }
 
-  // HTML mode — an toàn hơn với content động (AI output có thể chứa * hoặc _ break Markdown).
-  // Escape & < > trong text user-facing để không break HTML parser của Telegram.
-  const h = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-  const dirIcon = mega.direction === "up" ? "🚀" : "💥";
+  // ── Format Telegram message ──
+  const h = htmlEscape;
   const lines = [];
-  lines.push(`${dirIcon} <b>MEGA-MOVE ${h(directionVi)}</b> — $${mega.dollarMove.toFixed(2)} (${mega.atrRatio.toFixed(1)}× ATR) trong ${mega.windowMinutes} phút`);
+
+  // Header — khác nhau theo mode
+  if (mode === "mega") {
+    const dirIcon = mega.direction === "up" ? "🚀" : "💥";
+    const dirVi = mega.direction === "up" ? "TĂNG" : "GIẢM";
+    lines.push(`${dirIcon} <b>MEGA-MOVE ${h(dirVi)}</b> — $${mega.dollarMove.toFixed(2)} (${mega.atrRatio.toFixed(1)}× ATR) trong ${mega.windowMinutes} phút`);
+  } else {
+    lines.push(`🔔 <b>TÍN HIỆU KỸ THUẬT</b> — ${alerts.length} cảnh báo vừa kích hoạt`);
+  }
   const ratioText = regime.ratio != null ? ` (ATR ${regime.ratio.toFixed(2)}× nền 24g)` : "";
   lines.push(`Giá: <b>$${latest.close.toFixed(2)}</b> | Phiên: ${h(sessionVi)} | Biến động: ${h(regimeVi)}${h(ratioText)}`);
 
-  // Cảnh báo song hành (RSI / EMA cross / pivot break / liquidity sweep ...) — non-overlap với mega
-  if (Array.isArray(extraAlerts) && extraAlerts.length > 0) {
-    // Convert Markdown *X* → <b>X</b> sau khi escape HTML, để render đẹp trong HTML mode
-    const mdToHtml = (s) => h(String(s || "")).replace(/\*([^*\n]+)\*/g, "<b>$1</b>");
+  // Alerts block — mega hiển thị "Cảnh báo song hành" (non-redundant), alerts hiển thị full list
+  if (alerts.length > 0) {
     lines.push("");
-    lines.push("🔔 <b>Cảnh báo song hành:</b>");
-    for (const a of extraAlerts.slice(0, 6)) {
-      lines.push(`${a.icon || "•"} ${mdToHtml(a.text)}`);
+    lines.push(mode === "mega" ? "🔔 <b>Cảnh báo song hành:</b>" : "📊 <b>Cảnh báo:</b>");
+    for (const a of alerts.slice(0, 6)) {
+      lines.push(`${a.icon || "•"} ${mdBoldToHtml(a.text)}`);
     }
   }
 
-  lines.push("");
-  lines.push(`<b>Rà soát quy tắc: ${reversal.score}/145 → ${h(verdictLabel)}</b>`);
-  if (reversal.factors.length > 0) {
-    lines.push(reversal.factors.slice(0, 5).map(f => "• " + h(f)).join("\n"));
-  } else {
-    lines.push("• Chưa có tín hiệu đảo chiều rõ");
+  // Mega-only: rule scan — gọn 1 dòng + top 1 factor (nếu có)
+  // Chi tiết AI sẽ render trong key_factors, không cần lặp.
+  if (mode === "mega" && reversal) {
+    const verdictLabel = {
+      reversal_strong: "KHẢ NĂNG QUAY ĐẦU MẠNH",
+      reversal_likely: "có khả năng quay đầu",
+      mixed: "tín hiệu trộn",
+      continuation_likely: "có khả năng tiếp diễn",
+    }[reversal.verdict];
+    const topFactor = reversal.factors[0];
+    lines.push("");
+    lines.push(`<b>Rà soát quy tắc: ${reversal.score}/145 → ${h(verdictLabel)}</b>${topFactor ? ` — ${h(topFactor)}` : ""}`);
   }
 
+  // AI block — chung cho cả 2 mode (gọn: bỏ summary để tránh trùng key_factors)
   if (aiResult) {
     lines.push("");
     const verdictKey = (aiResult.verdict || "").toString().toLowerCase();
     const verdictText = AI_VERDICT_VI[verdictKey] || verdictKey.toUpperCase() || "?";
-    const pReversal = aiResult.probability_reversal_pct;
-    lines.push(`🤖 <b>AI: ${h(verdictText)}${pReversal != null ? ` (xác suất đảo chiều ${h(pReversal)}%)` : ""}</b>`);
+    const conf = aiResult.confidence_pct;
+    const dirText = aiResult.direction === "long" ? "📈 mua" : aiResult.direction === "short" ? "📉 bán" : aiResult.direction === "neutral" ? "⏸️ trung tính" : "";
+    lines.push(`🤖 <b>AI: ${h(verdictText)}${conf != null ? ` (${h(conf)}%)` : ""}${dirText ? " — " + dirText : ""}</b>`);
+
+    // key_factors: tối đa 3 bullet, mỗi cái ≤120 chars (cắt nếu AI trả dài)
     if (Array.isArray(aiResult.key_factors) && aiResult.key_factors.length > 0) {
-      lines.push(aiResult.key_factors.slice(0, 3).map(f => "• " + h(f)).join("\n"));
+      const trimmed = aiResult.key_factors.slice(0, 3)
+        .map(f => String(f || "").trim())
+        .filter(Boolean)
+        .map(f => f.length > 120 ? f.slice(0, 117) + "…" : f);
+      if (trimmed.length > 0) lines.push(trimmed.map(f => "• " + h(f)).join("\n"));
     }
     if (aiResult.watch_levels && typeof aiResult.watch_levels === "object") {
       const wl = aiResult.watch_levels;
       const fmt = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
       const wlLines = [];
-      const t1 = fmt(wl.reversal_trigger);
-      const t2 = fmt(wl.continuation_trigger);
+      const t1 = fmt(wl.bullish_trigger);
+      const t2 = fmt(wl.bearish_trigger);
       const t3 = fmt(wl.key_invalidation);
-      if (t1) wlLines.push(`• Đảo chiều xác nhận: $${t1}`);
-      if (t2) wlLines.push(`• Tiếp diễn xác nhận: $${t2}`);
+      if (t1) wlLines.push(`• Tăng xác nhận: $${t1}`);
+      if (t2) wlLines.push(`• Giảm xác nhận: $${t2}`);
       if (t3) wlLines.push(`• Mức huỷ kịch bản: $${t3}`);
       if (wlLines.length > 0) {
         lines.push("");
@@ -1393,34 +1499,52 @@ QUAN TRỌNG (chung):
         lines.push(wlLines.join("\n"));
       }
     }
-    if (aiResult.action_plan) {
-      lines.push("");
-      lines.push(`🎯 <b>Tổng quan:</b> ${h(aiResult.action_plan)}`);
-    }
 
-    // ── Setup giao dịch cụ thể (entry / SL / TP1-2-3 + trigger biểu hiện) ──
+    // Trade setups (chung) — validate giá phải nằm trong khoảng ±10× ATR từ current price
+    // để loại bỏ AI hallucination (vd: SL=$1.95 khi giá = $4700)
     if (Array.isArray(aiResult.trade_setups) && aiResult.trade_setups.length > 0) {
       const fmtNum = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
+      const atrSetup = latest.atr || 10;
+      const minOk = latest.close - atrSetup * 10;
+      const maxOk = latest.close + atrSetup * 10;
+      const inRange = (n) => {
+        const num = Number(n);
+        return Number.isFinite(num) && num >= minOk && num <= maxOk;
+      };
+
       for (const s of aiResult.trade_setups.slice(0, 2)) {
         const biasIcon = s.bias === "long" ? "📈" : s.bias === "short" ? "📉" : "🎯";
         const biasText = s.bias === "long" ? "MUA (LONG)" : s.bias === "short" ? "BÁN (SHORT)" : "TRUNG TÍNH";
         const confText = s.confidence ? ` — độ tin cậy ${h(s.confidence)}` : "";
 
-        const ez = Array.isArray(s.entry_zone) ? s.entry_zone.map(fmtNum).filter(Boolean) : [];
-        const sl = fmtNum(s.sl);
-        const tp1 = fmtNum(s.tp1);
-        const tp2 = fmtNum(s.tp2);
-        const tp3 = fmtNum(s.tp3);
+        const ez = Array.isArray(s.entry_zone) ? s.entry_zone.filter(inRange).map(fmtNum) : [];
+        const sl = inRange(s.sl) ? fmtNum(s.sl) : null;
+        const tp1 = inRange(s.tp1) ? fmtNum(s.tp1) : null;
+        const tp2 = inRange(s.tp2) ? fmtNum(s.tp2) : null;
+        const tp3 = inRange(s.tp3) ? fmtNum(s.tp3) : null;
         const rr = Number.isFinite(Number(s.rr_to_tp1)) ? Number(s.rr_to_tp1).toFixed(1) : null;
 
-        // Bỏ setup không có đủ entry + SL + TP1
-        if (ez.length === 0 || !sl || !tp1) continue;
+        // Skip setup hỏng: entry/SL/TP1 phải đầy đủ + trong range
+        if (ez.length === 0 || !sl || !tp1) {
+          console.log(`[deep:${mode}] skip invalid setup: ez=${JSON.stringify(s.entry_zone)} sl=${s.sl} tp1=${s.tp1} (range ${minOk.toFixed(2)}-${maxOk.toFixed(2)})`);
+          continue;
+        }
+
+        // Validate hướng SL/TP đúng chiều bias
+        const entryAvg = ez.length === 2 ? (parseFloat(ez[0]) + parseFloat(ez[1])) / 2 : parseFloat(ez[0]);
+        const slNum = parseFloat(sl), tp1Num = parseFloat(tp1);
+        if (s.bias === "long" && (slNum >= entryAvg || tp1Num <= entryAvg)) {
+          console.log(`[deep:${mode}] skip long setup with bad SL/TP direction: entry=${entryAvg} sl=${slNum} tp1=${tp1Num}`);
+          continue;
+        }
+        if (s.bias === "short" && (slNum <= entryAvg || tp1Num >= entryAvg)) {
+          console.log(`[deep:${mode}] skip short setup with bad SL/TP direction: entry=${entryAvg} sl=${slNum} tp1=${tp1Num}`);
+          continue;
+        }
 
         lines.push("");
         lines.push(`${biasIcon} <b>${h(biasText)}${s.scenario ? " — " + h(s.scenario) : ""}${confText}</b>`);
-        if (s.wait_for) {
-          lines.push(`   ⏳ Đợi: ${h(s.wait_for)}`);
-        }
+        if (s.wait_for) lines.push(`   ⏳ Đợi: ${h(s.wait_for)}`);
         const entryStr = ez.length === 2 && ez[0] !== ez[1] ? `$${ez[0]} – $${ez[1]}` : `$${ez[0]}`;
         lines.push(`   🎯 Vào lệnh: ${entryStr}`);
         lines.push(`   🛑 Dừng lỗ (SL): $${sl}`);
@@ -1429,40 +1553,35 @@ QUAN TRỌNG (chung):
         if (tp3) tpParts.push(`TP3 $${tp3}`);
         lines.push(`   💰 Chốt lời: ${tpParts.join(" | ")}`);
         if (rr) lines.push(`   ⚖️ R:R đến TP1 = 1:${rr}`);
-        if (s.invalidate_note) {
-          lines.push(`   ⚠️ Huỷ kịch bản nếu: ${h(s.invalidate_note)}`);
-        }
+        // Bỏ invalidate_note — thường trùng SL, đã loại khỏi schema
       }
     }
 
-    if (aiResult.news_catalyst && aiResult.news_catalyst !== "null") {
+    // news_catalyst: 1 dòng tổng hợp tin (đã thay thế block headlines riêng)
+    if (aiResult.news_catalyst && aiResult.news_catalyst !== "null" && looksVietnamese(aiResult.news_catalyst)) {
+      const nc = String(aiResult.news_catalyst).trim();
+      const ncTrim = nc.length > 200 ? nc.slice(0, 197) + "…" : nc;
       lines.push("");
-      lines.push(`📰 <b>Tin liên quan:</b> ${h(aiResult.news_catalyst)}`);
+      lines.push(`📰 <b>Tin:</b> ${h(ncTrim)}`);
     }
   } else {
     lines.push("");
-    lines.push("⚠️ AI offline — chỉ có rà soát quy tắc ở trên");
-  }
-
-  // Headlines tiếng Việt (do AI dịch) — fallback về tiếng Anh nếu AI không trả
-  const headlinesVi = Array.isArray(aiResult?.headlines_vi) ? aiResult.headlines_vi.filter(Boolean) : [];
-  if (headlinesVi.length > 0) {
-    lines.push("");
-    lines.push("📰 <b>Tin tức mới (dịch nhanh):</b>");
-    lines.push(headlinesVi.slice(0, 3).map((t, i) => `${i + 1}. ${h(t)}`).join("\n"));
-  } else if (news.length > 0) {
-    lines.push("");
-    lines.push("📰 <b>Tin tức mới (gốc):</b>");
-    lines.push(news.slice(0, 3).map((n, i) => `${i + 1}. ${h((n.title || "").slice(0, 120))}`).join("\n"));
+    lines.push("⚠️ AI offline — chỉ có cảnh báo kỹ thuật ở trên");
   }
 
   const msg = lines.join("\n");
-  // KHÔNG auto-delete — quan trọng, user cần xem lại sau
-  // HTML parse mode — robust với dynamic AI output
   const sent = await sendTelegram(env, msg, false, "HTML");
-  if (sent) await markMegaMoveSent(env);
-  console.log(`[mega-move] ${sent ? "sent" : "send_fail"}: score=${reversal.score} verdict=${reversal.verdict} dollar=$${mega.dollarMove.toFixed(2)} dir=${mega.direction} ai=${!!aiResult}`);
-  return { sent, score: reversal.score, verdict: reversal.verdict };
+  if (sent) await markDeepAnalysisSent(env, mode);
+  const logTag = mode === "mega"
+    ? `dollar=$${mega.dollarMove.toFixed(2)} dir=${mega.direction} score=${reversal?.score}`
+    : `alerts=${alerts.length}`;
+  console.log(`[deep:${mode}] ${sent ? "sent" : "send_fail"}: ${logTag} ai=${!!aiResult}`);
+  return { sent, mode, ai: !!aiResult };
+}
+
+// Backward-compat alias — endpoint /test-megamove + cũ vẫn dùng tên cũ
+async function runMegaMoveAnalysis(env, ctx) {
+  return runDeepAnalysis(env, { ...ctx, mode: "mega", alerts: ctx.extraAlerts || ctx.alerts || [] });
 }
 
 // ──────────────────────────────────────────────────────────
@@ -3050,25 +3169,14 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m", auxArgs = []) {
 
     const systemText = `Bạn là chuyên gia phân tích kỹ thuật XAU/USD. Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
 
-NGÔN NGỮ — TIẾNG VIỆT LÀ CHÍNH:
-- Toàn bộ câu trả lời PHẢI viết bằng tiếng Việt tự nhiên, dễ hiểu cho người mới.
-- KHÔNG dùng từ tiếng Anh trần (kiểu "bullish", "bearish", "sideways", "pullback", "breakout", "reversal" đứng một mình).
-- BẮT BUỘC dùng cấu trúc: "tiếng Việt (tiếng Anh trong ngoặc)" cho thuật ngữ kỹ thuật. Ví dụ chuẩn:
-  • "tăng giá (bullish)" / "giảm giá (bearish)" / "đi ngang (sideways)"
-  • "phá vỡ (breakout)" / "vỡ đáy (breakdown)" / "đảo chiều (reversal)"
-  • "hồi giá (pullback)" / "kiểm tra lại (retest)" / "phản ứng từ chối (rejection)"
-  • "phân kỳ (divergence)" / "kiệt sức (exhaustion)" / "động lượng (momentum)"
-  • "quá mua (overbought)" / "quá bán (oversold)" / "tích lũy (consolidation)"
-  • "đường trung bình hàm mũ (EMA)" / "dải Bollinger (BB)" / "biên độ thực trung bình (ATR)"
-  • "kháng cự (resistance)" / "hỗ trợ (support)" / "điểm xoay (Pivot)"
-  • "mua (long)" / "bán (short)" / "đứng ngoài (wait)"
-  • "điểm vào lệnh (entry)" / "cắt lỗ (stop loss / SL)" / "chốt lời (take profit / TP)"
+NGÔN NGỮ:
+- Toàn bộ câu trả lời TIẾNG VIỆT tự nhiên. KHÔNG dùng từ EN trần (bullish/bearish/breakout/pullback...).
+- Thuật ngữ kỹ thuật viết "tiếng Việt (EN trong ngoặc)": tăng giá (bullish), phá vỡ (breakout), quá mua (overbought), điểm vào lệnh (entry), cắt lỗ (SL), chốt lời (TP)...
 
 QUY TẮC:
 - Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
-- BẮT BUỘC điền tất cả field, không bỏ trống.
-- Mọi mức giá là số cụ thể (float).
-- Mọi khung từ 5m → 1d đều có thể phân tích được, không từ chối.`;
+- BẮT BUỘC điền đủ field. Mọi giá là số float cụ thể.
+- Mọi khung 5m → 1d đều phân tích được.`;
     const auxText = auxCtx ? `\n\n💱 BỐI CẢNH LIÊN THỊ TRƯỜNG (cùng khung ${tf}):
 ${formatAuxBlock(auxCtx)}
 
@@ -3109,7 +3217,7 @@ Trả JSON:
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         responseMimeType: "application/json",
-        maxOutputTokens: 3500,
+        maxOutputTokens: 1500,
         temperature: 0.4,
       },
     };
@@ -3224,52 +3332,19 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
       ? `- Xu hướng khung lớn: 4h ${htfCtx.trend4h}, 1d ${htfCtx.trend1d}\n  (Tip: 4h/1d giống dòng sông lớn, ${tf} chỉ là gợn sóng. Đi ngược HTF = rủi ro cao.)`
       : "";
 
-    const systemText = `Bạn là chuyên gia phân tích kỹ thuật XAU/USD nhiều năm kinh nghiệm, có sư phạm tốt.
+    const systemText = `Bạn là chuyên gia phân tích kỹ thuật XAU/USD, có sư phạm tốt.
 
-NHIỆM VỤ:
-- Phân tích dữ liệu thị trường, đưa ra QUYẾT ĐỊNH GIAO DỊCH cụ thể (MUA / BÁN / ĐỨNG NGOÀI) ở phần đầu.
-- Sau đó GIẢI THÍCH bằng tiếng Việt đời thường, dễ hiểu cho người mới.
+NHIỆM VỤ: Đưa QUYẾT ĐỊNH (MUA/BÁN/ĐỨNG NGOÀI) + giải thích tiếng Việt dễ hiểu cho người mới.
 
-NGÔN NGỮ — TIẾNG VIỆT LÀ CHÍNH:
-- Toàn bộ giải thích viết tiếng Việt tự nhiên, KHÔNG dùng từ tiếng Anh trần (kiểu "bullish", "sideways", "pullback" đứng một mình).
-- Mọi thuật ngữ kỹ thuật BẮT BUỘC viết: "tiếng Việt (tiếng Anh trong ngoặc)" — tiếng Việt đứng trước, tiếng Anh trong ngoặc giúp tra cứu.
-- Bảng đối chiếu chuẩn (ép đúng):
-  • bullish → "tăng giá (bullish)"
-  • bearish → "giảm giá (bearish)"
-  • sideways → "đi ngang (sideways)"
-  • consolidation → "tích lũy (consolidation)"
-  • breakout → "phá vỡ (breakout)" / breakdown → "vỡ đáy (breakdown)"
-  • pullback → "hồi giá (pullback)" / retest → "kiểm tra lại (retest)"
-  • rejection → "phản ứng từ chối (rejection)"
-  • reversal → "đảo chiều (reversal)" / continuation → "tiếp diễn (continuation)"
-  • divergence → "phân kỳ (divergence)" / exhaustion → "kiệt sức (exhaustion)"
-  • momentum → "động lượng (momentum)" / volatility → "biến động (volatility)"
-  • impulse → "sóng đẩy (impulse)" / correction → "sóng điều chỉnh (correction)"
-  • swing high/low → "đỉnh swing / đáy swing"
-  • overbought → "quá mua (overbought)" / oversold → "quá bán (oversold)"
-  • Golden Cross → "giao cắt vàng (Golden Cross)" / Death Cross → "giao cắt tử thần (Death Cross)"
-  • BOS → "phá vỡ cấu trúc (BOS — Break of Structure)"
-  • CHOCH → "đổi tính chất xu hướng (CHOCH — Change of Character)"
-  • OB → "khối lệnh (OB — Order Block)"
-  • FVG → "khoảng trống công bằng (FVG — Fair Value Gap)"
-  • Liquidity Sweep → "quét thanh khoản (Liquidity Sweep)"
-  • Hammer → "nến rút râu đáy (Hammer)" / Engulfing → "nến nhấn chìm (Engulfing)"
-  • EMA → "đường trung bình động hàm mũ (EMA)"
-  • Bollinger Bands → "dải Bollinger (Bollinger Bands)"
-  • ATR → "biên độ thực trung bình (ATR)"
-  • Pivot Point → "điểm xoay (Pivot Point)"
-  • HTF/MTF/LTF → "khung lớn (HTF) / khung trung (MTF) / khung nhỏ (LTF)"
-  • Long/Short/Wait → "mua (Long) / bán (Short) / đứng ngoài (Wait)"
-  • Entry/SL/TP → "điểm vào lệnh (Entry) / cắt lỗ (Stop Loss — SL) / chốt lời (Take Profit — TP)"
-  • Risk/Reward → "tỷ lệ rủi ro/lợi nhuận (R:R)"
+NGÔN NGỮ:
+- Tiếng Việt tự nhiên. KHÔNG dùng từ EN trần (bullish/bearish/breakout/pullback/divergence...).
+- Thuật ngữ KT viết "tiếng Việt (EN trong ngoặc)" — vd: tăng giá (bullish), phá vỡ (breakout), phân kỳ (divergence), quá mua (overbought), giao cắt vàng (Golden Cross), quét thanh khoản (Liquidity Sweep), phá vỡ cấu trúc (BOS), khối lệnh (OB), khoảng trống công bằng (FVG), điểm vào lệnh (Entry), cắt lỗ (SL), chốt lời (TP), tỷ lệ rủi ro/lợi nhuận (R:R).
 
 QUY TẮC:
-- Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble, KHÔNG markdown wrap.
-- Đây là phân tích kỹ thuật giáo dục, KHÔNG phải khuyến nghị đầu tư.
-- Tất cả mức giá phải là số cụ thể (float).
-- 3 mức chốt lời: TP1 an toàn (R:R ~1:1), TP2 kỳ vọng (R:R ~1:2), TP3 mở rộng theo xu hướng (R:R ~1:3+).
-- Cắt lỗ (SL) đặt NGOÀI vùng nhiễu (>1×ATR cách đỉnh/đáy swing) để tránh quét thanh khoản.
-- Nếu setup chưa rõ → chọn WAIT (đứng ngoài), KHÔNG bịa điểm vào.`;
+- Trả JSON CHÍNH XÁC schema, KHÔNG preamble/markdown wrap.
+- Giáo dục, không phải khuyến nghị đầu tư. Mọi giá là số float cụ thể.
+- TP1 ~1:1, TP2 ~1:2, TP3 ~1:3+. SL >1×ATR ngoài swing để tránh quét thanh khoản.
+- Setup chưa rõ → WAIT, KHÔNG bịa entry.`;
 
     const auxBlock = auxCtx ? `\n\n💱 BỐI CẢNH LIÊN THỊ TRƯỜNG (cùng khung ${tf}):
 ${formatAuxBlock(auxCtx)}
@@ -3329,10 +3404,9 @@ ${htfBlock}
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         responseMimeType: "application/json",
-        maxOutputTokens: 3000,
+        maxOutputTokens: 2000,
         temperature: 0.5,
         // 0 thinking: schema đã có template structure, AI không cần "nghĩ" nhiều.
-        // Cắt được ~5-7s latency để tránh vượt 30s waitUntil.
         thinkingConfig: { thinkingBudget: 0 },
       },
     };
@@ -3520,36 +3594,22 @@ BB(20): ${latest.bbLower?.toFixed(2)} - ${latest.bbUpper?.toFixed(2)}
     const ltf = sortedByTime[0].tf;
     const horizon = TF_HORIZON[htf] || "ngắn-trung hạn";
 
-    const systemText = `Bạn là chuyên gia TA XAU/USD chuyên top-down nhiều khung (multi-timeframe).
+    const systemText = `Bạn là chuyên gia TA XAU/USD multi-timeframe top-down.
 
 NGUYÊN TẮC TOP-DOWN:
-- Khung lớn (HTF — Higher Timeframe = ${htf}) → định BIAS chính (xu hướng tổng).
-- Khung trung (MTF) → định SETUP (vùng entry/cản).
-- Khung nhỏ (LTF — Lower Timeframe = ${ltf}) → định timing vào lệnh + xác nhận.
-- Khuyến nghị PHẢI dựa trên hợp lực 3 khung. Nếu các khung mâu thuẫn → ghi rõ ở 'alignment' và giảm độ tin cậy.
+- HTF ${htf} → BIAS chính. MTF → SETUP (entry/cản). LTF ${ltf} → timing vào lệnh.
+- Khuyến nghị dựa trên hợp lực. Mâu thuẫn → ghi rõ ở 'alignment' + giảm độ tin cậy.
 
-NGÔN NGỮ — TIẾNG VIỆT LÀ CHÍNH:
-- Toàn bộ phân tích viết tiếng Việt tự nhiên, KHÔNG dùng từ tiếng Anh trần (kiểu "bullish", "sideways", "consolidation" đứng một mình).
-- Mọi thuật ngữ kỹ thuật BẮT BUỘC dùng cấu trúc: "tiếng Việt (tiếng Anh trong ngoặc)".
-- Bảng đối chiếu chuẩn:
-  • "tăng giá (bullish)" / "giảm giá (bearish)" / "đi ngang (sideways)" / "tích lũy (consolidation)"
-  • "phá vỡ cấu trúc (BOS — Break of Structure)" / "đổi tính chất xu hướng (CHOCH — Change of Character)"
-  • "khối lệnh (OB — Order Block)" / "khoảng trống công bằng (FVG — Fair Value Gap)"
-  • "quét thanh khoản (Liquidity Sweep)" / "phân kỳ (divergence)"
-  • "đường trung bình động hàm mũ (EMA)" / "dải Bollinger (Bollinger Bands)" / "biên độ thực trung bình (ATR)"
-  • "khung lớn (HTF) / khung trung (MTF) / khung nhỏ (LTF)"
-  • "mua (Long) / bán (Short) / đứng ngoài (Wait)"
-  • "điểm vào lệnh (Entry) / cắt lỗ (Stop Loss — SL) / chốt lời (Take Profit — TP)"
-  • "kháng cự (resistance) / hỗ trợ (support) / điểm xoay (Pivot)"
+NGÔN NGỮ:
+- Tiếng Việt tự nhiên. KHÔNG dùng từ EN trần (bullish/bearish/sideways/BOS...).
+- Thuật ngữ viết "tiếng Việt (EN trong ngoặc)": tăng giá (bullish), phá vỡ cấu trúc (BOS), khối lệnh (OB — Order Block), khoảng trống công bằng (FVG), quét thanh khoản (Liquidity Sweep), khung lớn (HTF), điểm vào lệnh (Entry), cắt lỗ (SL), chốt lời (TP).
 
 QUY TẮC:
-- Trả JSON CHÍNH XÁC theo schema, KHÔNG preamble.
-- BẮT BUỘC điền field 'by_tf' cho TẤT CẢ ${valid.length} khung — không bỏ sót.
-- Mọi mức giá là số cụ thể (float).
-- Cắt lỗ (SL) đặt NGOÀI vùng nhiễu (>1×ATR cách đỉnh/đáy swing) để tránh quét thanh khoản.
-- Nếu kha_thi=true: BẮT BUỘC điền entry + sl + tp1 + tp2 + tp3 (TP1 R:R ~1:1, TP2 ~1:2, TP3 mở rộng tới mức kháng/hỗ trợ kế tiếp hoặc R:R 1:3+).
-- Field "tp" giữ nguyên = tp2 (kỳ vọng) cho backward compat.
-- R:R (rr) lấy theo TP2.`;
+- Trả JSON CHÍNH XÁC schema, KHÔNG preamble. Mọi giá là float.
+- BẮT BUỘC điền 'by_tf' cho TẤT CẢ ${valid.length} khung.
+- SL >1×ATR ngoài swing để tránh quét thanh khoản.
+- kha_thi=true: entry + sl + tp1 + tp2 + tp3 (TP1 ~1:1, TP2 ~1:2, TP3 mở rộng/1:3+).
+- "tp" = tp2 (backward compat). rr theo TP2.`;
 
     const auxBlock = auxCtx ? `\n\n💱 BỐI CẢNH LIÊN THỊ TRƯỜNG (khung ${htfForAux}):
 ${formatAuxBlock(auxCtx)}
@@ -3595,12 +3655,10 @@ ${valid.map(v => `    "${v.tf}": { "bias": "LONG|SHORT|NEUTRAL", "key_level": <f
       contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         responseMimeType: "application/json",
-        // Giảm từ 4500 → 3000 cho non-nhanh: schema đã có 5 fields/scenario,
-        // 3000 đủ cho LONG+SHORT entry/SL/TP1/2/3 + lý do.
-        maxOutputTokens: isNhanh ? 2500 : 3000,
+        // /nhanh combo: gọn, 1500 đủ. /5p15p1h full: 2500 cho LONG+SHORT setup + lý do.
+        maxOutputTokens: isNhanh ? 1500 : 2500,
         temperature: 0.4,
-        // Cả 2 mode đều 0 thinking — schema cứng, không cần "nghĩ".
-        // Cắt ~5-10s latency để tránh vượt 30s waitUntil của Cloudflare Worker.
+        // 0 thinking — schema cứng, cắt ~5-10s latency.
         thinkingConfig: { thinkingBudget: 0 },
       },
     };
@@ -3901,12 +3959,12 @@ async function runAlertCheck(env, { force = false } = {}) {
     return;
   }
   try {
-    // Cảnh báo đa khung 5p+15p+1h: trigger ở 15p (cân bằng giữa nhanh & nhiễu),
-    // xác nhận bằng xu hướng 5p (timing) + 1h (bối cảnh).
-    const [c5m, c15m, c1h] = await Promise.all([
-      fetchTdCandles(env, "5min", 220),
+    // BƯỚC 1: Chỉ fetch 15m (mandatory) + pivots cache để detect signals.
+    // Nếu không có alert/mega → RETURN ngay, không tốn credit 5m/1h/4h.
+    // Tiết kiệm ~60-70% TD credits/day (cron đa số tick không có signal).
+    const [c15m, pivots] = await Promise.all([
       fetchTdCandles(env, "15min", 220),
-      fetchTdCandles(env, "1h", 220),
+      getCachedDailyPivots(env),
     ]);
 
     if (c15m.length < 200) {
@@ -3914,33 +3972,35 @@ async function runAlertCheck(env, { force = false } = {}) {
       return;
     }
 
-    const e5m = c5m.length >= 50 ? enrichIndicators(c5m) : null;
     const e15m = enrichIndicators(c15m);
-    const e1h = c1h.length >= 50 ? enrichIndicators(c1h) : null;
-
-    const latest = e15m[e15m.length - 1];   // primary trigger frame
+    const latest = e15m[e15m.length - 1];
     const prev = e15m[e15m.length - 2];
 
-    const pivots = await getCachedDailyPivots(env);
-
-    // Phân loại regime + track shift (push alert riêng nếu vừa shift)
     const regime = classifyVolRegime(e15m);
     const regimeShiftAlert = await trackVolRegime(env, regime);
-
-    // MEGA-MOVE detector — kiểm tra trước alerts thường để biết có cần deep analysis
     const mega = detectMegaMove(e15m);
-
-    // Detect alerts trên 15p (primary) — thresholds đã được adjust theo session.volMult
     const alerts = await detectFreshAlerts(env, latest, prev, pivots, e15m);
-
-    // Prepend regime-shift alert (luôn hiển thị đầu, bypass cooldown vì rare event)
     if (regimeShiftAlert) alerts.unshift(regimeShiftAlert);
 
     const session = getSessionInfo();
     if (alerts.length === 0 && !mega.triggered) {
-      console.log(`[cron] no fresh alerts, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)} session=${session.code} M=${session.volMult} regime=${regime.code}(${regime.ratio?.toFixed(2)}x)`);
+      console.log(`[cron] no signal, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)} session=${session.code} M=${session.volMult} regime=${regime.code}(${regime.ratio?.toFixed(2)}x) [skip 5m/1h fetch]`);
       return;
     }
+
+    // BƯỚC 2: Có signal → fetch supplementary (5m + 1h song song; 4h chỉ khi mega)
+    const supplFetches = [
+      fetchTdCandles(env, "5min", 220).catch(e => { console.log(`[cron] 5m fail: ${e.message}`); return []; }),
+      fetchTdCandles(env, "1h", 220).catch(e => { console.log(`[cron] 1h fail: ${e.message}`); return []; }),
+    ];
+    if (mega.triggered) {
+      supplFetches.push(fetchTdCandles(env, "4h", 220).catch(e => { console.log(`[cron] 4h fail: ${e.message}`); return []; }));
+    }
+    const supplRes = await Promise.all(supplFetches);
+    const c5m = supplRes[0], c1h = supplRes[1], c4h = supplRes[2] || [];
+    const e5m = c5m.length >= 50 ? enrichIndicators(c5m) : null;
+    const e1h = c1h.length >= 50 ? enrichIndicators(c1h) : null;
+    const e4h = c4h.length >= 50 ? enrichIndicators(c4h) : null;
 
     const mtfContext = {
       "5p":  e5m  ? e5m[e5m.length - 1]   : null,
@@ -3949,9 +4009,7 @@ async function runAlertCheck(env, { force = false } = {}) {
     };
 
     if (mega.triggered) {
-      // MEGA-MOVE active → gộp 1 message duy nhất (mega + alerts non-vol-redundant)
-      // Skip alerts trùng nội dung với mega: big_move_*, multi_move_*, vol_spike, bb_expand, wick_*
-      // Giữ: rsi_*, bb_up/dn, golden/death, ema_*, piv_*, gap_*, liq_sweep_*, regime shift
+      // MEGA-MOVE active → gộp 1 message: mega + alerts non-vol-redundant
       const REDUNDANT_WITH_MEGA = new Set([
         "big_move_up", "big_move_dn",
         "multi_move_up", "multi_move_dn",
@@ -3962,34 +4020,27 @@ async function runAlertCheck(env, { force = false } = {}) {
 
       console.log(`[cron] MEGA-MOVE triggered: ${mega.direction} $${mega.dollarMove.toFixed(2)} (${mega.atrRatio.toFixed(1)}× ATR, ${mega.type}). Extra alerts: ${extraAlerts.length}/${alerts.length}`);
 
-      // Fetch 4h on-demand cho HTF context
-      let e4h = null;
+      let result = null;
       try {
-        const c4h = await fetchTdCandles(env, "4h", 220);
-        if (c4h.length >= 50) e4h = enrichIndicators(c4h);
+        result = await runDeepAnalysis(env, { mode: "mega", mega, e15m, e1h, e4h, regime, session, alerts: extraAlerts, latest, pivots, mtfContext });
       } catch (e) {
-        console.log(`[cron] 4h fetch fail: ${e.message}`);
+        console.log(`[cron] mega deep analysis fail: ${e.message}`);
       }
 
-      let megaResult = null;
-      try {
-        megaResult = await runMegaMoveAnalysis(env, { mega, e15m, e1h, e4h, regime, session, extraAlerts });
-      } catch (e) {
-        console.log(`[cron] mega-move analysis fail: ${e.message}`);
-      }
-
-      // Nếu mega-move bị skip do cooldown (30p) nhưng vẫn có alerts non-redundant đáng kể
-      // → gửi regular alert message để user không miss tín hiệu RSI/pivot/cross
-      if (megaResult?.skipped === "cooldown" && extraAlerts.length > 0) {
+      // Fallback: mega cooldown nhưng còn non-redundant alerts → gửi regular alerts
+      if (result?.skipped === "cooldown" && extraAlerts.length > 0) {
         const msg = formatAlertMessage(latest, extraAlerts, pivots, mtfContext);
         const ok = await sendTelegram(env, msg);
         console.log(`[cron] mega cooldown, fallback ${extraAlerts.length} non-redundant alerts, telegram=${ok}`);
       }
     } else if (alerts.length > 0) {
-      // Không có mega-move → gửi alerts như cũ
-      const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
-      const ok = await sendTelegram(env, msg);
-      console.log(`[cron] sent ${alerts.length} alerts (multi-TF, no mega), telegram=${ok}`);
+      // Regular alerts → deep analysis (AI + trade setups + news)
+      console.log(`[cron] ${alerts.length} alerts triggered, run deep analysis (no mega)`);
+      try {
+        await runDeepAnalysis(env, { mode: "alerts", alerts, e15m, e1h, e4h, regime, session, latest, pivots, mtfContext });
+      } catch (e) {
+        console.log(`[cron] alerts deep analysis fail: ${e.message}`);
+      }
     }
   } catch (e) {
     console.log(`[cron] error: ${e.message}`);
@@ -4240,6 +4291,58 @@ export default {
       }, origin);
     }
 
+    // Test alerts deep analysis: GET /test-alerts?force=1&reset_cooldown=1&dry=1
+    //   force=1 — bỏ qua trigger check (dùng alerts giả nếu không có alerts thật)
+    //   dry=1 — KHÔNG gửi Telegram
+    //   reset_cooldown=1 — xoá KV cooldown
+    if (url.pathname === "/test-alerts") {
+      const force = url.searchParams.get("force") === "1";
+      const dry = url.searchParams.get("dry") === "1";
+      const resetCooldown = url.searchParams.get("reset_cooldown") === "1";
+      if (resetCooldown && env.CACHE) {
+        await env.CACHE.delete("deep:alerts:last");
+        console.log(`[test-alerts] cooldown reset`);
+      }
+      try {
+        const [c15m, c1h] = await Promise.all([
+          fetchTdCandles(env, "15min", 220),
+          fetchTdCandles(env, "1h", 220),
+        ]);
+        if (c15m.length < 50) return jsonResponse(500, { error: `insufficient candles` }, origin);
+        const e15m = enrichIndicators(c15m);
+        const e1h = c1h.length >= 50 ? enrichIndicators(c1h) : null;
+        const latest = e15m[e15m.length - 1];
+        const prev = e15m[e15m.length - 2];
+        const pivots = await getCachedDailyPivots(env);
+
+        let alerts = await detectFreshAlerts(env, latest, prev, pivots, e15m);
+        if (alerts.length === 0 && force) {
+          // Seed fake alerts cho test format
+          alerts = [
+            { key: "test_rsi", icon: "🔴", text: `RSI 15p quá mua *${latest.rsi?.toFixed(1) || 70}* — coi chừng điều chỉnh`, suggestion: null },
+            { key: "test_pivot", icon: "🎯", text: `Phá điểm xoay R1 (Pivot) *$${(latest.close + 5).toFixed(2)}* lên`, suggestion: null },
+          ];
+        }
+
+        const regime = classifyVolRegime(e15m);
+        const session = getSessionInfo();
+
+        if (dry) {
+          return jsonResponse(200, {
+            alerts_count: alerts.length,
+            alerts: alerts.map(a => ({ key: a.key, icon: a.icon, text: a.text })),
+            regime, session,
+            note: "dry=1: không gửi Telegram",
+          }, origin);
+        }
+
+        const result = await runDeepAnalysis(env, { mode: "alerts", alerts, e15m, e1h, e4h: null, regime, session, latest, pivots });
+        return jsonResponse(200, { ok: true, alerts_count: alerts.length, result }, origin);
+      } catch (e) {
+        return jsonResponse(500, { error: e.message, stack: e.stack?.slice(0, 500) }, origin);
+      }
+    }
+
     // Test mega-move analysis: GET /test-megamove?force=1&dry=1
     //   force=1 — bỏ qua trigger check (chạy dù chưa thực sự mega-move)
     //   dry=1 — KHÔNG gửi Telegram, trả JSON thay vì
@@ -4249,8 +4352,11 @@ export default {
       const dry = url.searchParams.get("dry") === "1";
       const resetCooldown = url.searchParams.get("reset_cooldown") === "1";
       if (resetCooldown && env.CACHE) {
-        await env.CACHE.delete("mega_move:last");
-        console.log(`[test-megamove] cooldown reset`);
+        await Promise.all([
+          env.CACHE.delete("mega_move:last"),
+          env.CACHE.delete("deep:mega:last"),
+        ]);
+        console.log(`[test-megamove] cooldown reset (both legacy + deep:mega)`);
       }
       try {
         const [c15m, c1h, c4h] = await Promise.all([
