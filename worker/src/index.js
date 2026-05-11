@@ -3260,40 +3260,73 @@ Phân tích theo format đã quy định. ${currentPrice != null ? "DÙNG GIÁ $
         return `${i + 1}.${tag} [${n.source} ${formatTimeAgo(n.ts)}] ${n.title}${n.summary ? `\n   ${n.summary.slice(0, 180)}` : ""}`;
       }).join("\n");
 
+      // Lịch event thật từ finnhub (tuần tới) — tránh AI bịa ngày
+      const calEvents = await fetchEconomicCalendar(env).catch(() => []);
+      const nowTs = Date.now();
+      const upcomingEvents = calEvents
+        .filter(e => e.ts > nowTs && e.ts < nowTs + 7 * 86400 * 1000)
+        .sort((a, b) => a.ts - b.ts)
+        .slice(0, 6);
+      const calBlock = upcomingEvents.length > 0
+        ? upcomingEvents.map(e => {
+            const dateVn = new Date(e.ts).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false });
+            const fc = e.forecast ? ` | Dự báo ${e.forecast}` : "";
+            const pv = e.previous ? ` | Lần trước ${e.previous}` : "";
+            return `- ${e.title}: ${dateVn} (giờ VN)${fc}${pv}`;
+          }).join("\n")
+        : "(Không có event high-impact nào sắp tới trong lịch.)";
+
       systemText = `Bạn là chuyên gia phân tích tin tức macro & tác động lên XAU/USD.
 
 NHIỆM VỤ:
-- Tổng hợp 3-5 chủ đề chính từ tin tức 7 ngày
-- Highlight catalysts mạnh sắp tới (NFP, CPI, FOMC, Fed speech...)
-- Dự đoán phản ứng XAU + đề xuất tiếp cận
+- Tổng hợp 3-5 chủ đề chính TỪ TIN ĐƯỢC CUNG CẤP (không dùng kiến thức cũ).
+- Catalysts sắp tới CHỈ TỪ DANH SÁCH LỊCH ECONOMIC EVENTS được cung cấp — KHÔNG bịa ngày/giờ.
+- Vùng giá dự báo CHỈ DÙNG GIÁ HIỆN TẠI ± biên độ hợp lý — KHÔNG dùng giá lịch sử ($1.800/$2.000 etc).
+- KHÔNG khuyến nghị mua/bán cụ thể.
 
 NGÔN NGỮ — bilingual:
-- "tăng giá (bullish)" / "giảm giá (bearish)"
-- "Số liệu việc làm Mỹ (NFP)" / "Chỉ số giá tiêu dùng (CPI)"
-- "Quyết định lãi suất (Rate Decision)"
-- "diều hâu (hawkish)" / "bồ câu (dovish)"
+- "tăng giá (bullish)" / "giảm giá (bearish)" / "diều hâu (hawkish)" / "bồ câu (dovish)"
+- "Số liệu việc làm Mỹ (NFP)" / "Chỉ số giá tiêu dùng (CPI)" / "Quyết định lãi suất (Rate Decision)"
 
-NGUYÊN TẮC: tin USD tích cực → DXY ↑ → XAU ↓; tin USD tiêu cực → DXY ↓ → XAU ↑.
-KHÔNG khuyến nghị mua/bán cụ thể.
+NGUYÊN TẮC tương quan:
+- USD ↑ (NFP/CPI cao, hawkish Fed) → XAU ↓
+- USD ↓ (NFP/CPI thấp, dovish Fed) → XAU ↑
+- Risk-off (chiến tranh, suy thoái) → XAU ↑ (safe-haven)
 
-FORMAT MARKDOWN.`;
+QUY TẮC TUYỆT ĐỐI:
+- Vùng giá XAU phải nằm trong khoảng ±5% giá hiện tại ($X cho trước).
+- KHÔNG dùng giá $1.800-2.500 nếu giá hiện tại đã cao hơn.
+- Mọi sự kiện trong Catalysts PHẢI có trong danh sách lịch dưới đây, KHÔNG bịa.
+- Nếu danh sách lịch trống → ghi "Không có event quan trọng sắp tới (theo lịch hiện có)".
+
+FORMAT (Markdown bold dùng **X** sẽ tự convert sang HTML):`;
+
+      const priceCtx = currentPrice != null
+        ? `💰 GIÁ XAU/USD HIỆN TẠI: $${currentPrice.toFixed(2)} (ATR 15p ≈ $${currentAtr?.toFixed(2) || "?"})\n🚨 BẮT BUỘC dùng giá này làm baseline cho mọi vùng giá dự báo. Vùng dự báo tuần tới phải nằm trong $${(currentPrice * 0.95).toFixed(2)} – $${(currentPrice * 1.05).toFixed(2)}.`
+        : `⚠️ KHÔNG có giá XAU hiện tại → BỎ phần "Vùng giá" trong dự báo, chỉ ghi xu hướng định tính.`;
 
       userText = `Hôm nay: ${today}
+
+${priceCtx}
+
+📅 LỊCH ECONOMIC EVENTS SẮP TỚI (tuần tới — CHỈ DÙNG LỊCH NÀY, KHÔNG BỊA):
+${calBlock}
 
 📰 ${filtered.length} tin gold-relevant 7 ngày (${highImpact.length} tin high-impact 🚨):
 
 ${newsList}
 
-Tổng hợp theo format:
+Tổng hợp theo format (mọi text TIẾNG VIỆT):
 
 **📌 Chủ đề chính tuần qua**
-- Chủ đề 1: ...
+- Chủ đề 1: ... (rút từ tin THỰC TẾ ở trên, không tự bịa)
 
 **🚨 Catalysts mạnh sắp tới**
-- Sự kiện: ngày + giờ + dự đoán phản ứng XAU
+- Sự kiện X: <copy NGUYÊN ngày/giờ từ lịch> — dự đoán phản ứng XAU
 
 **📈 Dự báo XAU**
-- Bias tuần tới + vùng giá
+- Bias tuần tới: tăng giá / giảm giá / đi ngang
+${currentPrice != null ? `- Vùng giá: $${(currentPrice * 0.97).toFixed(0)} – $${(currentPrice * 1.03).toFixed(0)} (±3% từ giá hiện tại)` : `- Vùng giá: (bỏ qua — chưa có giá hiện tại)`}
 
 **💡 Khuyến nghị tiếp cận**
 - Ưu tiên + tránh
