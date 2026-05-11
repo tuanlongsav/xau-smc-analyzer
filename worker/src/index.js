@@ -874,6 +874,22 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
     }
   }
 
+  // ── 9. Phá range tích luỹ (Range Breakout sau Consolidation) ──
+  // Detect 4-8h sideways tight rồi đột ngột phá lên/xuống.
+  // Try 6h trước, fallback 4h nếu 6h chưa qualify.
+  for (const hours of [6, 4]) {
+    const rb = detectRangeBreakout(candlesEnriched, hours);
+    if (rb && rb.triggered) {
+      const dir = rb.direction;
+      const icon = dir === "up" ? "📤" : "📥";
+      const dirText = dir === "up" ? "LÊN" : "XUỐNG";
+      await push(`range_breakout_${dir}`, icon,
+        `Phá range tích luỹ ${rb.consolidationHours}h ${dirText} *$${rb.breakoutPrice.toFixed(2)}* — biên độ tích luỹ ${rb.rangeSize.toFixed(2)} điểm (${rb.rangeAtrRatio.toFixed(2)}× ATR nền)`,
+        `Sau giai đoạn tích luỹ (consolidation), breakout thường đẩy tiếp theo measured move. Mục tiêu kỹ thuật: $${rb.targetPrice.toFixed(2)}. Theo dõi retest mức phá vỡ làm hỗ trợ/kháng cự mới.`);
+      break; // chỉ lấy 1 timeframe để tránh trùng alert
+    }
+  }
+
   return out;
 }
 
@@ -1015,6 +1031,67 @@ function detectMegaMove(candlesEnriched) {
   }
 
   return { triggered: false };
+}
+
+// ──────────────────────────────────────────────────────────
+// Range expansion / Breakout sau consolidation
+// Detect khi giá đi ngang tích luỹ vài giờ rồi đột ngột phá lên/xuống.
+// Đây là setup high-confidence: target = breakout level + range size
+// (measured move). Phổ biến sau accumulation/distribution phase.
+// ──────────────────────────────────────────────────────────
+function detectRangeBreakout(candlesEnriched, hours = 6) {
+  const CANDLES_PER_HOUR = 4; // 15-min candles
+  const windowSize = hours * CANDLES_PER_HOUR;
+  if (!Array.isArray(candlesEnriched) || candlesEnriched.length < windowSize + 96) return null;
+
+  const latest = candlesEnriched[candlesEnriched.length - 1];
+  const prev = candlesEnriched[candlesEnriched.length - 2];
+  if (!latest?.close || !prev?.close || !latest.atr) return null;
+
+  // Window data: từ candle[-windowSize-1] đến candle[-2] (loại trừ nến hiện tại)
+  const window = candlesEnriched.slice(-windowSize - 1, -1);
+  const winHigh = Math.max(...window.map(c => c.high).filter(Number.isFinite));
+  const winLow = Math.min(...window.map(c => c.low).filter(Number.isFinite));
+  const winRange = winHigh - winLow;
+
+  // Baseline ATR: trung bình 96 nến gần nhất (24h) để estimate biến động chuẩn
+  const recentAtrs = candlesEnriched.slice(-96).map(c => c.atr).filter(a => a != null);
+  if (recentAtrs.length < 50) return null;
+  const baselineAtr = recentAtrs.reduce((s, a) => s + a, 0) / recentAtrs.length;
+  const rangeAtrRatio = winRange / baselineAtr;
+
+  // Consolidation: range trong window phải tight (< 1.5× ATR baseline)
+  // 6h range < 1.5× ATR(15p) = giá đi ngang trong biên ~15-20 điểm
+  if (rangeAtrRatio > 1.5) return null;
+
+  // Breakout: nến hiện tại close ngoài winHigh/winLow + nến trước CHƯA phá
+  const buffer = 0.15 * latest.atr; // confirmation buffer
+  if (latest.close > winHigh + buffer && prev.close <= winHigh + buffer) {
+    return {
+      triggered: true,
+      direction: "up",
+      consolidationHours: hours,
+      rangeSize: winRange,
+      rangeAtrRatio,
+      breakoutPrice: winHigh,
+      breakoutDistance: latest.close - winHigh,
+      // Measured move target: range size projected lên từ breakout level
+      targetPrice: winHigh + winRange,
+    };
+  }
+  if (latest.close < winLow - buffer && prev.close >= winLow - buffer) {
+    return {
+      triggered: true,
+      direction: "down",
+      consolidationHours: hours,
+      rangeSize: winRange,
+      rangeAtrRatio,
+      breakoutPrice: winLow,
+      breakoutDistance: winLow - latest.close,
+      targetPrice: winLow - winRange,
+    };
+  }
+  return null;
 }
 
 // Tìm local extremes (đỉnh/đáy) trong window 3-3 — dùng cho RSI divergence.
@@ -1188,6 +1265,250 @@ async function fetchTopGoldNews(env, limit = 5) {
     console.log(`[mega-news] fail: ${e.message}`);
     return [];
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// PHASE 5: Economic calendar pre-event alerts (4h, 1h, 30p trước event)
+// ══════════════════════════════════════════════════════════════════════
+// Forex Factory JSON weekly feed (free, no auth). Schema:
+//   [{ title, country, date (ISO), impact, forecast, previous }, ...]
+const FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
+
+// Keywords nhận diện event high-impact XAU
+const PRE_EVENT_KEYWORDS = [
+  "non-farm", "non farm", "nfp", "payroll", "employment",
+  "cpi", "ppi", "pce", "inflation", "core inflation",
+  "fed funds", "fomc", "fed chair", "powell", "interest rate",
+  "gdp", "unemployment", "jobless claims", "retail sales",
+  "ism manufacturing", "ism services",
+];
+
+function vietnameseEventLabel(title) {
+  const lc = (title || "").toLowerCase();
+  if (lc.includes("non-farm") || lc.includes("nfp") || lc.includes("payroll")) return "Việc làm phi nông nghiệp Mỹ (NFP)";
+  if (lc.includes("cpi") && lc.includes("core")) return "CPI lõi (Core CPI)";
+  if (lc.includes("cpi")) return "Chỉ số giá tiêu dùng (CPI)";
+  if (lc.includes("ppi")) return "Chỉ số giá sản xuất (PPI)";
+  if (lc.includes("pce")) return "Chỉ số chi tiêu cá nhân (PCE)";
+  if (lc.includes("fed funds") || lc.includes("interest rate")) return "Quyết định lãi suất Fed";
+  if (lc.includes("fomc statement") || lc.includes("fomc minutes")) return "Biên bản/Tuyên bố FOMC";
+  if (lc.includes("fomc")) return "Cuộc họp FOMC (Fed)";
+  if (lc.includes("fed chair") || lc.includes("powell")) return "Bài phát biểu Chủ tịch Fed (Powell)";
+  if (lc.includes("gdp")) return "GDP (Tăng trưởng kinh tế)";
+  if (lc.includes("unemployment rate")) return "Tỷ lệ thất nghiệp";
+  if (lc.includes("jobless")) return "Số người xin trợ cấp thất nghiệp";
+  if (lc.includes("retail sales")) return "Doanh số bán lẻ";
+  if (lc.includes("ism manufacturing")) return "Chỉ số ISM Sản xuất";
+  if (lc.includes("ism services")) return "Chỉ số ISM Dịch vụ";
+  return title; // fallback giữ nguyên
+}
+
+function isPreEventRelevant(event) {
+  if (!event || !event.title || !event.date) return false;
+  if ((event.country || "").toUpperCase() !== "USD") return false;
+  const impact = (event.impact || "").toLowerCase();
+  if (impact !== "high") return false;
+  const t = event.title.toLowerCase();
+  return PRE_EVENT_KEYWORDS.some(k => t.includes(k));
+}
+
+// Fetch finnhub.io economic calendar (free 60 req/min, allow CF egress).
+// Schema: { economicCalendar: [{event, country, time, impact, actual, prev, estimate, ...}] }
+async function fetchFinnhubCalendar(env) {
+  if (!env.FINNHUB_API_KEY) return null;
+  const from = new Date().toISOString().slice(0, 10);
+  const to = new Date(Date.now() + 7 * 86400 * 1000).toISOString().slice(0, 10);
+  const url = `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${env.FINNHUB_API_KEY}`;
+  try {
+    const r = await fetch(url, { cf: { cacheEverything: true, cacheTtl: 3600 } });
+    if (!r.ok) {
+      console.log(`[econ-cal:finnhub] HTTP ${r.status}`);
+      return null;
+    }
+    const d = await r.json();
+    const arr = Array.isArray(d?.economicCalendar) ? d.economicCalendar : [];
+    return arr.map(e => ({
+      title: e.event,
+      country: e.country,
+      date: e.time, // ISO "2026-05-12 08:30:00" hoặc "2026-05-12T08:30:00"
+      ts: new Date(e.time.includes("T") ? e.time : e.time.replace(" ", "T") + "Z").getTime(),
+      forecast: e.estimate != null ? String(e.estimate) : null,
+      previous: e.prev != null ? String(e.prev) : null,
+      // Finnhub impact: "high" | "medium" | "low" (case may vary)
+      impact: e.impact ? e.impact.charAt(0).toUpperCase() + e.impact.slice(1).toLowerCase() : "",
+    })).filter(e => Number.isFinite(e.ts));
+  } catch (e) {
+    console.log(`[econ-cal:finnhub] fail: ${e.message}`);
+    return null;
+  }
+}
+
+// Fetch + parse + filter — cache 12h trong KV.
+// Ưu tiên finnhub (CF-friendly) → fallback faireconomy (thường 429 từ CF) →
+// fallback KV last_good (lần fetch thành công gần nhất).
+async function fetchEconomicCalendar(env) {
+  const bucket = Math.floor(Date.now() / (12 * 3600 * 1000));
+  const cacheKey = `econ_cal:${bucket}`;
+  const cached = await cacheGet(env, cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch {}
+  }
+
+  // 1) Try finnhub (preferred — không bị CF egress block)
+  let arr = await fetchFinnhubCalendar(env);
+  let source = "finnhub";
+
+  // 2) Fallback: faireconomy (thường 429 nhưng thử)
+  if (!arr || arr.length === 0) {
+    source = "faireconomy";
+    try {
+      const r = await fetch(FF_CALENDAR_URL, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "*/*",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        cf: { cacheEverything: true, cacheTtl: 3600 },
+      });
+      if (r.ok) {
+        const raw = await r.json();
+        if (Array.isArray(raw)) {
+          arr = raw.map(e => ({
+            title: e.title,
+            country: e.country,
+            date: e.date,
+            ts: new Date(e.date).getTime(),
+            forecast: e.forecast || null,
+            previous: e.previous || null,
+            impact: e.impact,
+          })).filter(e => Number.isFinite(e.ts));
+        }
+      } else {
+        console.log(`[econ-cal:ff] HTTP ${r.status}`);
+      }
+    } catch (e) {
+      console.log(`[econ-cal:ff] fail: ${e.message}`);
+    }
+  }
+
+  // 3) Filter relevant + cache nếu có
+  if (Array.isArray(arr) && arr.length > 0) {
+    const relevant = arr.filter(isPreEventRelevant);
+    console.log(`[econ-cal:${source}] total=${arr.length} relevant=${relevant.length}`);
+    if (relevant.length > 0) {
+      await cachePut(env, cacheKey, JSON.stringify(relevant));
+      if (env.CACHE) {
+        try { await env.CACHE.put("econ_cal:last_good", JSON.stringify(relevant), { expirationTtl: 7 * 86400 }); } catch {}
+      }
+    }
+    return relevant;
+  }
+
+  // 4) Last resort: KV last_good (lần fetch thành công gần nhất, có thể cũ vài ngày)
+  const fallback = await cacheGet(env, "econ_cal:last_good");
+  if (fallback) {
+    try {
+      const parsed = JSON.parse(fallback);
+      const future = parsed.filter(e => e.ts > Date.now() - 60000);
+      console.log(`[econ-cal] dùng KV last_good (${parsed.length} events, ${future.length} còn future)`);
+      return future;
+    } catch {}
+  }
+
+  console.log(`[econ-cal] không có data — cần set FINNHUB_API_KEY hoặc đợi faireconomy mở`);
+  return [];
+}
+
+// Tier definitions: 4h / 1h / 30p với tolerance ±3 phút cho cron drift
+const PRE_EVENT_TIERS = [
+  { minutes: 240, key: "4h",  label: "4 giờ",   icon: "🟡" },
+  { minutes: 60,  key: "1h",  label: "1 giờ",   icon: "🟠" },
+  { minutes: 30,  key: "30m", label: "30 phút", icon: "🔴" },
+];
+const PRE_EVENT_TOLERANCE_MIN = 3;
+
+function eventId(event) {
+  // Hash đơn giản: ts + title (unique trong tuần)
+  return `${event.ts}_${(event.title || "").slice(0, 30).replace(/[^a-z0-9]/gi, "")}`;
+}
+
+async function checkAndFirePreEventAlerts(env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return 0;
+  const events = await fetchEconomicCalendar(env);
+  if (events.length === 0) return 0;
+
+  const now = Date.now();
+  let fired = 0;
+
+  for (const ev of events) {
+    const minutesToEvent = (ev.ts - now) / 60000;
+    if (minutesToEvent < 0) continue; // đã qua
+    if (minutesToEvent > 250) continue; // xa quá 4h+, bỏ qua
+
+    for (const tier of PRE_EVENT_TIERS) {
+      if (Math.abs(minutesToEvent - tier.minutes) > PRE_EVENT_TOLERANCE_MIN) continue;
+
+      const dedupKey = `pre_event:${eventId(ev)}:${tier.key}`;
+      if (env.CACHE) {
+        const seen = await env.CACHE.get(dedupKey);
+        if (seen) continue;
+      }
+
+      const sent = await sendPreEventAlert(env, ev, tier, minutesToEvent);
+      if (sent && env.CACHE) {
+        // TTL = tier.minutes + 60 phút để KV không phình
+        await env.CACHE.put(dedupKey, "1", { expirationTtl: (tier.minutes + 60) * 60 });
+      }
+      if (sent) fired++;
+      break; // 1 event chỉ fire 1 tier mỗi cron tick
+    }
+  }
+  return fired;
+}
+
+async function sendPreEventAlert(env, event, tier, minutesToEvent) {
+  const h = htmlEscape;
+  const vnLabel = vietnameseEventLabel(event.title);
+  const eventTimeVn = new Date(event.ts).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false });
+  const eventTimeUtc = new Date(event.ts).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+
+  const lines = [];
+  lines.push(`${tier.icon} <b>SẮP CÓ TIN — Còn ${tier.label}</b>`);
+  lines.push(`📅 <b>${h(vnLabel)}</b>`);
+  if (vnLabel !== event.title) {
+    lines.push(`<i>(${h(event.title)})</i>`);
+  }
+  lines.push(`🕐 ${h(eventTimeVn)} (giờ VN) — ${h(eventTimeUtc)}`);
+  lines.push(`🎯 Tác động: <b>CAO</b> (USD)`);
+
+  if (event.forecast || event.previous) {
+    const parts = [];
+    if (event.forecast) parts.push(`Dự báo: <b>${h(event.forecast)}</b>`);
+    if (event.previous) parts.push(`Lần trước: ${h(event.previous)}`);
+    lines.push(`📊 ${parts.join(" | ")}`);
+  }
+
+  // Hướng dẫn ngắn theo tier
+  if (tier.key === "4h") {
+    lines.push("");
+    lines.push("⏳ <b>Chuẩn bị:</b> Cân nhắc đóng lệnh trước event để tránh slippage. Biến động trước/sau release có thể vượt 2-3× ATR thường.");
+  } else if (tier.key === "1h") {
+    lines.push("");
+    lines.push("⚠️ <b>Cảnh giác:</b> Spread bắt đầu giãn. Hạn chế vào lệnh mới. Nếu giữ vị thế → cân nhắc thu hẹp size hoặc mở SL.");
+  } else if (tier.key === "30m") {
+    lines.push("");
+    lines.push("🚨 <b>Sắp release:</b> Tạm dừng giao dịch. Đợi 5-10p sau release để xem direction rõ + spread bình thường lại.");
+    lines.push("");
+    lines.push("<b>Mẹo:</b>");
+    lines.push("• Dữ liệu hot (vượt forecast nhiều) → USD mạnh → XAU giảm");
+    lines.push("• Dữ liệu lạnh (dưới forecast) → USD yếu → XAU tăng");
+    lines.push("• Fed dovish → XAU tăng | Fed hawkish → XAU giảm");
+  }
+
+  const msg = lines.join("\n");
+  const sent = await sendTelegram(env, msg, false, "HTML");
+  console.log(`[pre-event] ${sent ? "sent" : "send_fail"}: ${event.title} tier=${tier.key} mins_left=${minutesToEvent.toFixed(1)}`);
+  return sent;
 }
 
 // ──────────────────────────────────────────────────────────
@@ -4025,13 +4346,23 @@ async function runAlertCheck(env, { force = false } = {}) {
   // Dọn message hết hạn — ALWAYS chạy (kể cả thiếu Telegram secret, kể cả cuối tuần).
   await cleanupExpiredMessages(env);
 
+  // Pre-event check (LUÔN chạy, kể cả T7/CN) — event sáng thứ Hai cần alert
+  // 4h trước = chiều Chủ Nhật. Không tốn TD credit, chỉ Telegram + KV.
+  if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
+    try {
+      await checkAndFirePreEventAlerts(env);
+    } catch (e) {
+      console.log(`[cron] pre-event check fail: ${e.message}`);
+    }
+  }
+
   // Vàng (XAU/USD) đóng cửa cuối tuần: thị trường ngừng giao dịch từ Sat 00 UTC
   // đến hết Sun 21 UTC. Skip alert check để tiết kiệm quota TwelveData và tránh
   // gửi cảnh báo trên dữ liệu nến cũ. Manual trigger ({force:true}) vẫn chạy.
   if (!force) {
     const utcDay = new Date().getUTCDay(); // 0=CN, 6=T7
     if (utcDay === 0 || utcDay === 6) {
-      console.log(`[cron] cuối tuần (UTC day=${utcDay}) — vàng nghỉ, skip alert check`);
+      console.log(`[cron] cuối tuần (UTC day=${utcDay}) — vàng nghỉ, skip alert check (pre-event đã chạy)`);
       return;
     }
   }
@@ -4375,6 +4706,37 @@ export default {
         })),
         logs,
       }, origin);
+    }
+
+    // Test economic calendar fetch + pre-event scan: GET /test-precal?dry=1
+    //   dry=1 — trả JSON danh sách event sắp tới, không gửi Telegram
+    if (url.pathname === "/test-precal") {
+      const dry = url.searchParams.get("dry") === "1";
+      try {
+        const events = await fetchEconomicCalendar(env);
+        const now = Date.now();
+        const upcoming = events
+          .filter(e => e.ts > now && e.ts < now + 7 * 24 * 3600 * 1000)
+          .map(e => ({
+            title: e.title,
+            vn_label: vietnameseEventLabel(e.title),
+            date_vn: new Date(e.ts).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" }),
+            date_utc: new Date(e.ts).toISOString().slice(0, 16).replace("T", " "),
+            minutes_to_event: ((e.ts - now) / 60000).toFixed(1),
+            impact: e.impact,
+            forecast: e.forecast,
+            previous: e.previous,
+          }))
+          .sort((a, b) => parseFloat(a.minutes_to_event) - parseFloat(b.minutes_to_event));
+
+        if (dry) {
+          return jsonResponse(200, { events_count: events.length, upcoming_count: upcoming.length, upcoming: upcoming.slice(0, 10) }, origin);
+        }
+        const fired = await checkAndFirePreEventAlerts(env);
+        return jsonResponse(200, { ok: true, fired, upcoming_count: upcoming.length }, origin);
+      } catch (e) {
+        return jsonResponse(500, { error: e.message }, origin);
+      }
     }
 
     // Test alerts deep analysis: GET /test-alerts?force=1&reset_cooldown=1&dry=1
