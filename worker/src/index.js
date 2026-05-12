@@ -1515,13 +1515,19 @@ async function sendPreEventAlert(env, event, tier, minutesToEvent) {
 // Mega-move orchestrator — scan reversal + fetch news + gọi Gemini + gửi TG.
 // Cooldown 30p qua KV để tránh spam trong giai đoạn vol kéo dài.
 // ──────────────────────────────────────────────────────────
-const MEGA_MOVE_COOLDOWN_MS = 30 * 60 * 1000;
+// Adaptive cooldown: 15p khi vol regime "extreme" (biến động kéo dài,
+// user cần update thường xuyên), 30p khi normal/high. Tránh spam khi sideways.
+const MEGA_MOVE_COOLDOWN_NORMAL_MS = 30 * 60 * 1000;
+const MEGA_MOVE_COOLDOWN_EXTREME_MS = 15 * 60 * 1000;
 
-async function megaMoveCooldownOk(env) {
+async function megaMoveCooldownOk(env, regimeCode = null) {
   if (!env.CACHE) return true;
   const last = await env.CACHE.get("mega_move:last");
   if (!last) return true;
-  return Date.now() - parseInt(last) > MEGA_MOVE_COOLDOWN_MS;
+  const cooldown = regimeCode === "extreme"
+    ? MEGA_MOVE_COOLDOWN_EXTREME_MS
+    : MEGA_MOVE_COOLDOWN_NORMAL_MS;
+  return Date.now() - parseInt(last) > cooldown;
 }
 
 async function markMegaMoveSent(env) {
@@ -1609,13 +1615,18 @@ const AI_VERDICT_VI = {
  *   mode = "alerts" → header TÍN HIỆU + list alerts vừa kích hoạt
  * Schema AI output giống nhau giữa 2 mode → share format + render code.
  */
-const DEEP_ANALYSIS_COOLDOWN_MS = 30 * 60 * 1000;
+// Cooldown deep analysis — adaptive theo regime (15p extreme, 30p normal)
+const DEEP_ANALYSIS_COOLDOWN_NORMAL_MS = 30 * 60 * 1000;
+const DEEP_ANALYSIS_COOLDOWN_EXTREME_MS = 15 * 60 * 1000;
 
-async function deepAnalysisCooldownOk(env, mode) {
+async function deepAnalysisCooldownOk(env, mode, regimeCode = null) {
   if (!env.CACHE) return true;
   const last = await env.CACHE.get(`deep:${mode}:last`);
   if (!last) return true;
-  return Date.now() - parseInt(last) > DEEP_ANALYSIS_COOLDOWN_MS;
+  const cooldown = regimeCode === "extreme"
+    ? DEEP_ANALYSIS_COOLDOWN_EXTREME_MS
+    : DEEP_ANALYSIS_COOLDOWN_NORMAL_MS;
+  return Date.now() - parseInt(last) > cooldown;
 }
 
 async function markDeepAnalysisSent(env, mode) {
@@ -1652,13 +1663,14 @@ async function runDeepAnalysis(env, ctx) {
   if (mode === "alerts" && alerts.length === 0) {
     return { skipped: "no_alerts" };
   }
-  // Backward compat: kiểm tra cooldown legacy key mega_move:last cho mode mega
-  if (mode === "mega" && !(await megaMoveCooldownOk(env))) {
-    console.log(`[deep:${mode}] cooldown (legacy mega key), skip`);
+  // Adaptive cooldown: extreme regime → 15p (bắt update nhanh khi volatility kéo dài),
+  // normal/high regime → 30p (tránh spam). Áp dụng cho cả 2 mode mega + alerts.
+  if (mode === "mega" && !(await megaMoveCooldownOk(env, regime?.code))) {
+    console.log(`[deep:${mode}] cooldown (regime=${regime?.code}), skip`);
     return { skipped: "cooldown" };
   }
-  if (!(await deepAnalysisCooldownOk(env, mode))) {
-    console.log(`[deep:${mode}] cooldown 30p, skip`);
+  if (!(await deepAnalysisCooldownOk(env, mode, regime?.code))) {
+    console.log(`[deep:${mode}] cooldown, skip`);
     return { skipped: "cooldown" };
   }
 
@@ -3698,6 +3710,7 @@ QUY TẮC SETUP:
 Trả JSON:
 {
   "huong": "LONG|SHORT|NEUTRAL",
+  "do_tin_cay_pct": <0-100, % xác suất setup này đúng — bắt buộc>,
   "tom_tat": "1-2 câu phe nào kiểm soát + lý do ngắn",
   "entry_goi_y": <float|null>,
   "sl_goi_y": <float|null>,
@@ -3735,49 +3748,48 @@ Trả JSON:
     }
 
     const huong = (d.huong || "NEUTRAL").toUpperCase();
-    const huongIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[huong] || "❓";
+    const huongIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "⏸️" }[huong] || "❓";
     const huongLabel = { LONG: "MUA (LONG)", SHORT: "BÁN (SHORT)", NEUTRAL: "ĐỨNG NGOÀI" }[huong] || huong;
     const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
+    const tfVi = ({ "5m": "5p", "15m": "15p", "1h": "1g", "4h": "4g", "1d": "1 ngày" })[tf] || tf;
 
-    let m = `<b>🥇 Quét nhanh XAU/USD ${tf}</b> — Horizon ${horizon}\n`;
-    m += `Giá hiện tại: <b>$${l.close.toFixed(2)}</b> | ${huongIcon} <b>${huongLabel}</b>\n`;
+    const confPct = Number.isFinite(Number(d.do_tin_cay_pct)) ? Math.round(d.do_tin_cay_pct) : null;
+    const confTag = confPct != null ? ` | Tin cậy: <b>${confPct}%</b>` : "";
+
+    let m = `<b>🥇 Quét nhanh XAU/USD ${tfVi}</b> (Tầm nhìn ${htmlEsc(horizon)})\n`;
+    m += `Giá: <b>$${l.close.toFixed(2)}</b> | ${huongIcon} <b>${huongLabel}</b>${confTag}\n`;
     if (auxCtx) {
       const auxLines = formatAuxBlock(auxCtx).split("\n");
       m += auxLines.map(l => htmlEsc(l)).join("\n") + "\n";
     }
-    m += `\n`;
 
-    if (d.tom_tat) m += `${htmlEsc(d.tom_tat)}\n\n`;
+    if (d.tom_tat) m += `\n<i>${htmlEsc(d.tom_tat)}</i>\n`;
 
-    // Khuyến nghị giá vào lệnh — Entry / SL / TP1-2-3
+    // Khuyến nghị giá vào lệnh — TP gộp 1 dòng (chuẩn cùng /15p và /5p15p1h)
     const sgEntry = d.entry_goi_y, sgSl = d.sl_goi_y;
     const sgTp1 = d.tp1_goi_y ?? d.tp_goi_y; // backward compat
     const sgTp2 = d.tp2_goi_y;
     const sgTp3 = d.tp3_goi_y;
     if (sgEntry != null && sgSl != null && sgTp1 != null) {
       const slDist = Math.abs(sgEntry - sgSl);
-      const rr1 = Math.abs((sgTp1 - sgEntry) / (sgEntry - sgSl));
-      m += `<b>🎯 Khuyến nghị giá vào lệnh (${huongLabel}):</b>\n`;
-      m += `📍 Điểm vào (Entry): <b>$${fmt2(sgEntry)}</b>\n`;
-      m += `🛑 Cắt lỗ (SL): <b>$${fmt2(sgSl)}</b> <i>(rủi ro ~${slDist.toFixed(2)} điểm)</i>\n`;
-      m += `🎯 Chốt lời 1 (TP1, R:R ${rr1.toFixed(1)} — an toàn): <b>$${fmt2(sgTp1)}</b>\n`;
-      if (sgTp2 != null) {
-        const rr2 = Math.abs((sgTp2 - sgEntry) / (sgEntry - sgSl));
-        m += `🎯 Chốt lời 2 (TP2, R:R ${rr2.toFixed(1)} — kỳ vọng): <b>$${fmt2(sgTp2)}</b>\n`;
-      }
-      if (sgTp3 != null) {
-        const rr3 = Math.abs((sgTp3 - sgEntry) / (sgEntry - sgSl));
-        m += `🎯 Chốt lời 3 (TP3, R:R ${rr3.toFixed(1)} — mở rộng): <b>$${fmt2(sgTp3)}</b>\n`;
-      }
+      const rrOf = (tp) => (slDist > 0) ? (Math.abs(tp - sgEntry) / slDist).toFixed(1) : "?";
+      m += `\n━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n`;
+      m += `${huongIcon} <b>${huongLabel}</b>\n`;
+      m += `📍 Vào lệnh: <b>$${fmt2(sgEntry)}</b>\n`;
+      m += `🛑 Cắt lỗ (SL): <b>$${fmt2(sgSl)}</b> <i>(${slDist.toFixed(2)} điểm)</i>\n`;
+      const tpParts = [`TP1 <b>$${fmt2(sgTp1)}</b> (R:R ${rrOf(sgTp1)})`];
+      if (sgTp2 != null) tpParts.push(`TP2 <b>$${fmt2(sgTp2)}</b> (R:R ${rrOf(sgTp2)})`);
+      if (sgTp3 != null) tpParts.push(`TP3 <b>$${fmt2(sgTp3)}</b> (R:R ${rrOf(sgTp3)})`);
+      m += `💰 Chốt lời: ${tpParts.join(" | ")}\n`;
       if (d.ly_do_setup) m += `<i>💡 ${htmlEsc(d.ly_do_setup)}</i>\n`;
     } else if (d.ly_do_setup) {
-      m += `<b>🎯 Setup:</b> ${htmlEsc(d.ly_do_setup)}\n`;
+      m += `\n<b>🎯 Setup:</b> ${htmlEsc(d.ly_do_setup)}\n`;
     }
 
     if (d.khang_cu_gan || d.ho_tro_gan) {
-      m += `\n<b>📍 Mức giá cần quan sát:</b>\n`;
-      if (d.khang_cu_gan) m += `▲ <b>$${Number(d.khang_cu_gan).toFixed(2)}</b> kháng cự gần\n`;
-      if (d.ho_tro_gan)  m += `▼ <b>$${Number(d.ho_tro_gan).toFixed(2)}</b> hỗ trợ gần\n`;
+      m += `\n<b>📍 Mức giá quan trọng:</b>\n`;
+      if (d.khang_cu_gan) m += `▲ <b>$${Number(d.khang_cu_gan).toFixed(2)}</b> <i>— kháng cự gần</i>\n`;
+      if (d.ho_tro_gan)  m += `▼ <b>$${Number(d.ho_tro_gan).toFixed(2)}</b> <i>— hỗ trợ gần</i>\n`;
     }
 
     if (d.canh_bao) {
@@ -3874,6 +3886,7 @@ ${htfBlock}
   "quyet_dinh": {
     "huong": "BUY | SELL | WAIT",
     "do_tin_cay": "Cao | Trung bình | Thấp",
+    "do_tin_cay_pct": <0-100, % xác suất setup này đúng — BẮT BUỘC>,
     "entry": <float | null nếu WAIT>,
     "sl": <float | null nếu WAIT>,
     "tp1": <float | null>,
@@ -3946,42 +3959,40 @@ ${htfBlock}
  */
 function formatAnalysisHTML(d, tf, horizon) {
   const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
-  const fmtRr = (r) => (typeof r === "number" && !isNaN(r)) ? Number(r).toFixed(1) : null;
   const qd = d.quyet_dinh || {};
   const gt = d.giai_thich || {};
   const htf = d.huong_HTF || {};
 
   const huong = String(qd.huong || "WAIT").toUpperCase();
-  const huongIcon = { BUY: "🟢", SELL: "🔴", WAIT: "🟡" }[huong] || "❓";
+  const huongIcon = { BUY: "📈", SELL: "📉", WAIT: "⏸️" }[huong] || "❓";
   const huongLabel = {
     BUY: "MUA (LONG)",
     SELL: "BÁN (SHORT)",
     WAIT: "ĐỨNG NGOÀI",
   }[huong] || huong;
+  const tfVi = ({ "5m": "5p", "15m": "15p", "1h": "1g", "4h": "4g", "1d": "1 ngày" })[tf] || tf;
 
-  let m = `<b>🥇 Phân tích XAU/USD ${tf}</b> — Horizon ${horizon}\n\n`;
+  let m = `<b>🥇 Phân tích XAU/USD ${tfVi}</b> (Tầm nhìn ${htmlEsc(horizon)})\n\n`;
 
   // ══════ PHẦN 1: QUYẾT ĐỊNH ══════
-  m += `━━━ <b>🎯 QUYẾT ĐỊNH</b> ━━━\n`;
-  m += `${huongIcon} <b>${huongLabel}</b> | Tin cậy: <b>${htmlEsc(qd.do_tin_cay || "?")}</b>\n`;
+  m += `━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n`;
+  const confPctA = Number.isFinite(Number(qd.do_tin_cay_pct)) ? ` (${Math.round(qd.do_tin_cay_pct)}%)` : "";
+  m += `${huongIcon} <b>${huongLabel}</b> | Tin cậy: <b>${htmlEsc(qd.do_tin_cay || "?")}${confPctA}</b>\n`;
 
-  if (huong !== "WAIT" && qd.entry != null) {
-    m += `\n📍 Entry: <b>$${fmt2(qd.entry)}</b>\n`;
-    m += `🛑 SL: <b>$${fmt2(qd.sl)}</b>\n`;
-    if (qd.tp1 != null) {
-      const rr = fmtRr(qd.rr_tp1);
-      m += `🎯 TP1 an toàn: <b>$${fmt2(qd.tp1)}</b>${rr ? ` <i>(R:R ${rr})</i>` : ""}\n`;
-    }
-    if (qd.tp2 != null) {
-      const rr = fmtRr(qd.rr_tp2);
-      m += `🎯 TP2 kỳ vọng: <b>$${fmt2(qd.tp2)}</b>${rr ? ` <i>(R:R ${rr})</i>` : ""}\n`;
-    }
-    if (qd.tp3 != null) m += `🎯 TP3 mở rộng theo xu hướng: <b>$${fmt2(qd.tp3)}</b>\n`;
+  if (huong !== "WAIT" && qd.entry != null && qd.sl != null && qd.tp1 != null) {
+    const slDist = Math.abs(qd.entry - qd.sl);
+    const rrOf = (tp) => (tp != null && slDist > 0) ? (Math.abs(tp - qd.entry) / slDist).toFixed(1) : null;
+    m += `\n📍 Vào lệnh: <b>$${fmt2(qd.entry)}</b>\n`;
+    m += `🛑 Cắt lỗ (SL): <b>$${fmt2(qd.sl)}</b> <i>(${slDist.toFixed(2)} điểm)</i>\n`;
+    const tpParts = [`TP1 <b>$${fmt2(qd.tp1)}</b> (R:R ${rrOf(qd.tp1) || "?"})`];
+    if (qd.tp2 != null) tpParts.push(`TP2 <b>$${fmt2(qd.tp2)}</b> (R:R ${rrOf(qd.tp2) || "?"})`);
+    if (qd.tp3 != null) tpParts.push(`TP3 <b>$${fmt2(qd.tp3)}</b> (R:R ${rrOf(qd.tp3) || "?"})`);
+    m += `💰 Chốt lời: ${tpParts.join(" | ")}\n`;
   } else {
     m += `\n<i>Chưa có setup rõ ràng — chờ giá xác nhận hướng.</i>\n`;
   }
 
-  // ══════ PHẦN 2: GIẢI THÍCH (cho người mới) ══════
+  // ══════ PHẦN 2: GIẢI THÍCH ══════
   m += `\n━━━ <b>📚 GIẢI THÍCH</b> ━━━\n`;
   if (gt.buc_tranh_toan_canh) {
     m += `\n<b>🎨 Bức tranh toàn cảnh:</b>\n${htmlEsc(gt.buc_tranh_toan_canh)}\n`;
@@ -3991,12 +4002,15 @@ function formatAnalysisHTML(d, tf, horizon) {
   }
   if (Array.isArray(gt.rui_ro_can_luu_y) && gt.rui_ro_can_luu_y.length) {
     m += `\n<b>⚠️ Rủi ro cần lưu ý:</b>\n`;
-    for (const r of gt.rui_ro_can_luu_y) m += `• ${htmlEsc(r)}\n`;
+    for (const r of gt.rui_ro_can_luu_y.slice(0, 3)) {
+      const rt = String(r);
+      m += `• ${htmlEsc(rt.length > 160 ? rt.slice(0, 157) + "…" : rt)}\n`;
+    }
   }
 
   // HTF context
   if (htf.khung_4h || htf.khung_1d) {
-    m += `\n<b>🌊 Bối cảnh khung lớn:</b> 4h <b>${htmlEsc(htf.khung_4h || "?")}</b> | 1d <b>${htmlEsc(htf.khung_1d || "?")}</b>`;
+    m += `\n<b>🌊 Bối cảnh khung lớn:</b> 4g <b>${htmlEsc(htf.khung_4h || "?")}</b> | 1 ngày <b>${htmlEsc(htf.khung_1d || "?")}</b>`;
     if (htf.ghi_chu) m += `\n<i>${htmlEsc(htf.ghi_chu)}</i>`;
   }
 
@@ -4130,23 +4144,29 @@ Trả JSON:
   "consensus_bias": "LONG | SHORT | NEUTRAL",
   "alignment": "all_align | majority | divergent",
   "do_tin_cay": "thấp | trung bình | cao",
+  "do_tin_cay_pct": <0-100, % xác suất setup chính đúng — BẮT BUỘC>,
   "tom_tat": "1-2 câu summary top-down (vd '1d bullish, 4h consolidate, 1h pullback về EMA21')",
   "by_tf": {
 ${valid.map(v => `    "${v.tf}": { "bias": "LONG|SHORT|NEUTRAL", "key_level": <float>, "ghi_chu": "1 câu" }`).join(",\n")}
   },
   "long": {
     "kha_thi": true | false,
+    "xac_suat_pct": <0-100, xác suất kịch bản LONG xảy ra trong horizon ${horizon}>,
     "entry": <float>, "sl": <float>, "tp": <float>, "rr": <float>,
     "tp1": <float|null>, "tp2": <float|null>, "tp3": <float|null>,
-    "ly_do": "lý do confluence từ khung lớn xuống nhỏ",
-    "dieu_kien_confirm": "vd 'đợi nến 15p đóng trên $X + RSI > 50'"
+    "ly_do": "1 câu lý do (≤80 ký tự) — KHÔNG đoạn dài",
+    "dieu_kien_confirm": "vd 'nến 15p đóng trên $X + RSI > 50'"
   },
-  "short": { ...same fields... },
+  "short": { ...same fields, xac_suat_pct cho SHORT... },
   "khang_cu": [{"gia": <float>, "ghi_chu": "vd 'HTF resistance + Fib 0.5'"}, ... 2-3 mức],
   "ho_tro": [{"gia": <float>, "ghi_chu": "..."}, ... 2-3 mức],
-  "phan_tich_top_down": "1-2 đoạn giải thích cách 3 khung bổ trợ hoặc mâu thuẫn nhau, vai trò mỗi khung trong setup",
-  "rui_ro_chinh": ["...", "...", "..."]
-}`;
+  "phan_tich_top_down": "1-2 câu (≤300 ký tự) giải thích vai trò 3 khung — NGẮN",
+  "rui_ro_chinh": ["≤80 ký tự", "≤80 ký tự", "≤80 ký tự"]
+}
+
+LƯU Ý xac_suat_pct: LONG + SHORT ≤ 100. Phần còn lại là xác suất "Chờ".
+- Consensus LONG + all_align → LONG ~70%, SHORT ~5%.
+- Consensus NEUTRAL + divergent → LONG ~25%, SHORT ~25%, Chờ ~50%.`;
 
     const body = {
       systemInstruction: { parts: [{ text: systemText }] },
@@ -4198,83 +4218,136 @@ ${valid.map(v => `    "${v.tf}": { "bias": "LONG|SHORT|NEUTRAL", "key_level": <f
 
 function formatMultiTfHTML(d, valid, horizon, isNhanh) {
   const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
+  // Map EN bias → VN
+  const BIAS_VI = { LONG: "MUA (LONG)", SHORT: "BÁN (SHORT)", NEUTRAL: "TRUNG TÍNH" };
+  const BIAS_ICON = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" };
   const consensus = (d.consensus_bias || "NEUTRAL").toUpperCase();
-  const consensusIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[consensus] || "❓";
+  const consensusIcon = BIAS_ICON[consensus] || "❓";
+  const consensusVi = BIAS_VI[consensus] || consensus;
   const alignment = {
-    "all_align": "✅ Đồng thuận",
-    "majority":  "⚠️ Đa số",
-    "divergent": "❌ Phân vân",
+    "all_align": "✅ tất cả khung đồng thuận",
+    "majority":  "⚠️ đa số khung đồng thuận",
+    "divergent": "❌ các khung phân vân",
   }[d.alignment] || htmlEsc(d.alignment || "?");
 
-  const tfsLabel = valid.map(v => v.tf).join(" + ");
+  // Trim TF labels: 5m → 5p, 15m → 15p, 1h → 1g, 4h → 4g, 1d → 1d
+  const tfVi = (tf) => tf.replace("m", "p").replace("h", "g");
+  const tfsLabel = valid.map(v => tfVi(v.tf)).join(" + ");
   const prefix = isNhanh ? "Quét nhanh" : "Phân tích chi tiết";
 
-  let m = `<b>🥇 ${prefix} đa khung: ${tfsLabel}</b> (Horizon ${horizon})\n`;
-  m += `${consensusIcon} Đồng thuận: <b>${consensus}</b> | Tin cậy: <b>${htmlEsc(d.do_tin_cay || "?")}</b> | ${alignment}\n`;
+  // Compute probability mỗi kịch bản từ AI (nếu trả) hoặc rule-based theo consensus + alignment
+  const computeProb = () => {
+    // Ưu tiên AI trả xac_suat_pct trong long/short, else tính rule-based
+    const aiLong = Number(d.long?.xac_suat_pct);
+    const aiShort = Number(d.short?.xac_suat_pct);
+    if (Number.isFinite(aiLong) && Number.isFinite(aiShort)) {
+      const wait = Math.max(0, 100 - aiLong - aiShort);
+      return { long: aiLong, short: aiShort, wait };
+    }
+    // Rule-based theo consensus
+    const align = d.alignment;
+    if (consensus === "LONG") {
+      if (align === "all_align") return { long: 70, short: 5, wait: 25 };
+      if (align === "majority")  return { long: 55, short: 15, wait: 30 };
+      return { long: 40, short: 25, wait: 35 };
+    }
+    if (consensus === "SHORT") {
+      if (align === "all_align") return { long: 5, short: 70, wait: 25 };
+      if (align === "majority")  return { long: 15, short: 55, wait: 30 };
+      return { long: 25, short: 40, wait: 35 };
+    }
+    // NEUTRAL
+    if (align === "divergent") return { long: 25, short: 25, wait: 50 };
+    return { long: 30, short: 30, wait: 40 };
+  };
+  const prob = computeProb();
+
+  const confPctM = Number.isFinite(Number(d.do_tin_cay_pct)) ? ` (${Math.round(d.do_tin_cay_pct)}%)` : "";
+  let m = `<b>🥇 ${prefix} đa khung: ${tfsLabel}</b> (Tầm nhìn ${htmlEsc(horizon)})\n`;
+  m += `${consensusIcon} Đồng thuận: <b>${consensusVi}</b> | Tin cậy: <b>${htmlEsc(d.do_tin_cay || "?")}${confPctM}</b> | ${alignment}\n`;
   if (d.tom_tat) m += `<i>${htmlEsc(d.tom_tat)}</i>\n`;
 
-  // Xu hướng từng khung — luôn show TẤT CẢ valid TFs (dù AI có miss thì hiện "chưa rõ")
+  // Xu hướng từng khung — compact 1 dòng/khung, bỏ ghi_chu nếu dài
   m += `\n<b>📊 Xu hướng từng khung:</b>\n`;
   const byTf = d.by_tf || {};
   for (const v of valid) {
-    // Try multiple key variants AI có thể dùng
     const b = byTf[v.tf] || byTf[v.tf.replace("m", "p")] || byTf[v.tf.toUpperCase()];
     if (!b) {
-      m += `• <b>${v.tf}</b>: <i>chưa có (AI thiếu data)</i>\n`;
+      m += `• <b>${tfVi(v.tf)}</b>: <i>chưa có data</i>\n`;
       continue;
     }
-    const bIcon = { LONG: "📈", SHORT: "📉", NEUTRAL: "➡️" }[String(b.bias || "").toUpperCase()] || "•";
-    m += `${bIcon} <b>${v.tf}</b>: ${htmlEsc(b.bias || "?")}`;
+    const biasUp = String(b.bias || "").toUpperCase();
+    const bIcon = BIAS_ICON[biasUp] || "•";
+    const biasVi = BIAS_VI[biasUp] || (b.bias || "?");
+    m += `${bIcon} <b>${tfVi(v.tf)}</b>: ${htmlEsc(biasVi)}`;
     if (b.key_level) m += ` | $${fmt2(b.key_level)}`;
-    if (b.ghi_chu) m += ` <i>— ${htmlEsc(b.ghi_chu)}</i>`;
+    if (b.ghi_chu) {
+      const note = String(b.ghi_chu);
+      const noteTrim = note.length > 90 ? note.slice(0, 87) + "…" : note;
+      m += ` <i>— ${htmlEsc(noteTrim)}</i>`;
+    }
     m += `\n`;
   }
 
+  // Kịch bản xác suất tổng quát
+  m += `\n<b>🎲 Xác suất kịch bản:</b>\n`;
+  m += `📈 Tăng (LONG): <b>${prob.long}%</b> | 📉 Giảm (SHORT): <b>${prob.short}%</b> | ⏸️ Chờ: <b>${prob.wait}%</b>\n`;
+
   m += `\n━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n\n`;
 
-  const scenarioBlock = (sc, label, icon) => {
+  const scenarioBlock = (sc, label, icon, probPct) => {
+    const probTag = probPct != null ? ` <i>(xác suất ${probPct}%)</i>` : "";
     if (!sc?.kha_thi) {
-      return `${icon} <b>${label}</b>: ❌ chưa khả thi\n<i>${htmlEsc(sc?.ly_do || "Chưa thuận")}</i>`;
+      const reason = sc?.ly_do || "chưa đủ hợp lực";
+      const reasonTrim = reason.length > 150 ? reason.slice(0, 147) + "…" : reason;
+      return `${icon} <b>${label}</b>: ❌ chưa khả thi${probTag}\n<i>${htmlEsc(reasonTrim)}</i>`;
     }
     const slDist = (sc.entry != null && sc.sl != null) ? Math.abs(sc.entry - sc.sl) : null;
-    let s = `${icon} <b>${label}</b> ✅`;
+    let s = `${icon} <b>${label}</b> ✅${probTag}`;
     if (sc.rr != null) s += ` | R:R: <b>${Number(sc.rr).toFixed(1)}</b>`;
-    s += `\n📍 Điểm vào (Entry): <b>$${fmt2(sc.entry)}</b>\n`;
-    s += `🛑 Cắt lỗ (SL): <b>$${fmt2(sc.sl)}</b>${slDist ? ` <i>(rủi ro ~${slDist.toFixed(2)} điểm)</i>` : ""}\n`;
-    // TP — ưu tiên TP1/2/3 nếu có, fallback TP đơn
+    s += `\n📍 Vào lệnh: <b>$${fmt2(sc.entry)}</b>\n`;
+    s += `🛑 Cắt lỗ (SL): <b>$${fmt2(sc.sl)}</b>${slDist ? ` <i>(${slDist.toFixed(2)} điểm)</i>` : ""}\n`;
     const rrFor = (tp) => (slDist && tp != null) ? Math.abs((tp - sc.entry) / slDist).toFixed(1) : null;
     if (sc.tp1 != null || sc.tp2 != null || sc.tp3 != null) {
-      if (sc.tp1 != null) s += `🎯 Chốt lời 1 (TP1, R:R ${rrFor(sc.tp1) || "?"} — an toàn): <b>$${fmt2(sc.tp1)}</b>\n`;
-      if (sc.tp2 != null) s += `🎯 Chốt lời 2 (TP2, R:R ${rrFor(sc.tp2) || "?"} — kỳ vọng): <b>$${fmt2(sc.tp2)}</b>\n`;
-      if (sc.tp3 != null) s += `🎯 Chốt lời 3 (TP3, R:R ${rrFor(sc.tp3) || "?"} — mở rộng): <b>$${fmt2(sc.tp3)}</b>\n`;
+      const tpParts = [];
+      if (sc.tp1 != null) tpParts.push(`TP1 <b>$${fmt2(sc.tp1)}</b> (R:R ${rrFor(sc.tp1) || "?"})`);
+      if (sc.tp2 != null) tpParts.push(`TP2 <b>$${fmt2(sc.tp2)}</b> (R:R ${rrFor(sc.tp2) || "?"})`);
+      if (sc.tp3 != null) tpParts.push(`TP3 <b>$${fmt2(sc.tp3)}</b> (R:R ${rrFor(sc.tp3) || "?"})`);
+      s += `💰 Chốt lời: ${tpParts.join(" | ")}\n`;
     } else if (sc.tp != null) {
-      s += `🎯 Chốt lời (TP): <b>$${fmt2(sc.tp)}</b>\n`;
+      s += `💰 Chốt lời (TP): <b>$${fmt2(sc.tp)}</b>\n`;
     }
-    if (sc.dieu_kien_confirm) s += `✅ Điều kiện xác nhận: ${htmlEsc(sc.dieu_kien_confirm)}\n`;
-    if (sc.ly_do) s += `<i>💡 ${htmlEsc(sc.ly_do)}</i>`;
+    if (sc.dieu_kien_confirm) s += `✅ Đợi xác nhận: ${htmlEsc(sc.dieu_kien_confirm)}\n`;
     return s;
   };
 
-  m += scenarioBlock(d.long, "MUA (LONG)", "📈") + "\n\n";
-  m += scenarioBlock(d.short, "BÁN (SHORT)", "📉") + "\n\n";
+  m += scenarioBlock(d.long, "MUA (LONG)", "📈", prob.long) + "\n\n";
+  m += scenarioBlock(d.short, "BÁN (SHORT)", "📉", prob.short) + "\n\n";
 
   if ((Array.isArray(d.khang_cu) && d.khang_cu.length) || (Array.isArray(d.ho_tro) && d.ho_tro.length)) {
     m += `<b>📍 Mức giá quan trọng:</b>\n`;
     for (const k of (d.khang_cu || [])) {
       m += `▲ <b>$${fmt2(k.gia)}</b>${k.ghi_chu ? ` <i>— ${htmlEsc(k.ghi_chu)}</i>` : ""}\n`;
     }
-    for (const h of (d.ho_tro || [])) {
-      m += `▼ <b>$${fmt2(h.gia)}</b>${h.ghi_chu ? ` <i>— ${htmlEsc(h.ghi_chu)}</i>` : ""}\n`;
+    for (const hh of (d.ho_tro || [])) {
+      m += `▼ <b>$${fmt2(hh.gia)}</b>${hh.ghi_chu ? ` <i>— ${htmlEsc(hh.ghi_chu)}</i>` : ""}\n`;
     }
     m += `\n`;
   }
 
-  m += `━━━ <b>📊 PHÂN TÍCH TỪ KHUNG LỚN XUỐNG NHỎ</b> ━━━\n`;
-  if (d.phan_tich_top_down) m += htmlEsc(d.phan_tich_top_down) + "\n\n";
+  // Phân tích top-down — gọn lại tối đa 300 chars (đã có tom_tat ở header)
+  if (d.phan_tich_top_down) {
+    const td = String(d.phan_tich_top_down).trim();
+    const tdTrim = td.length > 350 ? td.slice(0, 347) + "…" : td;
+    m += `<b>📊 Phân tích từ khung lớn xuống nhỏ:</b>\n${htmlEsc(tdTrim)}\n\n`;
+  }
 
   if (Array.isArray(d.rui_ro_chinh) && d.rui_ro_chinh.length) {
     m += `<b>⚠️ Rủi ro chính:</b>\n`;
-    for (const r of d.rui_ro_chinh) m += `• ${htmlEsc(r)}\n`;
+    for (const r of d.rui_ro_chinh.slice(0, 3)) {
+      const rt = String(r);
+      m += `• ${htmlEsc(rt.length > 160 ? rt.slice(0, 157) + "…" : rt)}\n`;
+    }
   }
 
   return m;
@@ -5074,28 +5147,38 @@ export default {
       if (!env.TELEGRAM_BOT_TOKEN) {
         return jsonResponse(500, { error: "TELEGRAM_BOT_TOKEN chưa set" }, origin);
       }
+      // Thứ tự ưu tiên gợi ý khi gõ "/" — combo top-down lên đầu vì dùng nhiều nhất.
+      // Telegram giữ ĐÚNG thứ tự trong array này khi hiển thị autocomplete.
       const commands = [
-        { command: "gia",      description: "Giá XAU + indicators" },
-        { command: "nhanh",    description: "Pulse 5 khung (no AI, instant)" },
-        { command: "nhanh5p",  description: "Quick scan 5 phút" },
-        { command: "nhanh15p", description: "Quick scan 15 phút" },
-        { command: "nhanh1h",  description: "Quick scan 1 giờ" },
-        { command: "nhanh4h",  description: "Quick scan 4 giờ" },
-        { command: "nhanh1d",  description: "Quick scan 1 ngày" },
-        { command: "5p",       description: "SMC chi tiết 5 phút" },
+        // ── 1. COMBO TOP-DOWN (dùng nhiều nhất, đưa lên đầu) ──
+        { command: "5p15p1h",       description: "⭐ SMC 3 khung intraday (5p+15p+1g)" },
+        { command: "1h4h1d",        description: "⭐ SMC 3 khung HTF (1g+4g+1d)" },
+        { command: "nhanh5p15p1h",  description: "⭐ Quét nhanh 3 khung intraday" },
+        { command: "nhanh1h4h1d",   description: "⭐ Quét nhanh 3 khung HTF" },
+
+        // ── 2. Giá + tổng quan ──
+        { command: "gia",      description: "Giá XAU + chỉ báo" },
+        { command: "nhanh",    description: "Pulse 5 khung (instant, no AI)" },
+
+        // ── 3. Quét nhanh đơn khung ──
+        { command: "nhanh15p", description: "Quét nhanh 15 phút" },
+        { command: "nhanh1h",  description: "Quét nhanh 1 giờ" },
+        { command: "nhanh4h",  description: "Quét nhanh 4 giờ" },
+        { command: "nhanh5p",  description: "Quét nhanh 5 phút" },
+        { command: "nhanh1d",  description: "Quét nhanh 1 ngày" },
+
+        // ── 4. Phân tích chi tiết đơn khung ──
         { command: "15p",      description: "SMC chi tiết 15 phút" },
         { command: "1h",       description: "SMC chi tiết 1 giờ" },
         { command: "4h",       description: "SMC chi tiết 4 giờ" },
+        { command: "5p",       description: "SMC chi tiết 5 phút" },
         { command: "1d",       description: "SMC chi tiết 1 ngày" },
-        // Combo phổ biến (top-down analysis)
-        { command: "5p15p1h",       description: "SMC 3 khung intraday" },
-        { command: "1h4h1d",        description: "SMC 3 khung HTF" },
-        { command: "nhanh5p15p1h",  description: "Scan 3 khung intraday" },
-        { command: "nhanh1h4h1d",   description: "Scan 3 khung HTF" },
-        { command: "tin",      description: "Tin tức XAU 7 ngày + dự báo catalyst" },
-        { command: "ai",       description: "Tư vấn risk + lot size + TP/SL" },
+
+        // ── 5. Tin tức + utility ──
+        { command: "tin",      description: "Tin tức + dự báo catalyst" },
+        { command: "ai",       description: "Tư vấn risk + lot size" },
         { command: "tudien",   description: "Từ điển thuật ngữ Việt-Anh" },
-        { command: "xoa",      description: "Cấu hình thời gian tự xoá tin (vd /xoa 30p, /xoa 1h, /xoa off)" },
+        { command: "xoa",      description: "Cấu hình tự xoá tin (vd /xoa 30p)" },
         { command: "help",     description: "Hướng dẫn lệnh" },
       ];
       const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {

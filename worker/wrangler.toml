@@ -17,9 +17,13 @@ id = "124855cf2b474b6fba71e1fc4d08681a"
 [ai]
 binding = "AI"
 
-# Cron Trigger — mỗi 5 phút check kỹ thuật + gửi Telegram alert nếu có
+# Cron Trigger — mỗi 3 phút check kỹ thuật + gửi Telegram alert nếu có.
+# Tăng từ 5p → 3p để bắt signal nhanh hơn ~2p. Token/credit usage:
+#   - TD ~900/1600 cap (56%) nhờ early-exit khi không có signal.
+#   - Gemini RPD <2% cap (5 keys × 1500 RPD).
+# Mega-move cooldown adaptive (15p khi vol regime extreme, 30p khi normal).
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/3 * * * *"]
 
 # Tăng CPU limit từ 30s mặc định → 60s. Cần thiết cho lệnh /5p15p1h, /1h4h1d
 # (combo phân tích đa khung): fetch 3-5 nguồn TwelveData parallel + Gemini API
