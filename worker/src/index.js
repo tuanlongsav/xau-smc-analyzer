@@ -1575,7 +1575,8 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
     "tp2": <giá>,
     "tp3": ${tp3Above},    // long; short dùng ${tp3Below}
     "rr_to_tp1": <số thập phân, vd 1.5>,
-    "confidence": "cao|trung bình|thấp"
+    "confidence": "cao|trung bình|thấp",
+    "confidence_pct": <0-100, % xác suất setup này đúng — BẮT BUỘC, đồng nhất với chuỗi confidence>
   }],
   "news_catalyst": "1 CÂU TIẾNG VIỆT ≤120 ký tự về tin nào gây biến động (KHÔNG copy EN nguyên), hoặc null"
 }
@@ -1881,7 +1882,15 @@ ${schemaWithExamples}`;
       for (const s of aiResult.trade_setups.slice(0, 2)) {
         const biasIcon = s.bias === "long" ? "📈" : s.bias === "short" ? "📉" : "🎯";
         const biasText = s.bias === "long" ? "MUA (LONG)" : s.bias === "short" ? "BÁN (SHORT)" : "TRUNG TÍNH";
-        const confText = s.confidence ? ` — độ tin cậy ${h(s.confidence)}` : "";
+        // Confidence: ưu tiên số từ AI, fallback map từ chuỗi
+        const CONF_STR_TO_PCT = { cao: 75, "trung bình": 55, "trung binh": 55, thấp: 35, thap: 35 };
+        let confPct = Number.isFinite(Number(s.confidence_pct)) ? Math.round(Number(s.confidence_pct)) : null;
+        if (confPct == null && s.confidence) {
+          confPct = CONF_STR_TO_PCT[String(s.confidence).toLowerCase().trim()] ?? null;
+        }
+        const confText = s.confidence
+          ? ` — độ tin cậy ${h(s.confidence)}${confPct != null ? ` (${confPct}%)` : ""}`
+          : (confPct != null ? ` — độ tin cậy ${confPct}%` : "");
 
         const ez = Array.isArray(s.entry_zone) ? s.entry_zone.filter(inRange).map(fmtNum) : [];
         const sl = inRange(s.sl) ? fmtNum(s.sl) : null;
