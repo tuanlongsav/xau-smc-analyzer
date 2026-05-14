@@ -1556,6 +1556,16 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
   "direction": "long|short|neutral",
   "confidence_pct": 0-100,
   "summary": "2-3 câu tiếng Việt: phe nào kiểm soát, đang ở giai đoạn nào, có nên hành động gì.",
+  "outlook_short": {
+    "direction": "long|short|neutral",
+    "confidence_pct": <0-100>,
+    "note": "1 câu ngắn TV về xu hướng 15-30 phút tới (vd: 'nến 15p kế tiếp có thể test lại $X')"
+  },
+  "outlook_medium": {
+    "direction": "long|short|neutral",
+    "confidence_pct": <0-100>,
+    "note": "1 câu ngắn TV về xu hướng 1-4 giờ tới (vd: 'phiên Mỹ có thể đẩy giá tới $Y nếu phá $Z')"
+  },
   "key_factors": [
     "Lý do BẢN CHẤT, ≤100 ký tự (vd: 'RSI 1g vẫn dưới 70, trend còn space để đẩy tiếp')",
     "DIỄN GIẢI hàm ý, KHÔNG dump số (KHÔNG: 'RSI 65.2')"
@@ -1747,9 +1757,9 @@ ${schemaWithExamples}`;
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0.4,
-      // 1800 cho phép: summary 2-3 câu + key_factors 3 bullet + watch_levels + 1-2 setup
-      // + news_catalyst — tổng ~600-1000 output tokens trong thực tế
-      maxOutputTokens: 1800,
+      // 2000: summary 2-3 câu + key_factors 3 bullet + 2 outlook (ngắn/trung)
+      // + watch_levels + 1-2 setup + news_catalyst — tổng ~700-1100 output tokens
+      maxOutputTokens: 2000,
       thinkingConfig: { thinkingBudget: 0 },
     },
   };
@@ -1834,6 +1844,25 @@ ${schemaWithExamples}`;
         .filter(Boolean)
         .map(f => f.length > 140 ? f.slice(0, 137) + "…" : f);
       if (trimmed.length > 0) lines.push(trimmed.map(f => "• " + h(f)).join("\n"));
+    }
+
+    // Dự đoán xu hướng theo 2 mốc thời gian (ngắn 15-30p, trung 1-4g)
+    const renderOutlook = (o, labelTime) => {
+      if (!o || typeof o !== "object") return null;
+      const dir = String(o.direction || "").toLowerCase();
+      const dirIcon = dir === "long" ? "📈" : dir === "short" ? "📉" : dir === "neutral" ? "➡️" : "❓";
+      const dirText = dir === "long" ? "TĂNG" : dir === "short" ? "GIẢM" : dir === "neutral" ? "ĐI NGANG" : "?";
+      const conf = Number.isFinite(Number(o.confidence_pct)) ? ` ${Math.round(o.confidence_pct)}%` : "";
+      const note = o.note ? ` — <i>${h(String(o.note).slice(0, 200))}</i>` : "";
+      return `${dirIcon} <b>${labelTime}:</b> ${dirText}${conf}${note}`;
+    };
+    const oShort = renderOutlook(aiResult.outlook_short, "15-30 phút tới");
+    const oMedium = renderOutlook(aiResult.outlook_medium, "1-4 giờ tới");
+    if (oShort || oMedium) {
+      lines.push("");
+      lines.push("⏱️ <b>Dự đoán xu hướng:</b>");
+      if (oShort) lines.push(oShort);
+      if (oMedium) lines.push(oMedium);
     }
     // Mốc theo dõi — ưu tiên AI, fallback rule-based (đảm bảo LUÔN có)
     const fmtVal = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : null;
