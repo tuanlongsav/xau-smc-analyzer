@@ -6,9 +6,11 @@
 // - API calls (TwelveData/Gemini/RSS): network-only (luôn cần fresh)
 // - Icons + Tailwind/CDN: cache-first
 
-const VERSION = "v1.13.0";
+const VERSION = "v1.14.0";
 const APP_CACHE = `xau-smc-app-${VERSION}`;
 
+// App shell — đầy đủ JS modules đang import. Thiếu file → SW không cache,
+// offline mode bị hỏng. Đồng bộ với danh sách ls js/.
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -21,6 +23,7 @@ const APP_SHELL = [
   "./js/prompts.js",
   "./js/gemini.js",
   "./js/chart.js",
+  "./js/news.js",       // RSS news fetcher (thiếu trước đây → news offline fail)
   "./icons/icon-192.png",
   "./icons/icon-512.png",
 ];
@@ -46,13 +49,13 @@ self.addEventListener("fetch", (e) => {
   // Bỏ qua mọi request không phải GET
   if (e.request.method !== "GET") return;
 
-  // API calls → network only (data fresh)
+  // API calls → network only (data fresh, không cache)
   const NETWORK_ONLY_HOSTS = [
-    "api.twelvedata.com",          // (chỉ khi user override Gemini key - không dùng nữa cho data)
-    "generativelanguage.googleapis.com",
-    "api.rss2json.com",
-    "api.allorigins.win",
-    "workers.dev",                 // Cloudflare Worker proxy (Gemini + TwelveData)
+    "generativelanguage.googleapis.com",  // Gemini direct (không dùng nữa, frontend qua Worker)
+    "api.twelvedata.com",                 // TD direct (không dùng nữa, frontend qua Worker)
+    "api.rss2json.com",                   // RSS news
+    "api.allorigins.win",                 // RSS fallback
+    "workers.dev",                        // Cloudflare Worker proxy (Gemini + TwelveData + RSS)
   ];
   if (NETWORK_ONLY_HOSTS.some(h => url.hostname.includes(h))) {
     return; // mặc định fetch — không SW handle

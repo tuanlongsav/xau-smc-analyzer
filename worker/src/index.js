@@ -2114,36 +2114,60 @@ async function runMegaMoveAnalysis(env, ctx) {
  * Gửi message tới chat đã configure (cho cron alert).
  * autoDelete mặc định true — cảnh báo giá sẽ tự xoá sau 1h.
  */
+// Retry sendMessage trên 429 (rate limit) / 5xx (server error) với exponential backoff.
+// Không retry 4xx khác (vd parse error 400) vì retry vô ích.
 async function sendTelegram(env, text, autoDelete = true, parseMode = "Markdown") {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: env.TELEGRAM_CHAT_ID,
-        text,
-        parse_mode: parseMode,
-        disable_web_page_preview: true,
-      }),
-    });
-    if (!r.ok) {
-      console.log(`[telegram] send failed ${r.status} (mode=${parseMode}): ${(await r.text()).slice(0, 300)}`);
-      return false;
-    }
-    if (autoDelete) {
+  const body = JSON.stringify({
+    chat_id: env.TELEGRAM_CHAT_ID,
+    text,
+    parse_mode: parseMode,
+    disable_web_page_preview: true,
+  });
+
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      if (r.ok) {
+        if (autoDelete) {
+          try {
+            const data = await r.json();
+            const messageId = data?.result?.message_id;
+            if (messageId) await scheduleAutoDelete(env, env.TELEGRAM_CHAT_ID, messageId);
+          } catch {}
+        }
+        if (attempt > 0) console.log(`[telegram] OK sau ${attempt} retry`);
+        return true;
+      }
+      // Retry on 429 / 5xx
+      const errText = (await r.text()).slice(0, 300);
+      const transient = r.status === 429 || (r.status >= 500 && r.status < 600);
+      if (!transient || attempt === MAX_RETRIES - 1) {
+        console.log(`[telegram] send failed ${r.status} (mode=${parseMode}, attempt=${attempt + 1}/${MAX_RETRIES}): ${errText}`);
+        return false;
+      }
+      // 429: respect retry_after nếu có; else exponential backoff
+      let waitMs;
       try {
-        const data = await r.json();
-        const messageId = data?.result?.message_id;
-        if (messageId) await scheduleAutoDelete(env, env.TELEGRAM_CHAT_ID, messageId);
+        const j = JSON.parse(errText);
+        waitMs = j?.parameters?.retry_after ? (j.parameters.retry_after * 1000 + 200) : null;
       } catch {}
+      if (!waitMs) waitMs = Math.min(8000, (2 ** attempt) * 1000) + Math.random() * 400;
+      console.log(`[telegram] transient ${r.status}, retry ${attempt + 1}/${MAX_RETRIES} sau ${Math.round(waitMs)}ms`);
+      await new Promise(res => setTimeout(res, waitMs));
+    } catch (e) {
+      console.log(`[telegram] network error attempt ${attempt + 1}/${MAX_RETRIES}: ${e.message}`);
+      if (attempt === MAX_RETRIES - 1) return false;
+      await new Promise(res => setTimeout(res, 1000 * (attempt + 1)));
     }
-    return true;
-  } catch (e) {
-    console.log(`[telegram] error: ${e.message}`);
-    return false;
   }
+  return false;
 }
 
 // Helper: trend assessment từ EMA alignment + price position
@@ -2722,37 +2746,60 @@ async function sendTelegramTo(env, chatId, text, replyToMessageId = null, parseM
       body: buildBody(mode),
     });
   };
-  try {
-    let r = await post(parseMode);
-    let bodyText = null;
-    // Nếu parse mode fail (Markdown/HTML) → retry plain text
-    if (!r.ok && (parseMode === "Markdown" || parseMode === "HTML")) {
-      bodyText = await r.text();
-      if (bodyText.includes("can't parse entities") || bodyText.includes("parse_mode")) {
-        console.log(`[tg-reply] ${parseMode} fail, retry plain. Err: ${bodyText.slice(0, 150)}`);
-        r = await post(null);
-        bodyText = null;
-      } else {
-        console.log(`[tg-reply] ${r.status}: ${bodyText.slice(0, 200)}`);
-      }
-    } else if (!r.ok) {
-      bodyText = await r.text();
-      console.log(`[tg-reply] ${r.status}: ${bodyText.slice(0, 200)}`);
-    }
 
-    // Schedule auto-delete sau 1h nếu gửi thành công + opt-in
-    if (r.ok && autoDelete) {
+  // Retry 429/5xx với exponential backoff. Riêng parse fail → retry plain (không retry).
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      let r = await post(parseMode);
+      if (r.ok) {
+        if (autoDelete) {
+          try {
+            const data = await r.json();
+            const messageId = data?.result?.message_id;
+            if (messageId) await scheduleAutoDelete(env, chatId, messageId);
+          } catch {}
+        }
+        if (attempt > 0) console.log(`[tg-reply] OK sau ${attempt} retry`);
+        return true;
+      }
+      const errText = (await r.text()).slice(0, 300);
+
+      // Parse error → retry với plain text (không tính vào MAX_RETRIES)
+      if ((parseMode === "Markdown" || parseMode === "HTML")
+          && (errText.includes("can't parse entities") || errText.includes("parse_mode"))) {
+        console.log(`[tg-reply] ${parseMode} parse fail, retry plain. Err: ${errText.slice(0, 150)}`);
+        const r2 = await post(null);
+        if (r2.ok && autoDelete) {
+          try {
+            const d = await r2.json();
+            if (d?.result?.message_id) await scheduleAutoDelete(env, chatId, d.result.message_id);
+          } catch {}
+        }
+        return r2.ok;
+      }
+
+      const transient = r.status === 429 || (r.status >= 500 && r.status < 600);
+      if (!transient || attempt === MAX_RETRIES - 1) {
+        console.log(`[tg-reply] ${r.status} (attempt ${attempt + 1}/${MAX_RETRIES}): ${errText}`);
+        return false;
+      }
+      // 429: respect retry_after
+      let waitMs;
       try {
-        const data = await r.json();
-        const messageId = data?.result?.message_id;
-        if (messageId) await scheduleAutoDelete(env, chatId, messageId);
+        const j = JSON.parse(errText);
+        waitMs = j?.parameters?.retry_after ? (j.parameters.retry_after * 1000 + 200) : null;
       } catch {}
+      if (!waitMs) waitMs = Math.min(8000, (2 ** attempt) * 1000) + Math.random() * 400;
+      console.log(`[tg-reply] transient ${r.status}, retry ${attempt + 1}/${MAX_RETRIES} sau ${Math.round(waitMs)}ms`);
+      await new Promise(res => setTimeout(res, waitMs));
+    } catch (e) {
+      console.log(`[tg-reply] network error attempt ${attempt + 1}/${MAX_RETRIES}: ${e.message}`);
+      if (attempt === MAX_RETRIES - 1) return false;
+      await new Promise(res => setTimeout(res, 1000 * (attempt + 1)));
     }
-    return r.ok;
-  } catch (e) {
-    console.log(`[tg-reply] error: ${e.message}`);
-    return false;
   }
+  return false;
 }
 
 const TF_TO_TD = { "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day" };
@@ -3484,7 +3531,7 @@ ${currentPrice != null ? `- Vùng giá: $${(currentPrice * 0.97).toFixed(0)} –
     // Convert Markdown → Telegram HTML (bold/italic/code) — robust hơn parse "Markdown" legacy
     // Telegram Markdown không hỗ trợ **X** (chỉ *X*) → AI thường output **X** sẽ không bold.
     const htmlMsg = markdownToTgHtml(m);
-    const parts = splitForTelegram(htmlMsg, 3900);
+    const parts = splitForTelegram(htmlMsg, 3900, "tin");
     for (let i = 0; i < parts.length; i++) {
       const suffix = parts.length > 1 ? `\n\n<i>[${i + 1}/${parts.length}]</i>` : "";
       await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "HTML");
@@ -3586,7 +3633,7 @@ Trả lời câu hỏi của user dùng giá/indicators thực ở trên. Tính 
     }
 
     const fullMsg = `💬 *Tư vấn:* "${question.length > 80 ? question.slice(0, 80) + "..." : question}"\n\n${text}\n\n_⚠️ Đây là tư vấn quản lý risk giáo dục, KHÔNG phải khuyến nghị đầu tư._`;
-    const parts = splitForTelegram(fullMsg, 3900);
+    const parts = splitForTelegram(fullMsg, 3900, "ai");
     for (let i = 0; i < parts.length; i++) {
       const suffix = parts.length > 1 ? `\n\n_[${i + 1}/${parts.length}]_` : "";
       // parseMode=Markdown với auto-fallback plain nếu AI Markdown lỗi
@@ -4044,7 +4091,7 @@ ${htfBlock}
       // Insert aux block sau header (sau dòng đầu tiên — Phân tích...)
       html = html.replace(/(\n\n)/, `\n${auxLines}\n\n`);
     }
-    const parts = splitForTelegram(html, 3900);
+    const parts = splitForTelegram(html, 3900, `analyze:${tf}`);
     console.log(`[bot] /analyze ${tf} text=${text?.length}c, html=${html.length}c, parts=${parts.length}`);
     for (let i = 0; i < parts.length; i++) {
       const suffix = parts.length > 1 ? `\n\n<i>[${i + 1}/${parts.length}]</i>` : "";
@@ -4125,7 +4172,14 @@ function formatAnalysisHTML(d, tf, horizon) {
  * Split text thành nhiều part fit Telegram 4096 char limit.
  * Cố gắng break ở paragraph boundary để giữ readability.
  */
-function splitForTelegram(text, maxLen = 3900) {
+/**
+ * Split text thành nhiều part fit Telegram 4096 char limit.
+ * Cố gắng break ở paragraph boundary để giữ readability.
+ * @param {string} text
+ * @param {number} maxLen
+ * @param {string} routeTag — tag để log biết route nào bị split (vd "tin", "analyze:15m")
+ */
+function splitForTelegram(text, maxLen = 3900, routeTag = null) {
   if (text.length <= maxLen) return [text];
   const parts = [];
   let remaining = text;
@@ -4134,7 +4188,7 @@ function splitForTelegram(text, maxLen = 3900) {
       parts.push(remaining);
       break;
     }
-    // Ưu tiên break ở \n\n (paragraph), fallback \n (line), cuối cùng cứng
+    // Ưu tiên break ở \n\n (paragraph), fallback \n (line), cuối cùng " " hoặc cứng
     let cut = remaining.lastIndexOf("\n\n", maxLen);
     if (cut === -1 || cut < maxLen / 2) cut = remaining.lastIndexOf("\n", maxLen);
     if (cut === -1 || cut < maxLen / 2) cut = remaining.lastIndexOf(" ", maxLen);
@@ -4142,6 +4196,8 @@ function splitForTelegram(text, maxLen = 3900) {
     parts.push(remaining.slice(0, cut).trimEnd());
     remaining = remaining.slice(cut).trimStart();
   }
+  // Log để dễ trace route nào hay bị split (có thể là dấu hiệu prompt quá dài)
+  console.log(`[tg-split]${routeTag ? ` route=${routeTag}` : ""} ${text.length}c → ${parts.length} parts (sizes: ${parts.map(p => p.length).join(",")})`);
   return parts;
 }
 
@@ -4311,7 +4367,7 @@ LƯU Ý xac_suat_pct: LONG + SHORT ≤ 100. Phần còn lại là xác suất "C
         html = `${auxLines}\n\n${html}`;
       }
     }
-    const parts = splitForTelegram(html, 3900);
+    const parts = splitForTelegram(html, 3900, `multi-tf:${tfs.join("+")}`);
     for (let i = 0; i < parts.length; i++) {
       const suffix = parts.length > 1 ? `\n\n<i>[${i + 1}/${parts.length}]</i>` : "";
       await sendTelegramTo(env, chatId, parts[i] + suffix, i === 0 ? replyTo : null, "HTML");

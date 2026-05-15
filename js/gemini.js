@@ -40,9 +40,8 @@ function extractJSON(text) {
  * @param {object} opts - { maxRetries, fallbackModel }
  */
 function buildGeminiUrl(model) {
-  // LUÔN qua Worker proxy: tránh gọi trực tiếp Google API từ client
-  // (Google chặn API ở 1 số quốc gia bao gồm VN — phải đi qua Cloudflare).
-  // Settings panel đã bỏ nên không còn user key trong localStorage.
+  // LUÔN qua Worker proxy: Google chặn Gemini API ở 1 số quốc gia (VN, CN, HK...)
+  // Frontend không bao giờ tiếp xúc API key trực tiếp.
   if (!CONFIG.GEMINI_PROXY_URL) return null;
   return `${CONFIG.GEMINI_PROXY_URL.replace(/\/$/, "")}/v1beta/models/${model}:generateContent`;
 }

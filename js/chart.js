@@ -28,6 +28,9 @@ function makeTickFormatter(tf) {
 }
 
 let priceChart = null, macdChart = null;
+// Track lần render đầu để biết có nên reset zoom hay giữ vị trí user đang xem.
+let hasInitialZoom = false;
+let lastRenderedTf = null;
 let candleSeries;
 let ema9Series, ema21Series, ema50Series, ema200Series;
 let sma50Series, sma200Series;
@@ -259,10 +262,18 @@ export function updateChart(candles, tf = "15m") {
       })
   );
 
-  // Zoom mặc định: N nến cuối (sync sẽ lan sang RSI/MACD chart)
+  // Zoom: snap về cuối nếu (a) lần đầu render, (b) user đang nhìn cuối (within 5 bars),
+  // hoặc (c) đổi TF. Else giữ nguyên vị trí user đang xem (refresh data realtime).
   const total = candles.length;
-  const from = Math.max(0, total - DEFAULT_VISIBLE_BARS);
-  priceChart.timeScale().setVisibleLogicalRange({ from, to: total - 1 });
+  const cur = priceChart.timeScale().getVisibleLogicalRange();
+  const isAtRightEdge = cur && (total - 1 - cur.to) < 5;
+  const tfChanged = lastRenderedTf !== null && lastRenderedTf !== tf;
+  if (!hasInitialZoom || isAtRightEdge || tfChanged) {
+    const from = Math.max(0, total - DEFAULT_VISIBLE_BARS);
+    priceChart.timeScale().setVisibleLogicalRange({ from, to: total - 1 });
+    hasInitialZoom = true;
+  }
+  lastRenderedTf = tf;
 }
 
 export function resizeChart() {

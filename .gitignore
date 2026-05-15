@@ -14,3 +14,7 @@ package-lock.json
 
 # Local config override (nếu user muốn dev local với key khác)
 js/config.local.js
+
+# Claude Code worktrees + Wrangler cache (không cần commit)
+.claude/
+.wrangler/
