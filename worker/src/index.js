@@ -2736,12 +2736,13 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
     try { return JSON.parse(cached); } catch {}
   }
 
-  // Validate response: với json mode, content text PHẢI parse được JSON
+  // Validate response: text KHÔNG được rỗng cho MỌI mode (tránh cache empty/safety-block).
+  // Với JSON mode còn phải parse được JSON.
   const isValidResponse = (resp) => {
     if (!resp) return false;
-    if (!wantJson) return true;
     const text = resp?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return false;
+    if (!text || !String(text).trim()) return false; // empty / whitespace-only / safety block
+    if (!wantJson) return true;
     return extractJSON(text) !== null;
   };
 
@@ -6006,28 +6007,32 @@ export default {
       }, origin);
     }
 
-    // Clear alert cooldowns (KV) — để re-test cùng alert ngay không phải đợi 1h
+    // Clear alert cooldowns (KV) — list ALL prefix "alert:" và xóa.
+    // Phải list-then-delete vì cooldown thật bây giờ là `alert:{key}:zXXX`
+    // (price-zone aware), không phải `alert:{key}` plain.
     if (url.pathname === "/clear-alert-cooldowns") {
       if (!env.CACHE) return jsonResponse(500, { error: "KV not configured" }, origin);
-      // Note: KV không list keys dễ dàng từ Worker. Manual delete known alert keys.
-      const knownKeys = [
-        "alert:rsi_overbought", "alert:rsi_oversold",
-        "alert:bb_up", "alert:bb_dn",
-        "alert:golden", "alert:death",
-        "alert:ema_up", "alert:ema_dn",
-        "alert:piv_up_r1", "alert:piv_up_r2", "alert:piv_dn_s1", "alert:piv_dn_s2",
-        "alert:big_move_up", "alert:big_move_dn",
-        "alert:multi_move_up", "alert:multi_move_dn",
-        "alert:vol_spike", "alert:bb_expand",
-        "alert:wick_top", "alert:wick_bottom",
-        "alert:gap_up", "alert:gap_dn",
-        "alert:liq_sweep_up", "alert:liq_sweep_dn",
-      ];
       let cleared = 0;
-      for (const k of knownKeys) {
-        try { await env.CACHE.delete(k); cleared++; } catch {}
-      }
-      return jsonResponse(200, { cleared, message: `Đã xóa ${cleared} khóa cooldown cảnh báo giá` }, origin);
+      let cursor = undefined;
+      const keysCleared = [];
+      // KV list paginated — loop tới khi list_complete=true.
+      // Mỗi page tối đa 1000 keys; alert cooldown thường <100 → 1 page là đủ.
+      do {
+        const result = await env.CACHE.list({ prefix: "alert:", cursor });
+        for (const entry of result.keys) {
+          try {
+            await env.CACHE.delete(entry.name);
+            cleared++;
+            if (keysCleared.length < 20) keysCleared.push(entry.name);
+          } catch {}
+        }
+        cursor = result.list_complete ? null : result.cursor;
+      } while (cursor);
+      return jsonResponse(200, {
+        cleared,
+        sample_keys: keysCleared,
+        message: `Đã xóa ${cleared} khóa cooldown cảnh báo (bao gồm price-zone variants)`,
+      }, origin);
     }
 
     // Block non-allowed origins for actual API calls
