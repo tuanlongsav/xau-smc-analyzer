@@ -1724,7 +1724,9 @@ async function runDeepAnalysis(env, ctx) {
     return { skipped: "cooldown" };
   }
 
-  const latest = e15m[e15m.length - 1];
+  // Dùng ctx.latest (nến 15p ĐÃ ĐÓNG, do cron pickTriggerCandle chọn).
+  // Fallback last array entry chỉ khi caller không truyền (vd test endpoint).
+  const latest = ctx.latest || e15m[e15m.length - 1];
   const sessionVi = SESSION_VI[session.code] || session.code;
   const regimeVi = REGIME_VI[regime.code] || regime.code;
 
@@ -1754,10 +1756,16 @@ async function runDeepAnalysis(env, ctx) {
   const last4h = e4h?.[e4h.length - 1];
   const fmtNum = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "?";
 
-  // Bias per TF (đơn giản hoá: dựa EMA21 vs close)
+  // Bias per TF — dùng biasOf() chung với phần Telegram khác để đồng nhất.
+  // biasOf trả {icon, short, dir} hoặc null khi thiếu EMA200/50/21.
   const biasOfTf = (c) => {
-    if (!c || c.close == null || c.ema21 == null) return "?";
-    return c.close > c.ema21 ? "TĂNG" : c.close < c.ema21 ? "GIẢM" : "đi ngang";
+    const b = biasOf(c);
+    if (!b) {
+      // Fallback nhẹ khi thiếu EMA dài hạn: so close vs EMA21
+      if (!c || c.close == null || c.ema21 == null) return "?";
+      return c.close > c.ema21 ? "tăng" : c.close < c.ema21 ? "giảm" : "đi ngang";
+    }
+    return b.short.toLowerCase(); // "tăng mạnh" / "giảm giá" / "đi ngang"
   };
 
   const pivLine = pivotsCtx
@@ -4728,10 +4736,14 @@ async function runAlertCheck(env, { force = false } = {}) {
       console.log(`[cron] 15m nến mới nhất chưa đóng → trigger trên nến đã đóng kế trước`);
     }
 
-    const regime = classifyVolRegime(e15m);
+    // closedE15m = e15m bỏ nến cuối nếu chưa đóng → mọi window-based detector
+    // (multi-move, range breakout, ATR spike) đều dùng nến đã đóng.
+    const closedE15m = isLatestClosed ? e15m : e15m.slice(0, -1);
+
+    const regime = classifyVolRegime(closedE15m);
     const regimeShiftAlert = await trackVolRegime(env, regime);
-    const mega = detectMegaMove(e15m);
-    const alerts = await detectFreshAlerts(env, latest, prev, pivots, e15m);
+    const mega = detectMegaMove(closedE15m);
+    const alerts = await detectFreshAlerts(env, latest, prev, pivots, closedE15m);
     if (regimeShiftAlert) alerts.unshift(regimeShiftAlert);
 
     const session = getSessionInfo();
@@ -4774,14 +4786,15 @@ async function runAlertCheck(env, { force = false } = {}) {
 
       let result = null;
       try {
-        result = await runDeepAnalysis(env, { mode: "mega", mega, e5m, e15m, e1h, e4h, regime, session, alerts: extraAlerts, latest, pivots, mtfContext });
+        result = await runDeepAnalysis(env, { mode: "mega", mega, e5m, e15m: closedE15m, e1h, e4h, regime, session, alerts: extraAlerts, latest, pivots, mtfContext });
       } catch (e) {
         console.log(`[cron] mega deep analysis fail: ${e.message}`);
       }
 
-      // Mark cooldown alerts CHỈ KHI đã gửi thành công (tránh alert lost-in-cooldown)
+      // Mark cooldown alerts CHỈ KHI đã gửi thành công + alert có key thật.
+      // regimeShiftAlert không có key → filter để tránh write KV "alert:undefined".
       if (result?.sent && extraAlerts.length > 0) {
-        for (const a of extraAlerts) await markAlerted(env, a.key);
+        for (const a of extraAlerts) if (a.key) await markAlerted(env, a.key);
       }
 
       // Fallback: mega cooldown nhưng còn non-redundant alerts → gửi regular alerts
@@ -4789,7 +4802,7 @@ async function runAlertCheck(env, { force = false } = {}) {
         const msg = formatAlertMessage(latest, extraAlerts, pivots, mtfContext);
         const ok = await sendTelegram(env, msg);
         if (ok) {
-          for (const a of extraAlerts) await markAlerted(env, a.key);
+          for (const a of extraAlerts) if (a.key) await markAlerted(env, a.key);
         }
         console.log(`[cron] mega cooldown, fallback ${extraAlerts.length} non-redundant alerts, telegram=${ok}`);
       }
@@ -4798,19 +4811,19 @@ async function runAlertCheck(env, { force = false } = {}) {
       console.log(`[cron] ${alerts.length} alerts triggered, run deep analysis (no mega)`);
       let result = null;
       try {
-        result = await runDeepAnalysis(env, { mode: "alerts", alerts, e5m, e15m, e1h, e4h, regime, session, latest, pivots, mtfContext });
+        result = await runDeepAnalysis(env, { mode: "alerts", alerts, e5m, e15m: closedE15m, e1h, e4h, regime, session, latest, pivots, mtfContext });
       } catch (e) {
         console.log(`[cron] alerts deep analysis fail: ${e.message}`);
       }
-      // Mark alert keys nếu gửi OK
+      // Mark alert keys nếu gửi OK (skip regimeShiftAlert vì không có key)
       if (result?.sent) {
-        for (const a of alerts) await markAlerted(env, a.key);
+        for (const a of alerts) if (a.key) await markAlerted(env, a.key);
       } else if (result?.skipped === "cooldown") {
         // Deep cooldown: gửi fallback rule-based ngắn để user không bỏ lỡ alert mới
         const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
         const ok = await sendTelegram(env, msg);
         if (ok) {
-          for (const a of alerts) await markAlerted(env, a.key);
+          for (const a of alerts) if (a.key) await markAlerted(env, a.key);
         }
         console.log(`[cron] alerts deep cooldown, fallback rule-based, telegram=${ok}`);
       }
