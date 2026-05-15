@@ -664,29 +664,47 @@ function interpretAuxImpact(auxCtx) {
 
 // ──────────────────────────────────────────────────────────
 // Alert detection + dedup via KV
+// Cooldown 1h theo `key + price_zone` — alert ở vùng giá KHÁC vẫn fire
+// (vd RSI overbought lần 1 ở $4700, lần 2 ở $4750 → cả 2 đều fire vì
+// khác zone). Zone bucket = floor(price / (2 × ATR)) — mỗi zone ~2×ATR.
 // ──────────────────────────────────────────────────────────
-const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1h dedup, không spam cùng alert
+const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1h dedup
 
-async function alertCooldownOk(env, key) {
+function priceZoneKey(price, atr) {
+  if (!Number.isFinite(price) || !Number.isFinite(atr) || atr <= 0) return "z0";
+  const zone = Math.floor(price / (atr * 2));
+  return `z${zone}`;
+}
+
+function cooldownCacheKey(alertKey, priceCtx) {
+  if (priceCtx?.price != null && priceCtx?.atr != null) {
+    return `alert:${alertKey}:${priceZoneKey(priceCtx.price, priceCtx.atr)}`;
+  }
+  return `alert:${alertKey}`;
+}
+
+async function alertCooldownOk(env, key, priceCtx = null) {
   if (!env.CACHE) return true;
-  const last = await env.CACHE.get(`alert:${key}`);
+  const last = await env.CACHE.get(cooldownCacheKey(key, priceCtx));
   if (!last) return true;
   return Date.now() - parseInt(last) > ALERT_COOLDOWN_MS;
 }
 
-async function markAlerted(env, key) {
+async function markAlerted(env, key, priceCtx = null) {
   if (!env.CACHE) return;
-  await env.CACHE.put(`alert:${key}`, String(Date.now()), { expirationTtl: 7200 });
+  await env.CACHE.put(cooldownCacheKey(key, priceCtx), String(Date.now()), { expirationTtl: 7200 });
 }
 
 async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
   const out = [];
+  // Cooldown per (key + price_zone) — alert ở vùng giá khác vẫn fire.
+  const priceCtx = { price: latest?.close, atr: latest?.atr };
   // KHÔNG markAlerted ở đây — chỉ check cooldown để filter.
   // markAlerted được gọi SAU KHI Telegram gửi thành công (trong cron),
   // tránh case: detect → mark cooldown → deep analysis skip → alert mất 1h.
   const push = async (key, icon, text, suggestion = null) => {
-    if (await alertCooldownOk(env, key)) {
-      out.push({ key, icon, text, suggestion });
+    if (await alertCooldownOk(env, key, priceCtx)) {
+      out.push({ key, icon, text, suggestion, priceCtx });
     }
   };
 
@@ -1683,6 +1701,7 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
   "direction": "long|short|neutral",
   "confidence_pct": 0-100,
   "trade_status": "enterable|watch|avoid",
+  "move_phase": "impulse|exhaustion|retest|mean_reversion|consolidation",
   "summary": "2-3 câu tiếng Việt: phe nào kiểm soát, đang ở giai đoạn nào, có nên hành động gì.",
   "outlook_short": {
     "direction": "long|short|neutral",
@@ -1722,6 +1741,7 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
 
 QUY TẮC TUYỆT ĐỐI:
 - **trade_status BẮT BUỘC**: "enterable" (≥3 confluence, setup rõ), "watch" (signal có nhưng đợi xác nhận), "avoid" (xung đột/data stale/đảo chiều không rõ).
+- **move_phase BẮT BUỘC** (đặc biệt cho mega-move): "impulse" (đẩy mạnh tiếp diễn), "exhaustion" (đà yếu, gần đỉnh/đáy), "retest" (kiểm tra lại mức phá), "mean_reversion" (về EMA/giá trung bình), "consolidation" (đi ngang sau move). Dùng để tránh câu trả lời chung chung reversal/continuation.
 - Giá là SỐ TUYỆT ĐỐI trong $${(currentPrice - atr * 5).toFixed(0)}-$${(currentPrice + atr * 5).toFixed(0)}. KHÔNG dùng $1.95/$1.00 — đó là sai.
 - Long: SL < entry < TP1 < TP2 < TP3. Short: SL > entry > TP1 > TP2 > TP3.
 - SL-entry ≥ 1× ATR (~$${atr.toFixed(0)}). TP1 ≥ entry ± 1× ATR.
@@ -1890,7 +1910,32 @@ ${reversal.factors.length > 0 ? reversal.factors.map(f => "- " + f).join("\n") :
 ${alerts.slice(0, 8).map(a => "- " + String(a.text || "").replace(/\*/g, "")).join("\n")}`;
   }
 
-  // Phần 4: NEWS
+  // Phần 4a: ECONOMIC EVENTS SẮP TỚI (ưu tiên cao hơn RSS — actionable, có ngày/giờ chính xác)
+  // Fetch lịch finnhub, lọc event trong 8h tới (±4h padding). Nếu có event high-impact
+  // sắp release, đó là catalyst MẠNH hơn nhiều so với RSS headline chung chung.
+  let upcomingEventsBlock = "";
+  try {
+    const cal = await fetchEconomicCalendar(env);
+    const nowTs = Date.now();
+    const upcoming = (cal || [])
+      .filter(e => e.ts > nowTs && e.ts < nowTs + 8 * 3600 * 1000)
+      .sort((a, b) => a.ts - b.ts)
+      .slice(0, 3);
+    if (upcoming.length > 0) {
+      upcomingEventsBlock = "\n\n## ⏰ EVENT SẮP TỚI (8h):\n" + upcoming.map(e => {
+        const minutes = Math.round((e.ts - nowTs) / 60000);
+        const timeVn = new Date(e.ts).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false, hour: "2-digit", minute: "2-digit" });
+        const meta = [];
+        if (e.forecast) meta.push(`dự báo ${e.forecast}`);
+        if (e.previous) meta.push(`lần trước ${e.previous}`);
+        return `- ${e.title} (USD, High) — ${timeVn} giờ VN (còn ${minutes}p)${meta.length ? " | " + meta.join(", ") : ""}`;
+      }).join("\n") + "\n⚠️ Cân nhắc tác động sự kiện vào setup — DXY/XAU thường biến động ±2× ATR thường sau release.";
+    }
+  } catch (e) {
+    console.log(`[deep] event fetch fail: ${e.message}`);
+  }
+
+  // Phần 4b: NEWS (RSS — chỉ phụ trợ context, ít actionable hơn event)
   const newsBlock = news.length > 0
     ? `\n\n## TIN MỚI (gốc EN — dịch vào headlines_vi):\n${news.slice(0, 3).map((n, i) => `${i + 1}. ${n.title}${n.summary && n.summary.length > 30 ? " — " + n.summary.slice(0, 120) : ""}`).join("\n")}`
     : "";
@@ -1902,7 +1947,7 @@ ${alerts.slice(0, 8).map(a => "- " + String(a.text || "").replace(/\*/g, "")).jo
 
   const prompt = `${intro}
 
-${context}${signalsBlock}${newsBlock}
+${context}${signalsBlock}${upcomingEventsBlock}${newsBlock}
 
 ${schemaWithExamples}`;
 
@@ -1985,31 +2030,44 @@ ${schemaWithExamples}`;
       : "";
     lines.push(`🤖 <b>AI: ${h(verdictText)}${conf != null ? ` (${h(conf)}%)` : ""}${dirText ? " — " + dirText : ""}</b>`);
 
-    // Trade status badge — render ngay sau verdict line cho dễ scan
+    // Trade status + move_phase badge — render ngay sau verdict line cho dễ scan
     const TRADE_STATUS_BADGE = {
       enterable: "🟢 <b>CÓ THỂ VÀO LỆNH</b>",
       watch: "🟡 <b>CHỈ THEO DÕI</b>",
       avoid: "🔴 <b>TRÁNH GIAO DỊCH</b>",
     };
+    const MOVE_PHASE_VI = {
+      impulse: "💨 Sóng đẩy (impulse)",
+      exhaustion: "🔋 Đà kiệt sức (exhaustion)",
+      retest: "🔁 Kiểm tra lại (retest)",
+      mean_reversion: "🎯 Hồi về trung bình (mean reversion)",
+      consolidation: "⏸️ Tích lũy (consolidation)",
+    };
     const tradeStatus = (aiResult.trade_status || "").toString().toLowerCase();
-    if (TRADE_STATUS_BADGE[tradeStatus]) {
-      lines.push(TRADE_STATUS_BADGE[tradeStatus]);
+    const movePhase = (aiResult.move_phase || "").toString().toLowerCase();
+    const statusBadge = TRADE_STATUS_BADGE[tradeStatus];
+    const phaseBadge = MOVE_PHASE_VI[movePhase];
+    if (statusBadge || phaseBadge) {
+      const parts = [];
+      if (statusBadge) parts.push(statusBadge);
+      if (phaseBadge && mode === "mega") parts.push(`<i>${phaseBadge}</i>`);
+      lines.push(parts.join(" | "));
     }
 
-    // Summary 2-3 câu — restore lại để user có context dễ đọc
+    // Pre-compute Summary + key_factors lines — sẽ push sau KẾ HOẠCH (trade_setups)
+    // Thứ tự render mới: Bias → Mốc → Kế hoạch → Lý do (theo audit feedback).
+    const deferredReasonLines = [];
     if (aiResult.summary && typeof aiResult.summary === "string") {
       const s = aiResult.summary.trim();
       const sTrim = s.length > 400 ? s.slice(0, 397) + "…" : s;
-      lines.push(h(sTrim));
+      deferredReasonLines.push(h(sTrim));
     }
-
-    // key_factors: tối đa 3 bullet, mỗi cái ≤140 chars
     if (Array.isArray(aiResult.key_factors) && aiResult.key_factors.length > 0) {
       const trimmed = aiResult.key_factors.slice(0, 3)
         .map(f => String(f || "").trim())
         .filter(Boolean)
         .map(f => f.length > 140 ? f.slice(0, 137) + "…" : f);
-      if (trimmed.length > 0) lines.push(trimmed.map(f => "• " + h(f)).join("\n"));
+      if (trimmed.length > 0) deferredReasonLines.push(trimmed.map(f => "• " + h(f)).join("\n"));
     }
 
     // Dự đoán xu hướng theo 2 mốc thời gian (ngắn 15-30p, trung 1-4g)
@@ -2156,6 +2214,14 @@ ${schemaWithExamples}`;
         lines.push(`   ⚖️ R:R 1:1 / 1:2 / 1:3 (TP1/TP2/TP3)`);
         renderedAnySetup = true;
       }
+    }
+
+    // 💡 LÝ DO (summary + key_factors) — đẩy xuống đây để đúng thứ tự
+    // Bias → Mốc → Kế hoạch → Lý do (theo audit suggestion).
+    if (deferredReasonLines.length > 0) {
+      lines.push("");
+      lines.push("💡 <b>Lý do:</b>");
+      lines.push(deferredReasonLines.join("\n"));
     }
 
     // news_catalyst: 1 dòng tổng hợp tin (đã thay thế block headlines riêng)
@@ -4829,6 +4895,28 @@ async function _handleTelegramUpdate(env, update) {
 
 // Main cron handler — chạy mỗi 5 phút.
 // Luôn dọn auto-delete trước, ngay cả khi không có alert mới.
+// Cron trace — rolling log 50 entries gần nhất trong KV.
+// Mục đích: khi bot im lặng, user có thể dùng /trace để xem lý do
+// (cooldown / no signal / weak alerts / AI fail / etc).
+const CRON_TRACE_KEY = "cron:trace";
+const CRON_TRACE_MAX = 50;
+
+async function appendCronTrace(env, entry) {
+  if (!env.CACHE) return;
+  try {
+    const cur = await env.CACHE.get(CRON_TRACE_KEY);
+    let arr = [];
+    if (cur) {
+      try { arr = JSON.parse(cur); } catch {}
+    }
+    arr.push({ ts: Date.now(), ...entry });
+    if (arr.length > CRON_TRACE_MAX) arr = arr.slice(-CRON_TRACE_MAX);
+    await env.CACHE.put(CRON_TRACE_KEY, JSON.stringify(arr), { expirationTtl: 7 * 86400 });
+  } catch (e) {
+    console.log(`[trace] append fail: ${e.message}`);
+  }
+}
+
 async function runAlertCheck(env, { force = false } = {}) {
   // Dọn message hết hạn — ALWAYS chạy (kể cả thiếu Telegram secret, kể cả cuối tuần).
   await cleanupExpiredMessages(env);
@@ -4905,6 +4993,7 @@ async function runAlertCheck(env, { force = false } = {}) {
     const session = getSessionInfo(latest?.time ? new Date((latest.time + 450) * 1000) : new Date());
     if (alerts.length === 0 && !mega.triggered) {
       console.log(`[cron] no signal, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)} session=${session.code} M=${session.volMult} regime=${regime.code}(${regime.ratio?.toFixed(2)}x) [skip 5m/1h fetch]`);
+      await appendCronTrace(env, { action: "no_signal", price: latest.close, rsi: latest.rsi, regime: regime.code, session: session.code });
       return;
     }
 
@@ -4948,35 +5037,52 @@ async function runAlertCheck(env, { force = false } = {}) {
       }
 
       // Mark cooldown alerts CHỈ KHI đã gửi thành công + alert có key thật.
-      // regimeShiftAlert không có key → filter để tránh write KV "alert:undefined".
       if (result?.sent && extraAlerts.length > 0) {
-        for (const a of extraAlerts) if (a.key) await markAlerted(env, a.key);
+        for (const a of extraAlerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
       }
 
       // Fallback: mega cooldown nhưng còn non-redundant alerts → gửi regular alerts
+      let fallbackOk = null;
       if (result?.skipped === "cooldown" && extraAlerts.length > 0) {
         const msg = formatAlertMessage(latest, extraAlerts, pivots, mtfContext);
-        const ok = await sendTelegram(env, msg);
-        if (ok) {
-          for (const a of extraAlerts) if (a.key) await markAlerted(env, a.key);
+        fallbackOk = await sendTelegram(env, msg);
+        if (fallbackOk) {
+          for (const a of extraAlerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
         }
-        console.log(`[cron] mega cooldown, fallback ${extraAlerts.length} non-redundant alerts, telegram=${ok}`);
+        console.log(`[cron] mega cooldown, fallback ${extraAlerts.length} non-redundant alerts, telegram=${fallbackOk}`);
       }
+
+      await appendCronTrace(env, {
+        action: "mega",
+        price: latest.close,
+        mega_dir: mega.direction,
+        mega_dollar: mega.dollarMove,
+        extra_keys: extraAlerts.map(a => a.key).filter(Boolean),
+        result: result?.sent ? "sent" : (result?.skipped || "fail"),
+        fallback: fallbackOk,
+      });
     } else if (alerts.length > 0) {
       // Regular alerts → gate by severity score:
-      //   weak (<4 pts):  chỉ gửi fallback rule-based, KHÔNG gọi AI (tiết kiệm token cho noise alerts)
+      //   weak (<4 pts):  chỉ gửi fallback rule-based, KHÔNG gọi AI
       //   medium+ (≥4):   deep AI analysis như trước
       const score = scoreAlerts(alerts);
-      console.log(`[cron] ${alerts.length} alerts (score ${score.total}, dir=${score.primaryDirection}, weak=${score.isWeak})`);
+      const alertKeys = alerts.map(a => a.key).filter(Boolean);
+      console.log(`[cron] ${alerts.length} alerts (score ${score.total}, dir=${score.primaryDirection}, weak=${score.isWeak}) keys=${alertKeys.join(",")}`);
 
       if (score.isWeak) {
-        // Tín hiệu yếu → fallback rule-based only (đỡ tốn Gemini tokens cho RSI/EMA cross đơn lẻ)
         const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
         const ok = await sendTelegram(env, msg);
         if (ok) {
-          for (const a of alerts) if (a.key) await markAlerted(env, a.key);
+          for (const a of alerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
         }
         console.log(`[cron] weak alerts (score ${score.total}), fallback rule-based only, telegram=${ok}`);
+        await appendCronTrace(env, {
+          action: "weak_fallback",
+          price: latest.close,
+          score: score.total, dir: score.primaryDirection,
+          keys: alertKeys,
+          result: ok ? "sent" : "fail",
+        });
       } else {
         let result = null;
         try {
@@ -4984,16 +5090,25 @@ async function runAlertCheck(env, { force = false } = {}) {
         } catch (e) {
           console.log(`[cron] alerts deep analysis fail: ${e.message}`);
         }
+        let fbOk = null;
         if (result?.sent) {
-          for (const a of alerts) if (a.key) await markAlerted(env, a.key);
+          for (const a of alerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
         } else if (result?.skipped === "cooldown") {
           const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
-          const ok = await sendTelegram(env, msg);
-          if (ok) {
-            for (const a of alerts) if (a.key) await markAlerted(env, a.key);
+          fbOk = await sendTelegram(env, msg);
+          if (fbOk) {
+            for (const a of alerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
           }
-          console.log(`[cron] alerts deep cooldown (score ${score.total}), fallback, telegram=${ok}`);
+          console.log(`[cron] alerts deep cooldown (score ${score.total}), fallback, telegram=${fbOk}`);
         }
+        await appendCronTrace(env, {
+          action: "deep_ai",
+          price: latest.close,
+          score: score.total, dir: score.primaryDirection,
+          keys: alertKeys,
+          result: result?.sent ? "sent" : (result?.skipped || "fail"),
+          fallback: fbOk,
+        });
       }
     }
   } catch (e) {
@@ -5280,6 +5395,28 @@ export default {
     //   force=1 — bỏ qua trigger check (dùng alerts giả nếu không có alerts thật)
     //   dry=1 — KHÔNG gửi Telegram
     //   reset_cooldown=1 — xoá KV cooldown
+    // GET /trace?n=20 — xem N entry cron trace gần nhất.
+    // Hữu ích khi bot im lặng — biết được lý do (cooldown / weak / no signal / fail).
+    if (url.pathname === "/trace") {
+      const n = Math.min(parseInt(url.searchParams.get("n") || "20"), 50);
+      let trace = [];
+      if (env.CACHE) {
+        const raw = await env.CACHE.get("cron:trace");
+        if (raw) {
+          try { trace = JSON.parse(raw); } catch {}
+        }
+      }
+      const slice = trace.slice(-n).reverse().map(e => ({
+        ...e,
+        time_vn: new Date(e.ts).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false }),
+      }));
+      return jsonResponse(200, {
+        total_stored: trace.length,
+        returned: slice.length,
+        entries: slice,
+      }, origin);
+    }
+
     if (url.pathname === "/test-alerts") {
       const force = url.searchParams.get("force") === "1";
       const dry = url.searchParams.get("dry") === "1";
