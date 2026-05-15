@@ -1033,6 +1033,88 @@ function pickTriggerCandle(candlesEnriched, intervalSec = 15 * 60) {
   };
 }
 
+// Map TF code → giây mỗi nến — dùng cho pickTriggerCandle + checkDataFreshness
+const TF_INTERVAL_SEC = {
+  "5m": 5 * 60, "15m": 15 * 60, "1h": 60 * 60, "4h": 4 * 60 * 60, "1d": 24 * 60 * 60,
+};
+
+/**
+ * Kiểm tra độ mới của candle data.
+ * TwelveData có thể trả nến cũ khi market đóng (T7/CN, holidays) hoặc lag.
+ * Returns { isStale, lagMinutes, ageRatio }.
+ *   - ageRatio: tỉ lệ tuổi nến so với interval (1.0 = đang chạy, 2.0 = chậm 1 nến).
+ *   - isStale: true khi ageRatio > 2.5 → caller nên warn + giảm độ tin cậy.
+ */
+function checkDataFreshness(candle, intervalSec) {
+  if (!candle?.time) return { isStale: true, lagMinutes: null, ageRatio: null, reason: "no_time" };
+  const ageSec = Math.floor(Date.now() / 1000) - candle.time;
+  const ageRatio = ageSec / intervalSec;
+  const lagMinutes = Math.floor(ageSec / 60);
+  return {
+    isStale: ageRatio > 2.5,
+    lagMinutes,
+    ageRatio,
+    reason: ageRatio > 2.5 ? `nến mới nhất ${lagMinutes} phút trước (>${(ageRatio).toFixed(1)}× interval)` : null,
+  };
+}
+
+/**
+ * Chấm điểm severity cho list alerts vừa kích hoạt.
+ *   - strong (4 pts): mega/multi-move, vol_spike, BB expansion, gap, sweep, range breakout, golden/death cross
+ *   - medium (2-3 pts): pivot break, wick rejection
+ *   - weak (1 pt): RSI extreme, BB touch, EMA cross
+ *
+ * Returns { total, isWeak, isMedium, isStrong, alignmentBonus, primaryDirection }.
+ * Caller dùng để gate AI: weak-only → fallback rule-based; medium+ → deep AI.
+ */
+const ALERT_SEVERITY = {
+  // strong (4 pts) — tín hiệu mạnh, hiếm, đáng deep AI
+  golden: 4, death: 4,
+  big_move_up: 4, big_move_dn: 4,
+  multi_move_up: 4, multi_move_dn: 4,
+  vol_spike: 4, bb_expand: 4,
+  gap_up: 4, gap_dn: 4,
+  liq_sweep_up: 4, liq_sweep_dn: 4,
+  range_breakout_up: 4, range_breakout_dn: 4,
+  // medium (2-3 pts) — pivot break/wick rejection
+  piv_up_r1: 2, piv_dn_r1: 2, piv_up_s1: 2, piv_dn_s1: 2,
+  piv_up_r2: 3, piv_dn_r2: 3, piv_up_s2: 3, piv_dn_s2: 3,
+  wick_top: 2, wick_bottom: 2,
+  // weak (1 pt) — RSI/BB/EMA cross đơn lẻ
+  rsi_overbought: 1, rsi_oversold: 1,
+  bb_up: 1, bb_dn: 1,
+  ema_up: 1, ema_dn: 1,
+};
+
+function scoreAlerts(alerts) {
+  let total = 0;
+  let upScore = 0, downScore = 0;
+  for (const a of alerts) {
+    if (!a?.key) continue; // bỏ regimeShiftAlert
+    const sev = ALERT_SEVERITY[a.key] || 1;
+    total += sev;
+    // Detect direction từ key suffix
+    const k = a.key;
+    if (/_up$|_up_|golden|overbought$|bb_up$|piv_up/.test(k)) upScore += sev;
+    else if (/_dn$|_dn_|death|oversold$|bb_dn$|piv_dn/.test(k)) downScore += sev;
+  }
+  // Confluence bonus: nhiều alerts cùng hướng
+  const aligned = Math.max(upScore, downScore);
+  const alignBonus = aligned >= 6 ? 3 : aligned >= 4 ? 2 : 0;
+  const finalScore = total + alignBonus;
+  return {
+    total: finalScore,
+    raw: total,
+    alignmentBonus: alignBonus,
+    primaryDirection: upScore > downScore ? "up" : downScore > upScore ? "down" : "mixed",
+    upScore, downScore,
+    // Thresholds: weak <4, medium 4-7, strong ≥8
+    isWeak: finalScore < 4,
+    isMedium: finalScore >= 4 && finalScore < 8,
+    isStrong: finalScore >= 8,
+  };
+}
+
 function detectMegaMove(candlesEnriched) {
   if (!Array.isArray(candlesEnriched) || candlesEnriched.length < 4) {
     return { triggered: false };
@@ -1600,6 +1682,7 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
   "verdict": "reversal_strong|reversal_likely|continuation|continuation_likely|mixed|wait",
   "direction": "long|short|neutral",
   "confidence_pct": 0-100,
+  "trade_status": "enterable|watch|avoid",
   "summary": "2-3 câu tiếng Việt: phe nào kiểm soát, đang ở giai đoạn nào, có nên hành động gì.",
   "outlook_short": {
     "direction": "long|short|neutral",
@@ -1638,6 +1721,7 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
 }
 
 QUY TẮC TUYỆT ĐỐI:
+- **trade_status BẮT BUỘC**: "enterable" (≥3 confluence, setup rõ), "watch" (signal có nhưng đợi xác nhận), "avoid" (xung đột/data stale/đảo chiều không rõ).
 - Giá là SỐ TUYỆT ĐỐI trong $${(currentPrice - atr * 5).toFixed(0)}-$${(currentPrice + atr * 5).toFixed(0)}. KHÔNG dùng $1.95/$1.00 — đó là sai.
 - Long: SL < entry < TP1 < TP2 < TP3. Short: SL > entry > TP1 > TP2 > TP3.
 - SL-entry ≥ 1× ATR (~$${atr.toFixed(0)}). TP1 ≥ entry ± 1× ATR.
@@ -1900,6 +1984,17 @@ ${schemaWithExamples}`;
       ? "⏸️ ĐỨNG NGOÀI"
       : "";
     lines.push(`🤖 <b>AI: ${h(verdictText)}${conf != null ? ` (${h(conf)}%)` : ""}${dirText ? " — " + dirText : ""}</b>`);
+
+    // Trade status badge — render ngay sau verdict line cho dễ scan
+    const TRADE_STATUS_BADGE = {
+      enterable: "🟢 <b>CÓ THỂ VÀO LỆNH</b>",
+      watch: "🟡 <b>CHỈ THEO DÕI</b>",
+      avoid: "🔴 <b>TRÁNH GIAO DỊCH</b>",
+    };
+    const tradeStatus = (aiResult.trade_status || "").toString().toLowerCase();
+    if (TRADE_STATUS_BADGE[tradeStatus]) {
+      lines.push(TRADE_STATUS_BADGE[tradeStatus]);
+    }
 
     // Summary 2-3 câu — restore lại để user có context dễ đọc
     if (aiResult.summary && typeof aiResult.summary === "string") {
@@ -3837,7 +3932,14 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m", auxArgs = []) {
       return;
     }
     const e = enrichIndicators(candles);
-    const l = e[e.length - 1];
+    // Phân tích trên NẾN ĐÃ ĐÓNG (tránh wick/RSI dao động trong nến chạy).
+    // displayCandle = nến mới nhất (có thể chưa đóng) → dùng cho "Giá hiện tại".
+    const intervalSec = TF_INTERVAL_SEC[tf] || 900;
+    const pick = pickTriggerCandle(e, intervalSec);
+    const l = pick?.latest || e[e.length - 1];
+    const displayPrice = pick?.displayCandle?.close ?? l.close;
+    const fresh = checkDataFreshness(pick?.displayCandle || l, intervalSec);
+
     const pivots = await getCachedDailyPivots(env);
 
     const pivotStr = pivots
@@ -3923,8 +4025,14 @@ Trả JSON:
     const confPct = Number.isFinite(Number(d.do_tin_cay_pct)) ? Math.round(d.do_tin_cay_pct) : null;
     const confTag = confPct != null ? ` | Tin cậy: <b>${confPct}%</b>` : "";
 
+    // Format thời gian nến trigger (giờ VN)
+    const triggerTimeStr = l.time
+      ? new Date(l.time * 1000).toLocaleTimeString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour: "2-digit", minute: "2-digit", hour12: false })
+      : null;
     let m = `<b>🥇 Quét nhanh XAU/USD ${tfVi}</b> (Tầm nhìn ${htmlEsc(horizon)})\n`;
-    m += `Giá: <b>$${l.close.toFixed(2)}</b> | ${huongIcon} <b>${huongLabel}</b>${confTag}\n`;
+    m += `Giá: <b>$${displayPrice.toFixed(2)}</b> | ${huongIcon} <b>${huongLabel}</b>${confTag}\n`;
+    if (triggerTimeStr) m += `<i>📊 Phân tích nến ${tfVi} đóng lúc ${triggerTimeStr}</i>\n`;
+    if (fresh.isStale) m += `⚠️ <b>Data cũ:</b> ${htmlEsc(fresh.reason)} — độ tin cậy giảm\n`;
     if (auxCtx) {
       const auxLines = formatAuxBlock(auxCtx).split("\n");
       m += auxLines.map(l => htmlEsc(l)).join("\n") + "\n";
@@ -3988,7 +4096,12 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
       return;
     }
     const e = enrichIndicators(candles);
-    const l = e[e.length - 1];
+    // Phân tích trên nến đã đóng (consistent với cron + /nhanh).
+    const intervalSecA = TF_INTERVAL_SEC[tf] || 900;
+    const pickA = pickTriggerCandle(e, intervalSecA);
+    const l = pickA?.latest || e[e.length - 1];
+    const displayPriceA = pickA?.displayCandle?.close ?? l.close;
+    const freshA = checkDataFreshness(pickA?.displayCandle || l, intervalSecA);
 
     const pivots = await getCachedDailyPivots(env);
 
@@ -4101,7 +4214,13 @@ ${htfBlock}
       return;
     }
 
-    let html = formatAnalysisHTML(d, tf, horizon);
+    // Truyền trigger time + stale info để formatAnalysisHTML hiển thị note
+    const triggerInfo = {
+      triggerTime: l.time ? new Date(l.time * 1000).toLocaleTimeString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour: "2-digit", minute: "2-digit", hour12: false }) : null,
+      displayPrice: displayPriceA,
+      stale: freshA.isStale ? freshA.reason : null,
+    };
+    let html = formatAnalysisHTML(d, tf, horizon, triggerInfo);
     if (auxCtx) {
       const auxLines = formatAuxBlock(auxCtx).split("\n").map(l => htmlEsc(l)).join("\n");
       // Insert aux block sau header (sau dòng đầu tiên — Phân tích...)
@@ -4124,7 +4243,7 @@ ${htfBlock}
  * QUYẾT ĐỊNH lên đầu (BUY/SELL/WAIT, entry, SL, 3 TPs).
  * GIẢI THÍCH dưới (bức tranh + lý do entry/SL + rủi ro).
  */
-function formatAnalysisHTML(d, tf, horizon) {
+function formatAnalysisHTML(d, tf, horizon, triggerInfo = null) {
   const fmt2 = (n) => (typeof n === "number" && !isNaN(n)) ? n.toFixed(2) : "?";
   const qd = d.quyet_dinh || {};
   const gt = d.giai_thich || {};
@@ -4139,7 +4258,14 @@ function formatAnalysisHTML(d, tf, horizon) {
   }[huong] || huong;
   const tfVi = ({ "5m": "5p", "15m": "15p", "1h": "1g", "4h": "4g", "1d": "1 ngày" })[tf] || tf;
 
-  let m = `<b>🥇 Phân tích XAU/USD ${tfVi}</b> (Tầm nhìn ${htmlEsc(horizon)})\n\n`;
+  let m = `<b>🥇 Phân tích XAU/USD ${tfVi}</b> (Tầm nhìn ${htmlEsc(horizon)})\n`;
+  if (triggerInfo?.displayPrice != null) {
+    m += `Giá: <b>$${triggerInfo.displayPrice.toFixed(2)}</b>`;
+    if (triggerInfo.triggerTime) m += ` <i>(phân tích nến ${tfVi} đóng lúc ${triggerInfo.triggerTime})</i>`;
+    m += `\n`;
+  }
+  if (triggerInfo?.stale) m += `⚠️ <b>Data cũ:</b> ${htmlEsc(triggerInfo.stale)} — độ tin cậy giảm\n`;
+  m += `\n`;
 
   // ══════ PHẦN 1: QUYẾT ĐỊNH ══════
   m += `━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n`;
@@ -4240,8 +4366,14 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs 
           const candles = await fetchTdCandles(env, tdInterval, 220);
           if (candles.length < 50) return null;
           const enriched = enrichIndicators(candles);
-          log(`fetch ${tf} ok (${candles.length} candles)`);
-          return { tf, latest: enriched[enriched.length - 1], candles };
+          // Per-TF: dùng nến đã đóng cho analysis, nến mới nhất cho displayPrice
+          const intervalSec = TF_INTERVAL_SEC[tf] || 900;
+          const pickTf = pickTriggerCandle(enriched, intervalSec);
+          const latestClosed = pickTf?.latest || enriched[enriched.length - 1];
+          const displayClose = pickTf?.displayCandle?.close ?? latestClosed.close;
+          const fresh = checkDataFreshness(pickTf?.displayCandle || latestClosed, intervalSec);
+          log(`fetch ${tf} ok (${candles.length} candles, closed=${pickTf?.isLatestClosed ?? "?"}, stale=${fresh.isStale})`);
+          return { tf, latest: latestClosed, displayClose, fresh, candles };
         } catch (e) {
           console.log(`[multi-tf] fetch ${tf} fail: ${e.message}`);
           return null;
@@ -4441,6 +4573,20 @@ function formatMultiTfHTML(d, valid, horizon, isNhanh) {
 
   const confPctM = Number.isFinite(Number(d.do_tin_cay_pct)) ? ` (${Math.round(d.do_tin_cay_pct)}%)` : "";
   let m = `<b>🥇 ${prefix} đa khung: ${tfsLabel}</b> (Tầm nhìn ${htmlEsc(horizon)})\n`;
+
+  // Giá hiện tại từ khung ngắn nhất (displayClose của TF nhỏ nhất)
+  const tfOrderArr = ["5m", "15m", "1h", "4h", "1d"];
+  const sortedValid = [...valid].sort((a, b) => tfOrderArr.indexOf(a.tf) - tfOrderArr.indexOf(b.tf));
+  const shortest = sortedValid[0];
+  const currentPriceShown = shortest?.displayClose ?? shortest?.latest?.close;
+  if (currentPriceShown != null) m += `Giá: <b>$${currentPriceShown.toFixed(2)}</b>\n`;
+
+  // Stale warning per-TF (chỉ liệt kê TF bị cũ)
+  const staleTfs = valid.filter(v => v.fresh?.isStale).map(v => `${tfVi(v.tf)} (${v.fresh.lagMinutes}p)`);
+  if (staleTfs.length > 0) {
+    m += `⚠️ <b>Data cũ:</b> ${staleTfs.join(", ")} — độ tin cậy giảm\n`;
+  }
+
   m += `${consensusIcon} Đồng thuận: <b>${consensusVi}</b> | Tin cậy: <b>${htmlEsc(d.do_tin_cay || "?")}${confPctM}</b> | ${alignment}\n`;
   if (d.tom_tat) m += `<i>${htmlEsc(d.tom_tat)}</i>\n`;
 
@@ -4817,25 +4963,37 @@ async function runAlertCheck(env, { force = false } = {}) {
         console.log(`[cron] mega cooldown, fallback ${extraAlerts.length} non-redundant alerts, telegram=${ok}`);
       }
     } else if (alerts.length > 0) {
-      // Regular alerts → deep analysis (AI + trade setups + news)
-      console.log(`[cron] ${alerts.length} alerts triggered, run deep analysis (no mega)`);
-      let result = null;
-      try {
-        result = await runDeepAnalysis(env, { mode: "alerts", alerts, e5m, e15m: closedE15m, e1h, e4h, regime, session, latest, pivots, mtfContext });
-      } catch (e) {
-        console.log(`[cron] alerts deep analysis fail: ${e.message}`);
-      }
-      // Mark alert keys nếu gửi OK (skip regimeShiftAlert vì không có key)
-      if (result?.sent) {
-        for (const a of alerts) if (a.key) await markAlerted(env, a.key);
-      } else if (result?.skipped === "cooldown") {
-        // Deep cooldown: gửi fallback rule-based ngắn để user không bỏ lỡ alert mới
+      // Regular alerts → gate by severity score:
+      //   weak (<4 pts):  chỉ gửi fallback rule-based, KHÔNG gọi AI (tiết kiệm token cho noise alerts)
+      //   medium+ (≥4):   deep AI analysis như trước
+      const score = scoreAlerts(alerts);
+      console.log(`[cron] ${alerts.length} alerts (score ${score.total}, dir=${score.primaryDirection}, weak=${score.isWeak})`);
+
+      if (score.isWeak) {
+        // Tín hiệu yếu → fallback rule-based only (đỡ tốn Gemini tokens cho RSI/EMA cross đơn lẻ)
         const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
         const ok = await sendTelegram(env, msg);
         if (ok) {
           for (const a of alerts) if (a.key) await markAlerted(env, a.key);
         }
-        console.log(`[cron] alerts deep cooldown, fallback rule-based, telegram=${ok}`);
+        console.log(`[cron] weak alerts (score ${score.total}), fallback rule-based only, telegram=${ok}`);
+      } else {
+        let result = null;
+        try {
+          result = await runDeepAnalysis(env, { mode: "alerts", alerts, e5m, e15m: closedE15m, e1h, e4h, regime, session, latest, pivots, mtfContext, alertScore: score });
+        } catch (e) {
+          console.log(`[cron] alerts deep analysis fail: ${e.message}`);
+        }
+        if (result?.sent) {
+          for (const a of alerts) if (a.key) await markAlerted(env, a.key);
+        } else if (result?.skipped === "cooldown") {
+          const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
+          const ok = await sendTelegram(env, msg);
+          if (ok) {
+            for (const a of alerts) if (a.key) await markAlerted(env, a.key);
+          }
+          console.log(`[cron] alerts deep cooldown (score ${score.total}), fallback, telegram=${ok}`);
+        }
       }
     }
   } catch (e) {
