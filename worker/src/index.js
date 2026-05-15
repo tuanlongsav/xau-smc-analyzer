@@ -3931,9 +3931,17 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
     // Map TF cho label mức giá (không có space)
     const tfShort = (tf) => ({ "5m": "5p", "15m": "15p", "1h": "1g", "4h": "4g", "1d": "1d" }[tf] || tf);
 
+    const tfViNhanh = (tf) => ({ "5m": "5p", "15m": "15p", "1h": "1g", "4h": "4g", "1d": "1 ngày" }[tf] || tf);
     let m = `<b>🥇 Tổng quan nhanh XAU/USD</b>\n`;
     m += `Giá hiện tại: <b>$${c.toFixed(2)}</b>\n`;
     m += `<i>Phiên ${getTradingSession()}</i>\n`;
+    if (staleTfsN.length > 0) {
+      const staleList = staleTfsN.map(v => {
+        const fr = checkDataFreshness(v.latest, TF_INTERVAL_SEC[v.tf] || 900);
+        return `${tfViNhanh(v.tf)} (${fr.lagMinutes}p)`;
+      });
+      m += `⚠️ <b>Data cũ:</b> ${staleList.join(", ")} — độ tin cậy giảm\n`;
+    }
     if (auxCtx) {
       const auxLines = formatAuxBlock(auxCtx).split("\n").map(l => htmlEsc(l)).join("\n");
       m += `\n${auxLines}\n`;
@@ -4022,7 +4030,12 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
 
         m += `\n━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n`;
         m += `${dirIcon} <b>${dirLabel}</b> | Tin cậy: ${confidence}\n\n`;
-        m += `📍 Điểm vào (Entry): <b>$${fmt(entry)}</b>\n`;
+        // Khoảng cách giữa giá live (5m) và entry (15p closed) — giúp user hiểu lệch
+        const liveVsEntry = c - entry;
+        const liveNote = Math.abs(liveVsEntry) > 0.5
+          ? ` <i>(giá live $${fmt(c)} ${liveVsEntry > 0 ? "+" : ""}${liveVsEntry.toFixed(2)})</i>`
+          : "";
+        m += `📍 Điểm vào (Entry): <b>$${fmt(entry)}</b> <i>— theo nến 15p đã đóng</i>${liveNote}\n`;
         m += `🛑 Cắt lỗ (SL): <b>$${fmt(sl)}</b> <i>(rủi ro ~${slDist.toFixed(2)} điểm)</i>\n`;
         m += `🎯 Chốt lời 1 (TP1, R:R 1:1 — an toàn): <b>$${fmt(tp1)}</b>\n`;
         m += `🎯 Chốt lời 2 (TP2, R:R 1:2 — kỳ vọng): <b>$${fmt(tp2)}</b>\n`;
