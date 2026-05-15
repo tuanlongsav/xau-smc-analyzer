@@ -221,9 +221,9 @@ async function cacheGet(env, key) {
   try { return await env.CACHE.get(key); } catch { return null; }
 }
 
-async function cachePut(env, key, value) {
+async function cachePut(env, key, value, ttlSec = CACHE_TTL_S) {
   if (!env.CACHE) return;
-  try { await env.CACHE.put(key, value, { expirationTtl: CACHE_TTL_S }); } catch {}
+  try { await env.CACHE.put(key, value, { expirationTtl: ttlSec }); } catch {}
 }
 
 // ──────────────────────────────────────────────────────────
@@ -1172,6 +1172,66 @@ function scoreAlerts(alerts) {
   };
 }
 
+/**
+ * Validate hình học Entry/SL/TP cho setup AI trả về.
+ * Shared validator dùng chung cho /nhanhTF, /analyze, multi-TF, deep alert.
+ * Returns { valid: bool, reason: string|null }.
+ *
+ * @param {object} setup — { bias: "BUY"|"SELL"|"LONG"|"SHORT", entry, sl, tp1, tp2?, tp3? }
+ * @param {object} ctx — { atr?, minRr? } — minRr = R:R tối thiểu cho TP1 (default 0.7)
+ */
+function validateTradeGeometry(setup, ctx = {}) {
+  const { entry, sl, tp1, tp2, tp3 } = setup;
+  const bias = String(setup.bias || "").toUpperCase();
+  const minRr = ctx.minRr ?? 0.7;
+
+  // Required fields
+  if (!Number.isFinite(entry) || !Number.isFinite(sl) || !Number.isFinite(tp1)) {
+    return { valid: false, reason: "thiếu entry/SL/TP1" };
+  }
+
+  const isLong = bias === "BUY" || bias === "LONG";
+  const isShort = bias === "SELL" || bias === "SHORT";
+  if (!isLong && !isShort) {
+    return { valid: false, reason: `bias không hợp lệ: ${setup.bias}` };
+  }
+
+  // Direction: SL/TP đúng chiều bias
+  if (isLong && !(sl < entry && entry < tp1)) {
+    return { valid: false, reason: `LONG cần sl<entry<tp1, got sl=${sl} entry=${entry} tp1=${tp1}` };
+  }
+  if (isShort && !(sl > entry && entry > tp1)) {
+    return { valid: false, reason: `SHORT cần sl>entry>tp1, got sl=${sl} entry=${entry} tp1=${tp1}` };
+  }
+
+  // TP order: TP1 < TP2 < TP3 (long) hoặc TP1 > TP2 > TP3 (short)
+  if (Number.isFinite(tp2)) {
+    if (isLong && tp2 <= tp1) return { valid: false, reason: `LONG cần tp2>tp1, got tp1=${tp1} tp2=${tp2}` };
+    if (isShort && tp2 >= tp1) return { valid: false, reason: `SHORT cần tp2<tp1, got tp1=${tp1} tp2=${tp2}` };
+  }
+  if (Number.isFinite(tp3)) {
+    const ref = Number.isFinite(tp2) ? tp2 : tp1;
+    if (isLong && tp3 <= ref) return { valid: false, reason: `LONG cần tp3>${Number.isFinite(tp2)?"tp2":"tp1"}, got tp3=${tp3}` };
+    if (isShort && tp3 >= ref) return { valid: false, reason: `SHORT cần tp3<${Number.isFinite(tp2)?"tp2":"tp1"}, got tp3=${tp3}` };
+  }
+
+  // R:R tối thiểu cho TP1
+  const slDist = Math.abs(entry - sl);
+  const tp1Dist = Math.abs(tp1 - entry);
+  if (slDist === 0) return { valid: false, reason: "SL trùng entry" };
+  const rr = tp1Dist / slDist;
+  if (rr < minRr) {
+    return { valid: false, reason: `R:R đến TP1 = ${rr.toFixed(2)} < ${minRr} (TP1 quá gần entry so với SL)` };
+  }
+
+  // SL distance ≥ 1× ATR (nếu có atr trong ctx)
+  if (Number.isFinite(ctx.atr) && ctx.atr > 0 && slDist < ctx.atr * 0.8) {
+    return { valid: false, reason: `SL cách entry ${slDist.toFixed(2)} < 0.8× ATR (${ctx.atr.toFixed(2)}) — quá gần, dễ bị quét stop` };
+  }
+
+  return { valid: true, reason: null };
+}
+
 function detectMegaMove(candlesEnriched) {
   if (!Array.isArray(candlesEnriched) || candlesEnriched.length < 4) {
     return { triggered: false };
@@ -1583,7 +1643,8 @@ async function fetchEconomicCalendar(env) {
     const relevant = arr.filter(isPreEventRelevant);
     console.log(`[econ-cal:${source}] total=${arr.length} relevant=${relevant.length}`);
     if (relevant.length > 0) {
-      await cachePut(env, cacheKey, JSON.stringify(relevant));
+      // Calendar update ~1×/ngày, cache 12h (43200s) — không reload mỗi 5p như default
+      await cachePut(env, cacheKey, JSON.stringify(relevant), 12 * 3600);
       if (env.CACHE) {
         try { await env.CACHE.put("econ_cal:last_good", JSON.stringify(relevant), { expirationTtl: 7 * 86400 }); } catch {}
       }
@@ -3787,8 +3848,12 @@ async function handleAskCmd(env, chatId, replyTo, question) {
       return;
     }
     const enriched = enrichIndicators(candles);
-    const latest = enriched[enriched.length - 1];
-    const prev = enriched[enriched.length - 2];
+    // Pick nến 15m ĐÃ ĐÓNG cho phân tích/trend/pattern.
+    // displayClose = nến mới nhất (live) — dùng cho "giá hiện tại" trong tư vấn risk.
+    const pickAsk = pickTriggerCandle(enriched, 15 * 60);
+    const latest = pickAsk?.latest || enriched[enriched.length - 1];
+    const prev = pickAsk?.prev || enriched[enriched.length - 2];
+    const displayCloseAsk = pickAsk?.displayCandle?.close ?? latest.close;
     const pivots = await getCachedDailyPivots(env);
     const trend = getTrendAssessment(latest);
     const session = getTradingSession();
@@ -3824,8 +3889,8 @@ NGÔN NGỮ:
 **⚠️ Cảnh báo:** nếu có rủi ro lớn`;
 
     const marketContext = `📊 BỐI CẢNH THỊ TRƯỜNG HIỆN TẠI:
-- Giá XAU/USD: $${latest.close.toFixed(2)}
-- Xu hướng 15m: ${trend?.label || "?"} ${trend?.note ? `(${trend.note})` : ""}
+- Giá XAU/USD live: $${displayCloseAsk.toFixed(2)} (close nến 15p đóng: $${latest.close.toFixed(2)})
+- Xu hướng 15m (theo nến đóng): ${trend?.label || "?"} ${trend?.note ? `(${trend.note})` : ""}
 - RSI(14): ${latest.rsi?.toFixed(1)} | ATR(14): ${latest.atr?.toFixed(2)}
 - EMA 21/50/200: ${latest.ema21?.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}
 - BB(20): ${latest.bbLower?.toFixed(2)} – ${latest.bbUpper?.toFixed(2)}
@@ -4110,14 +4175,15 @@ YÊU CẦU BẮT BUỘC: Trong câu trả lời (tom_tat hoặc canh_bao), PHẢ
 - OIL giảm → áp lực giảm XAU.
 Đối chiếu với setup XAU: nếu liên thị trường đồng thuận → tăng độ tin cậy. Nếu mâu thuẫn → giảm độ tin cậy + thêm vào canh_bao.` : "";
     const userText = `XAU/USD khung ${tf} (horizon ${horizon}), giá $${l.close.toFixed(2)}.
-RSI: ${l.rsi?.toFixed(1)} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
+RSI: ${l.rsi?.toFixed(1)} | ATR: ${l.atr?.toFixed(2) || "?"} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
 SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
 ${pivotStr}${auxText}
 
 QUY TẮC SETUP:
 - Nếu setup rõ (LONG hoặc SHORT) → BẮT BUỘC điền đủ entry + sl + tp1 + tp2 + tp3.
 - TP1 an toàn (R:R ~1:1), TP2 kỳ vọng (R:R ~1:2), TP3 mở rộng theo xu hướng (R:R 1:3+ hoặc tới mốc kháng/hỗ trợ kế tiếp).
-- SL đặt NGOÀI vùng nhiễu (>1×ATR cách swing) để tránh quét thanh khoản.
+- SL đặt NGOÀI vùng nhiễu (>1×ATR = >$${(l.atr || 10).toFixed(2)} cách swing) để tránh quét thanh khoản.
+- LONG: SL < entry < TP1 < TP2 < TP3. SHORT: SL > entry > TP1 > TP2 > TP3.
 - Nếu setup chưa rõ → set huong = "NEUTRAL" và để các trường giá = null.
 
 Trả JSON:
@@ -4189,7 +4255,12 @@ Trả JSON:
     const sgTp1 = d.tp1_goi_y ?? d.tp_goi_y; // backward compat
     const sgTp2 = d.tp2_goi_y;
     const sgTp3 = d.tp3_goi_y;
-    if (sgEntry != null && sgSl != null && sgTp1 != null) {
+    // Validate hình học trước khi render — AI có thể trả setup mâu thuẫn chiều
+    const geomCheck = validateTradeGeometry(
+      { bias: huong, entry: sgEntry, sl: sgSl, tp1: sgTp1, tp2: sgTp2, tp3: sgTp3 },
+      { atr: l.atr, minRr: 0.7 }
+    );
+    if (sgEntry != null && sgSl != null && sgTp1 != null && geomCheck.valid) {
       const slDist = Math.abs(sgEntry - sgSl);
       const rrOf = (tp) => (slDist > 0) ? (Math.abs(tp - sgEntry) / slDist).toFixed(1) : "?";
       m += `\n━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n`;
@@ -4201,6 +4272,10 @@ Trả JSON:
       if (sgTp3 != null) tpParts.push(`TP3 <b>$${fmt2(sgTp3)}</b> (R:R ${rrOf(sgTp3)})`);
       m += `💰 Chốt lời: ${tpParts.join(" | ")}\n`;
       if (d.ly_do_setup) m += `<i>💡 ${htmlEsc(d.ly_do_setup)}</i>\n`;
+    } else if (sgEntry != null && !geomCheck.valid) {
+      // AI trả setup nhưng hình học sai → log + chuyển sang đứng ngoài
+      console.log(`[/nhanh${tf}] reject invalid geometry: ${geomCheck.reason}`);
+      m += `\n<b>🎯 Setup:</b> AI trả setup không hợp lệ (${htmlEsc(geomCheck.reason)}) — đứng ngoài, chờ tín hiệu khác.\n`;
     } else if (d.ly_do_setup) {
       m += `\n<b>🎯 Setup:</b> ${htmlEsc(d.ly_do_setup)}\n`;
     }
@@ -4368,6 +4443,7 @@ ${htfBlock}
       triggerTime: l.time ? new Date(l.time * 1000).toLocaleTimeString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour: "2-digit", minute: "2-digit", hour12: false }) : null,
       displayPrice: displayPriceA,
       stale: freshA.isStale ? freshA.reason : null,
+      atr: l.atr,
     };
     let html = formatAnalysisHTML(d, tf, horizon, triggerInfo);
     if (auxCtx) {
@@ -4422,14 +4498,24 @@ function formatAnalysisHTML(d, tf, horizon, triggerInfo = null) {
   m += `${huongIcon} <b>${huongLabel}</b> | Tin cậy: <b>${htmlEsc(qd.do_tin_cay || "?")}${confPctA}</b>\n`;
 
   if (huong !== "WAIT" && qd.entry != null && qd.sl != null && qd.tp1 != null) {
-    const slDist = Math.abs(qd.entry - qd.sl);
-    const rrOf = (tp) => (tp != null && slDist > 0) ? (Math.abs(tp - qd.entry) / slDist).toFixed(1) : null;
-    m += `\n📍 Vào lệnh: <b>$${fmt2(qd.entry)}</b>\n`;
-    m += `🛑 Cắt lỗ (SL): <b>$${fmt2(qd.sl)}</b> <i>(${slDist.toFixed(2)} điểm)</i>\n`;
-    const tpParts = [`TP1 <b>$${fmt2(qd.tp1)}</b> (R:R ${rrOf(qd.tp1) || "?"})`];
-    if (qd.tp2 != null) tpParts.push(`TP2 <b>$${fmt2(qd.tp2)}</b> (R:R ${rrOf(qd.tp2) || "?"})`);
-    if (qd.tp3 != null) tpParts.push(`TP3 <b>$${fmt2(qd.tp3)}</b> (R:R ${rrOf(qd.tp3) || "?"})`);
-    m += `💰 Chốt lời: ${tpParts.join(" | ")}\n`;
+    // Validate hình học trước khi render
+    const geomCheck = validateTradeGeometry(
+      { bias: huong, entry: qd.entry, sl: qd.sl, tp1: qd.tp1, tp2: qd.tp2, tp3: qd.tp3 },
+      { atr: triggerInfo?.atr, minRr: 0.7 }
+    );
+    if (geomCheck.valid) {
+      const slDist = Math.abs(qd.entry - qd.sl);
+      const rrOf = (tp) => (tp != null && slDist > 0) ? (Math.abs(tp - qd.entry) / slDist).toFixed(1) : null;
+      m += `\n📍 Vào lệnh: <b>$${fmt2(qd.entry)}</b>\n`;
+      m += `🛑 Cắt lỗ (SL): <b>$${fmt2(qd.sl)}</b> <i>(${slDist.toFixed(2)} điểm)</i>\n`;
+      const tpParts = [`TP1 <b>$${fmt2(qd.tp1)}</b> (R:R ${rrOf(qd.tp1) || "?"})`];
+      if (qd.tp2 != null) tpParts.push(`TP2 <b>$${fmt2(qd.tp2)}</b> (R:R ${rrOf(qd.tp2) || "?"})`);
+      if (qd.tp3 != null) tpParts.push(`TP3 <b>$${fmt2(qd.tp3)}</b> (R:R ${rrOf(qd.tp3) || "?"})`);
+      m += `💰 Chốt lời: ${tpParts.join(" | ")}\n`;
+    } else {
+      console.log(`[/analyze ${tf}] reject invalid geometry: ${geomCheck.reason}`);
+      m += `\n<i>⚠️ AI trả setup không hợp lệ (${htmlEsc(geomCheck.reason)}) — đứng ngoài, dùng /5p15p1h hoặc /1h4h1d để xác nhận lại.</i>\n`;
+    }
   } else {
     m += `\n<i>Chưa có setup rõ ràng — chờ giá xác nhận hướng.</i>\n`;
   }
@@ -4769,12 +4855,22 @@ function formatMultiTfHTML(d, valid, horizon, isNhanh) {
 
   m += `\n━━━ <b>🎯 KHUYẾN NGHỊ GIÁ VÀO LỆNH</b> ━━━\n\n`;
 
-  const scenarioBlock = (sc, label, icon, probPct) => {
+  const scenarioBlock = (sc, label, icon, probPct, biasUpper) => {
     const probTag = probPct != null ? ` <i>(xác suất ${probPct}%)</i>` : "";
     if (!sc?.kha_thi) {
       const reason = sc?.ly_do || "chưa đủ hợp lực";
       const reasonTrim = reason.length > 150 ? reason.slice(0, 147) + "…" : reason;
       return `${icon} <b>${label}</b>: ❌ chưa khả thi${probTag}\n<i>${htmlEsc(reasonTrim)}</i>`;
+    }
+    // Validate hình học AI trả về — atr thường lấy từ HTF (4h hoặc 1d trong valid)
+    const atrForCheck = (valid.find(v => v.tf === "15m") || valid[0])?.latest?.atr;
+    const geomCheck = validateTradeGeometry(
+      { bias: biasUpper, entry: sc.entry, sl: sc.sl, tp1: sc.tp1 ?? sc.tp, tp2: sc.tp2, tp3: sc.tp3 },
+      { atr: atrForCheck, minRr: 0.7 }
+    );
+    if (!geomCheck.valid) {
+      console.log(`[multi-tf] reject ${label} geometry: ${geomCheck.reason}`);
+      return `${icon} <b>${label}</b>: ⚠️ setup AI không hợp lệ${probTag}\n<i>${htmlEsc(geomCheck.reason)}</i>`;
     }
     const slDist = (sc.entry != null && sc.sl != null) ? Math.abs(sc.entry - sc.sl) : null;
     let s = `${icon} <b>${label}</b> ✅${probTag}`;
@@ -4795,8 +4891,8 @@ function formatMultiTfHTML(d, valid, horizon, isNhanh) {
     return s;
   };
 
-  m += scenarioBlock(d.long, "MUA (LONG)", "📈", prob.long) + "\n\n";
-  m += scenarioBlock(d.short, "BÁN (SHORT)", "📉", prob.short) + "\n\n";
+  m += scenarioBlock(d.long, "MUA (LONG)", "📈", prob.long, "LONG") + "\n\n";
+  m += scenarioBlock(d.short, "BÁN (SHORT)", "📉", prob.short, "SHORT") + "\n\n";
 
   if ((Array.isArray(d.khang_cu) && d.khang_cu.length) || (Array.isArray(d.ho_tro) && d.ho_tro.length)) {
     m += `<b>📍 Mức giá quan trọng:</b>\n`;
@@ -4959,7 +5055,8 @@ async function _handleTelegramUpdate(env, update) {
   }
   // Backward compat: /analyze [tf] hoặc /smc [tf]
   if (cmd === "/analyze" || cmd === "/smc" || cmd === "/phantich") {
-    await handleAnalyzeCmd(env, chatId, replyTo, args[0] || "15m");
+    // Pass args.slice(1) làm auxArgs (vd /analyze 1h all → tf="1h", aux=["all"])
+    await handleAnalyzeCmd(env, chatId, replyTo, args[0] || "15m", args.slice(1));
     return;
   }
   // Lệnh bắt đầu với "/" nhưng không match → reply nhẹ để user biết bot đã nhận
