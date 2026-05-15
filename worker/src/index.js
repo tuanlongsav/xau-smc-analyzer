@@ -693,7 +693,15 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
   // Session-aware threshold modifier — phiên NY/overlap nhạy hơn, phiên Á siết.
   // Áp dụng cho các threshold biến động (strong move, impulse, ATR spike, BB expansion,
   // wick range, gap). KHÔNG áp dụng cho RSI/MA cross/pivot vì những thứ đó là level-based.
-  const session = getSessionInfo();
+  //
+  // Dùng thời gian CỦA NẾN TRIGGER (latest.time + interval/2 ≈ giữa nến) thay vì
+  // Date.now(): khi cron chạy sát ranh phiên (vd 13:00 UTC), nến trigger thuộc
+  // phiên cũ nhưng cron đã sang phiên mới → threshold M không khớp.
+  // latest.time = Unix sec của OPEN, +450s = giữa nến 15p.
+  const sessionTime = latest?.time
+    ? new Date((latest.time + 450) * 1000)
+    : new Date();
+  const session = getSessionInfo(sessionTime);
   const M = session.volMult;
 
   // ── 1. RSI quá mua / quá bán (Overbought/Oversold) ──
@@ -4746,7 +4754,9 @@ async function runAlertCheck(env, { force = false } = {}) {
     const alerts = await detectFreshAlerts(env, latest, prev, pivots, closedE15m);
     if (regimeShiftAlert) alerts.unshift(regimeShiftAlert);
 
-    const session = getSessionInfo();
+    // Session dùng thời gian nến trigger (đã đóng), không phải Date.now() —
+    // tránh mismatch khi cron chạy sát ranh phiên (vd 13:00 UTC).
+    const session = getSessionInfo(latest?.time ? new Date((latest.time + 450) * 1000) : new Date());
     if (alerts.length === 0 && !mega.triggered) {
       console.log(`[cron] no signal, price=${latest.close.toFixed(2)} rsi=${latest.rsi?.toFixed(1)} atr=${latest.atr?.toFixed(2)} session=${session.code} M=${session.volMult} regime=${regime.code}(${regime.ratio?.toFixed(2)}x) [skip 5m/1h fetch]`);
       return;
