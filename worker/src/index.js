@@ -1104,6 +1104,42 @@ const ALERT_SEVERITY = {
   ema_up: 1, ema_dn: 1,
 };
 
+// Direction TRADING-SIGNAL của mỗi alert (KHÔNG phải direction nến).
+// VD: rsi_overbought → tín hiệu CẢNH BÁO GIẢM (đảo chiều sau khi tăng quá đà).
+//     liq_sweep_up → quét đỉnh, smart money đảo chiều → GIẢM.
+//     wick_top → rejection ở đỉnh → GIẢM.
+// "neutral" = chỉ về volatility, không gắn hướng cụ thể.
+const ALERT_DIRECTION = {
+  // RSI extremes — cảnh báo đảo chiều
+  rsi_overbought: "down",
+  rsi_oversold: "up",
+  // BB break — đà mạnh theo hướng
+  bb_up: "up", bb_dn: "down",
+  // EMA cross — momentum shift
+  ema_up: "up", ema_dn: "down",
+  // Golden/Death Cross — long-term trend shift
+  golden: "up", death: "down",
+  // Pivot break — breakout direction
+  piv_up_r1: "up", piv_up_r2: "up", piv_up_s1: "up", piv_up_s2: "up",
+  piv_dn_r1: "down", piv_dn_r2: "down", piv_dn_s1: "down", piv_dn_s2: "down",
+  // Big single-candle move
+  big_move_up: "up", big_move_dn: "down",
+  // Multi-candle impulse
+  multi_move_up: "up", multi_move_dn: "down",
+  // Volatility events (không có hướng cố định)
+  vol_spike: "neutral",
+  bb_expand: "neutral",
+  // Wick rejection — đảo chiều khỏi đỉnh/đáy
+  wick_top: "down", wick_bottom: "up",
+  // Gap
+  gap_up: "up", gap_dn: "down",
+  // Liquidity sweep — quét stop rồi đảo (smart money pattern)
+  liq_sweep_up: "down",  // sweep đỉnh → bear
+  liq_sweep_dn: "up",    // sweep đáy → bull
+  // Range breakout
+  range_breakout_up: "up", range_breakout_dn: "down",
+};
+
 function scoreAlerts(alerts) {
   let total = 0;
   let upScore = 0, downScore = 0;
@@ -1111,10 +1147,11 @@ function scoreAlerts(alerts) {
     if (!a?.key) continue; // bỏ regimeShiftAlert
     const sev = ALERT_SEVERITY[a.key] || 1;
     total += sev;
-    // Detect direction từ key suffix
-    const k = a.key;
-    if (/_up$|_up_|golden|overbought$|bb_up$|piv_up/.test(k)) upScore += sev;
-    else if (/_dn$|_dn_|death|oversold$|bb_dn$|piv_dn/.test(k)) downScore += sev;
+    // Explicit direction map (fix bug regex cũ bị nhầm overbought=up / liq_sweep_up=up)
+    const dir = ALERT_DIRECTION[a.key];
+    if (dir === "up") upScore += sev;
+    else if (dir === "down") downScore += sev;
+    // "neutral" hoặc không có trong map → không cộng vào hướng nào
   }
   // Confluence bonus: nhiều alerts cùng hướng
   const aligned = Math.max(upScore, downScore);
@@ -1264,8 +1301,11 @@ function findLocalExtremes(candles, kind) {
 function scanReversalSignals(e15m, e1h, e4h, mega) {
   const latest = e15m[e15m.length - 1];
   const prev = e15m[e15m.length - 2];
-  const last1h = e1h?.[e1h.length - 1];
-  const last4h = e4h?.[e4h.length - 1];
+  // Dùng nến ĐÃ ĐÓNG cho 1h/4h context — tránh RSI/EMA bị méo bởi nến đang chạy
+  const pick1h = e1h ? pickTriggerCandle(e1h, 60 * 60) : null;
+  const pick4h = e4h ? pickTriggerCandle(e4h, 4 * 60 * 60) : null;
+  const last1h = pick1h?.latest || e1h?.[e1h?.length - 1];
+  const last4h = pick4h?.latest || e4h?.[e4h?.length - 1];
   const dir = mega.direction;
   const factors = [];
   let score = 0;
@@ -1862,10 +1902,14 @@ async function runDeepAnalysis(env, ctx) {
   }
 
   // Phần 2: BỐI CẢNH chung — bổ sung MTF context, ATR per TF, pivots, recent H/L
+  // Mỗi TF dùng nến ĐÃ ĐÓNG (pickTriggerCandle) để consistent với trigger candle.
   const e5m = ctx.e5m || null;
-  const last5m = e5m?.[e5m.length - 1];
-  const last1h = e1h?.[e1h.length - 1];
-  const last4h = e4h?.[e4h.length - 1];
+  const pick5m = e5m ? pickTriggerCandle(e5m, 5 * 60) : null;
+  const pick1h = e1h ? pickTriggerCandle(e1h, 60 * 60) : null;
+  const pick4h = e4h ? pickTriggerCandle(e4h, 4 * 60 * 60) : null;
+  const last5m = pick5m?.latest || e5m?.[e5m?.length - 1];
+  const last1h = pick1h?.latest || e1h?.[e1h?.length - 1];
+  const last4h = pick4h?.latest || e4h?.[e4h?.length - 1];
   const fmtNum = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "?";
 
   // Bias per TF — dùng biasOf() chung với phần Telegram khác để đồng nhất.
@@ -4171,7 +4215,9 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
 
     const pivots = await getCachedDailyPivots(env);
 
-    const last10 = candles.slice(-10).map(c =>
+    // Slice candles BỎ nến chưa đóng (nếu có) để AI không lẫn data nến đang chạy
+    const closedTailA = pickA?.isLatestClosed === false ? candles.slice(0, -1) : candles;
+    const last10 = closedTailA.slice(-10).map(c =>
       `O=${c.open.toFixed(2)} H=${c.high.toFixed(2)} L=${c.low.toFixed(2)} C=${c.close.toFixed(2)}`
     ).join(" | ");
     const horizon = TF_HORIZON[tf];
@@ -4180,7 +4226,10 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
       : "không có";
 
     // Bổ sung: candle pattern, session, HTF context (nếu LTF analysis)
-    const candlePattern = detectCandlePattern(l, e[e.length - 2]);
+    // prev = nến TRƯỚC nến trigger (pickA.prev). Nếu dùng e[length-2] khi nến cuối
+    // chưa đóng, l = e[length-2] và prev cũng = e[length-2] → engulfing detector
+    // so sánh nến với chính nó → mất tín hiệu.
+    const candlePattern = detectCandlePattern(l, pickA?.prev || e[e.length - 2]);
     const session = getTradingSession();
     const isLTF = tf === "5m" || tf === "15m" || tf === "1h";
     const htfCtx = isLTF ? await getHTFContext(env) : null;
@@ -4439,7 +4488,7 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs 
           const displayClose = pickTf?.displayCandle?.close ?? latestClosed.close;
           const fresh = checkDataFreshness(pickTf?.displayCandle || latestClosed, intervalSec);
           log(`fetch ${tf} ok (${candles.length} candles, closed=${pickTf?.isLatestClosed ?? "?"}, stale=${fresh.isStale})`);
-          return { tf, latest: latestClosed, displayClose, fresh, candles };
+          return { tf, latest: latestClosed, displayClose, fresh, candles, isLatestClosed: pickTf?.isLatestClosed ?? true };
         } catch (e) {
           console.log(`[multi-tf] fetch ${tf} fail: ${e.message}`);
           return null;
@@ -4457,8 +4506,10 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs 
     const pivots = await getCachedDailyPivots(env);
 
     // Build prompt với data từng TF
-    const tfDataLines = valid.map(({ tf, latest, candles }) => {
-      const last5 = candles.slice(-5).map(c =>
+    const tfDataLines = valid.map(({ tf, latest, candles, isLatestClosed }) => {
+      // Slice bỏ nến chưa đóng để AI không lẫn data nến đang chạy
+      const closedTail = isLatestClosed === false ? candles.slice(0, -1) : candles;
+      const last5 = closedTail.slice(-5).map(c =>
         `O=${c.open.toFixed(2)} H=${c.high.toFixed(2)} L=${c.low.toFixed(2)} C=${c.close.toFixed(2)}`
       ).join(" | ");
       return `--- ${tf.toUpperCase()} ---
