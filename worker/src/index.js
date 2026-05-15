@@ -445,17 +445,19 @@ async function getHTFContext(env) {
       fetchTdCandles(env, "4h", 220),
       fetchTdCandles(env, "1day", 220),
     ]);
-    const trendOf = (candles) => {
+    const trendOf = (candles, intervalSec) => {
       if (!candles || candles.length < 50) return "chưa rõ";
       const e = enrichIndicators(candles);
-      const last = e[e.length - 1];
+      // Dùng nến ĐÃ ĐÓNG cho HTF trend — tránh 4h/1d đang chạy làm trend assessment lung lay
+      const pick = pickTriggerCandle(e, intervalSec);
+      const last = pick?.latest || e[e.length - 1];
       if (last.close > last.ema200 && last.ema21 > last.ema50 && last.ema50 > last.ema200) return "Tăng mạnh (Strong Bullish)";
       if (last.close > last.ema50 && last.close > last.ema200) return "Tăng giá (Bullish)";
       if (last.close < last.ema200 && last.ema21 < last.ema50 && last.ema50 < last.ema200) return "Giảm mạnh (Strong Bearish)";
       if (last.close < last.ema50 && last.close < last.ema200) return "Giảm giá (Bearish)";
       return "Đi ngang (Sideways)";
     };
-    const result = { trend4h: trendOf(c4h), trend1d: trendOf(c1d) };
+    const result = { trend4h: trendOf(c4h, 4 * 3600), trend1d: trendOf(c1d, 24 * 3600) };
     if (env.CACHE) {
       await env.CACHE.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 });
     }
@@ -3878,7 +3880,19 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
           const candles = await fetchTdCandles(env, TF_TO_TD[tf], 220);
           if (candles.length < 50) return null;
           const e = enrichIndicators(candles);
-          return { tf, latest: e[e.length - 1], prev: e[e.length - 2] };
+          // Pick nến ĐÃ ĐÓNG cho bias/RSI; displayClose riêng cho "Giá hiện tại"
+          const intervalSec = TF_INTERVAL_SEC[tf] || 900;
+          const pickN = pickTriggerCandle(e, intervalSec);
+          const latestClosed = pickN?.latest || e[e.length - 1];
+          const prevClosed = pickN?.prev || e[e.length - 2];
+          const displayClose = pickN?.displayCandle?.close ?? latestClosed.close;
+          return {
+            tf,
+            latest: latestClosed,
+            prev: prevClosed,
+            displayClose,
+            isLatestClosed: pickN?.isLatestClosed ?? true,
+          };
         } catch { return null; }
       })),
       getAuxContext(env, auxArgs),
@@ -3888,7 +3902,13 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
       await sendTelegramTo(env, chatId, "❌ Không fetch được data", replyTo);
       return;
     }
-    const c = valid[0].latest.close;
+    // Giá hiện tại = displayClose của TF nhỏ nhất (5m). Latest = nến đã đóng (cho bias).
+    const c = valid[0].displayClose ?? valid[0].latest.close;
+    // Stale info per-TF
+    const staleTfsN = valid.filter(v => {
+      const fr = checkDataFreshness(v.latest, TF_INTERVAL_SEC[v.tf] || 900);
+      return fr.isStale;
+    });
     const pivots = await getCachedDailyPivots(env);
 
     const determineBias = (l) => {
@@ -5062,10 +5082,14 @@ async function runAlertCheck(env, { force = false } = {}) {
     const e1h = c1h.length >= 50 ? enrichIndicators(c1h) : null;
     const e4h = c4h.length >= 50 ? enrichIndicators(c4h) : null;
 
+    // mtfContext dùng nến ĐÃ ĐÓNG per-TF (formatAlertMessage hiển thị "Xác nhận đa khung"
+    // → nếu lấy nến đang chạy, bias 5p/1g có thể flip ngẫu nhiên giữa các tick).
+    const pick5mCron = e5m ? pickTriggerCandle(e5m, 5 * 60) : null;
+    const pick1hCron = e1h ? pickTriggerCandle(e1h, 60 * 60) : null;
     const mtfContext = {
-      "5p":  e5m  ? e5m[e5m.length - 1]   : null,
-      "15p": latest,
-      "1g":  e1h  ? e1h[e1h.length - 1]   : null,
+      "5p":  pick5mCron?.latest || (e5m ? e5m[e5m.length - 1] : null),
+      "15p": latest, // đã là nến đóng (từ pickTriggerCandle ở đầu cron)
+      "1g":  pick1hCron?.latest || (e1h ? e1h[e1h.length - 1] : null),
     };
 
     if (mega.triggered) {
