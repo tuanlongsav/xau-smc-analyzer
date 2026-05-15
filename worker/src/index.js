@@ -681,11 +681,12 @@ async function markAlerted(env, key) {
 
 async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
   const out = [];
-  // Giữ `key` trong object để cron logic có thể filter redundant alerts khi MEGA-MOVE active
+  // KHÔNG markAlerted ở đây — chỉ check cooldown để filter.
+  // markAlerted được gọi SAU KHI Telegram gửi thành công (trong cron),
+  // tránh case: detect → mark cooldown → deep analysis skip → alert mất 1h.
   const push = async (key, icon, text, suggestion = null) => {
     if (await alertCooldownOk(env, key)) {
       out.push({ key, icon, text, suggestion });
-      await markAlerted(env, key);
     }
   };
 
@@ -987,6 +988,42 @@ async function trackVolRegime(env, currentRegime) {
 const MEGA_MOVE_DOLLAR = 20;
 const MEGA_MOVE_SINGLE_ATR = 2.0;
 const MEGA_MOVE_CLUSTER_ATR = 3.0;
+
+/**
+ * Chọn nến trigger đã đóng + nến phía trước cho detection.
+ * TwelveData trả nến mới nhất có thể đang chạy (chưa đóng) → wick/BB break
+ * trong nến chạy có thể biến mất khi nến đóng. Cần ép trigger trên nến ĐÃ ĐÓNG.
+ *
+ * Trả về { latest, prev, displayCandle, isLatestClosed }:
+ * - latest, prev: dùng cho detectFreshAlerts (signals)
+ * - displayCandle: nến mới nhất (có thể chưa đóng) — chỉ để hiển thị giá hiện tại
+ *
+ * @param {Array} candlesEnriched
+ * @param {number} intervalSec — độ dài 1 nến (15m=900s, 5m=300s, 1h=3600s)
+ */
+function pickTriggerCandle(candlesEnriched, intervalSec = 15 * 60) {
+  if (!Array.isArray(candlesEnriched) || candlesEnriched.length < 3) return null;
+  const n = candlesEnriched.length;
+  const last = candlesEnriched[n - 1];
+  const nowSec = Math.floor(Date.now() / 1000);
+  // Nến đã đóng nếu open_time + interval đã qua hiện tại
+  const isLatestClosed = last.time && (last.time + intervalSec) <= nowSec;
+  if (isLatestClosed) {
+    return {
+      latest: last,
+      prev: candlesEnriched[n - 2],
+      displayCandle: last,
+      isLatestClosed: true,
+    };
+  }
+  // Nến mới nhất chưa đóng → trigger trên nến áp chót (đã đóng chắc chắn)
+  return {
+    latest: candlesEnriched[n - 2],
+    prev: candlesEnriched[n - 3],
+    displayCandle: last,
+    isLatestClosed: false,
+  };
+}
 
 function detectMegaMove(candlesEnriched) {
   if (!Array.isArray(candlesEnriched) || candlesEnriched.length < 4) {
@@ -1588,14 +1625,16 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
     "confidence": "cao|trung bình|thấp",
     "confidence_pct": <0-100, % xác suất setup này đúng — BẮT BUỘC, đồng nhất với chuỗi confidence>
   }],
-  "news_catalyst": "1 CÂU TIẾNG VIỆT ≤120 ký tự về tin nào gây biến động (KHÔNG copy EN nguyên), hoặc null"
+  "news_catalyst": "1 CÂU TIẾNG VIỆT ≤120 ký tự về tin nào gây biến động (KHÔNG copy EN nguyên), hoặc null",
+  "no_trade_reason": "null nếu CÓ setup. Nếu không có setup nào hợp lý (signal yếu, đợi xác nhận, đa xung đột) → 1 CÂU TIẾNG VIỆT giải thích tại sao chưa vào lệnh được"
 }
 
 QUY TẮC TUYỆT ĐỐI:
 - Giá là SỐ TUYỆT ĐỐI trong $${(currentPrice - atr * 5).toFixed(0)}-$${(currentPrice + atr * 5).toFixed(0)}. KHÔNG dùng $1.95/$1.00 — đó là sai.
 - Long: SL < entry < TP1 < TP2 < TP3. Short: SL > entry > TP1 > TP2 > TP3.
 - SL-entry ≥ 1× ATR (~$${atr.toFixed(0)}). TP1 ≥ entry ± 1× ATR.
-- **BẮT BUỘC trả ≥1 trade_setup khi direction != "neutral"** (kể cả khi verdict là *_likely). Verdict mixed → 2 setup (long+short).
+- **trade_setups**: CHỈ trả setup khi có **≥ 2 yếu tố confluence cùng hướng** (vd: wick rejection + RSI extreme + key level). Nếu signal yếu/đợi xác nhận/xung đột đa khung → để trade_setups là MẢNG RỖNG [] và điền no_trade_reason. KHÔNG ép vào lệnh.
+- Verdict "mixed" + 2 setup chỉ khi cả 2 chiều đều có confluence riêng (wait_for khác nhau).
 - summary: 2-3 câu tự nhiên, hành động cụ thể (vd: "Phe bán có cơ hội tại $X nếu thấy Y. Đợi xác nhận, KHÔNG vào ngay.").
 - key_factors: 2-3 bullet ngắn, bản chất.
 - news_catalyst tiếng Việt ≤120 ký tự.
@@ -1708,15 +1747,31 @@ async function runDeepAnalysis(env, ctx) {
     intro = `XAU/USD có ${alerts.length} tín hiệu kỹ thuật vừa kích hoạt. Giá hiện tại $${latest.close.toFixed(2)}.`;
   }
 
-  // Phần 2: BỐI CẢNH chung
-  const last1hRsi = e1h?.[e1h.length - 1]?.rsi;
-  const last4hRsi = e4h?.[e4h.length - 1]?.rsi;
+  // Phần 2: BỐI CẢNH chung — bổ sung MTF context, ATR per TF, pivots, recent H/L
+  const e5m = ctx.e5m || null;
+  const last5m = e5m?.[e5m.length - 1];
+  const last1h = e1h?.[e1h.length - 1];
+  const last4h = e4h?.[e4h.length - 1];
+  const fmtNum = (v) => Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "?";
+
+  // Bias per TF (đơn giản hoá: dựa EMA21 vs close)
+  const biasOfTf = (c) => {
+    if (!c || c.close == null || c.ema21 == null) return "?";
+    return c.close > c.ema21 ? "TĂNG" : c.close < c.ema21 ? "GIẢM" : "đi ngang";
+  };
+
+  const pivLine = pivotsCtx
+    ? `${fmtNum(pivotsCtx.r2)}/${fmtNum(pivotsCtx.r1)}/${fmtNum(pivotsCtx.pp)}/${fmtNum(pivotsCtx.s1)}/${fmtNum(pivotsCtx.s2)}`
+    : "?";
+
   const context = `## BỐI CẢNH
-- Phiên: ${session.name}
-- Biến động: ${regimeVi}${regime.ratio != null ? ` (ATR ${regime.ratio.toFixed(2)}× nền 24g)` : ""}
-- RSI 15p/1g/4g: ${latest.rsi?.toFixed(1) || "?"}/${last1hRsi?.toFixed(1) || "?"}/${last4hRsi?.toFixed(1) || "?"}
-- EMA21/50/200 (15p): ${latest.ema21?.toFixed(2)}/${latest.ema50?.toFixed(2)}/${latest.ema200?.toFixed(2)}
-- BB (15p): ${latest.bbLower?.toFixed(2)} ~ ${latest.bbUpper?.toFixed(2)}`;
+- Phiên: ${session.name} | Biến động: ${regimeVi}${regime.ratio != null ? ` (ATR ${regime.ratio.toFixed(2)}× nền 24g)` : ""}
+- 5p: bias ${biasOfTf(last5m)} | RSI ${fmtNum(last5m?.rsi)} | ATR ${fmtNum(last5m?.atr)} | EMA21 ${fmtNum(last5m?.ema21)}
+- 15p (trigger): bias ${biasOfTf(latest)} | RSI ${fmtNum(latest.rsi)} | ATR ${fmtNum(latest.atr)} | EMA21/50/200 ${fmtNum(latest.ema21)}/${fmtNum(latest.ema50)}/${fmtNum(latest.ema200)} | BB ${fmtNum(latest.bbLower)}~${fmtNum(latest.bbUpper)}
+- 1g: bias ${biasOfTf(last1h)} | RSI ${fmtNum(last1h?.rsi)} | ATR ${fmtNum(last1h?.atr)} | EMA21 ${fmtNum(last1h?.ema21)}
+${last4h ? `- 4g: bias ${biasOfTf(last4h)} | RSI ${fmtNum(last4h.rsi)} | ATR ${fmtNum(last4h.atr)}` : ""}
+- Pivots R2/R1/PP/S1/S2: ${pivLine}
+- 50-nến H/L (15p): ${fmtNum(latest.recentHigh)} / ${fmtNum(latest.recentLow)}`;
 
   // Phần 3: SIGNALS (mega: reversal scan; alerts: list)
   let signalsBlock = "";
@@ -1959,13 +2014,24 @@ ${schemaWithExamples}`;
       }
     }
 
-    // Fallback rule-based: AI không trả setup hợp lệ + có direction rõ
-    // → đảm bảo LUÔN có giá khuyến nghị (entry/SL/TP) khi hướng đủ rõ.
-    if (!renderedAnySetup && aiResult.direction && aiResult.direction !== "neutral") {
+    // Nếu AI trả no_trade_reason → respect quyết định "đợi xác nhận", KHÔNG fallback rule-based
+    const noTradeReason = aiResult.no_trade_reason;
+    const hasExplicitNoTrade = noTradeReason && typeof noTradeReason === "string"
+      && noTradeReason.toLowerCase() !== "null" && noTradeReason.trim().length > 5;
+
+    if (!renderedAnySetup && hasExplicitNoTrade) {
+      // AI cố tình không trả setup — hiển thị lý do thay vì ép rule-based
+      lines.push("");
+      lines.push(`⏳ <b>Chưa khả thi:</b> ${h(noTradeReason)}`);
+      renderedAnySetup = true; // mark để không trigger rule-based
+    }
+
+    // Fallback rule-based CHỈ KHI: AI quên trả setup (không có no_trade_reason) + có direction
+    // → tránh ép vào lệnh khi AI đã cảnh báo "đợi", nhưng vẫn cover case AI quên field.
+    if (!renderedAnySetup && !hasExplicitNoTrade && aiResult.direction && aiResult.direction !== "neutral") {
       const dirForRule = aiResult.direction === "long" ? "BUY" : "SELL";
       const klForRule = getKeyLevelsAround(latest, pivotsCtx, latest.close);
       const trendForRule = getTrendAssessment(latest);
-      // Tạo alerts giả từ direction để generateTradeSuggestion chấm điểm đúng
       const fakeAlerts = [{ text: dirForRule === "BUY" ? "TĂNG đẩy lên" : "GIẢM đẩy xuống" }];
       const ruleSg = generateTradeSuggestion(latest, fakeAlerts, trendForRule, klForRule);
       if (ruleSg) {
@@ -4126,10 +4192,11 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs 
         `O=${c.open.toFixed(2)} H=${c.high.toFixed(2)} L=${c.low.toFixed(2)} C=${c.close.toFixed(2)}`
       ).join(" | ");
       return `--- ${tf.toUpperCase()} ---
-Giá: $${latest.close.toFixed(2)} | RSI: ${latest.rsi?.toFixed(1)}
+Giá: $${latest.close.toFixed(2)} | RSI: ${latest.rsi?.toFixed(1)} | ATR: ${latest.atr?.toFixed(2) ?? "?"}
 EMA 21/50/200: ${latest.ema21?.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}
 SMA 50/200: ${latest.sma50?.toFixed(2)} / ${latest.sma200?.toFixed(2)} ${latest.sma50 > latest.sma200 ? "(golden)" : "(death)"}
 BB(20): ${latest.bbLower?.toFixed(2)} - ${latest.bbUpper?.toFixed(2)}
+50-nến H/L: ${latest.recentHigh?.toFixed(2) ?? "?"} / ${latest.recentLow?.toFixed(2) ?? "?"}
 5 nến gần: ${last5}`;
     }).join("\n\n");
 
@@ -4592,8 +4659,18 @@ async function runAlertCheck(env, { force = false } = {}) {
     }
 
     const e15m = enrichIndicators(c15m);
-    const latest = e15m[e15m.length - 1];
-    const prev = e15m[e15m.length - 2];
+
+    // Trigger trên nến 15m ĐÃ ĐÓNG để tránh wick/BB false-positive trong nến chạy.
+    // displayCandle = nến mới nhất (có thể chưa đóng) — dùng để hiển thị giá hiện tại.
+    const pick = pickTriggerCandle(e15m, 15 * 60);
+    if (!pick) {
+      console.log(`[cron] not enough closed candles for trigger`);
+      return;
+    }
+    const { latest, prev, displayCandle, isLatestClosed } = pick;
+    if (!isLatestClosed) {
+      console.log(`[cron] 15m nến mới nhất chưa đóng → trigger trên nến đã đóng kế trước`);
+    }
 
     const regime = classifyVolRegime(e15m);
     const regimeShiftAlert = await trackVolRegime(env, regime);
@@ -4641,24 +4718,45 @@ async function runAlertCheck(env, { force = false } = {}) {
 
       let result = null;
       try {
-        result = await runDeepAnalysis(env, { mode: "mega", mega, e15m, e1h, e4h, regime, session, alerts: extraAlerts, latest, pivots, mtfContext });
+        result = await runDeepAnalysis(env, { mode: "mega", mega, e5m, e15m, e1h, e4h, regime, session, alerts: extraAlerts, latest, pivots, mtfContext });
       } catch (e) {
         console.log(`[cron] mega deep analysis fail: ${e.message}`);
+      }
+
+      // Mark cooldown alerts CHỈ KHI đã gửi thành công (tránh alert lost-in-cooldown)
+      if (result?.sent && extraAlerts.length > 0) {
+        for (const a of extraAlerts) await markAlerted(env, a.key);
       }
 
       // Fallback: mega cooldown nhưng còn non-redundant alerts → gửi regular alerts
       if (result?.skipped === "cooldown" && extraAlerts.length > 0) {
         const msg = formatAlertMessage(latest, extraAlerts, pivots, mtfContext);
         const ok = await sendTelegram(env, msg);
+        if (ok) {
+          for (const a of extraAlerts) await markAlerted(env, a.key);
+        }
         console.log(`[cron] mega cooldown, fallback ${extraAlerts.length} non-redundant alerts, telegram=${ok}`);
       }
     } else if (alerts.length > 0) {
       // Regular alerts → deep analysis (AI + trade setups + news)
       console.log(`[cron] ${alerts.length} alerts triggered, run deep analysis (no mega)`);
+      let result = null;
       try {
-        await runDeepAnalysis(env, { mode: "alerts", alerts, e15m, e1h, e4h, regime, session, latest, pivots, mtfContext });
+        result = await runDeepAnalysis(env, { mode: "alerts", alerts, e5m, e15m, e1h, e4h, regime, session, latest, pivots, mtfContext });
       } catch (e) {
         console.log(`[cron] alerts deep analysis fail: ${e.message}`);
+      }
+      // Mark alert keys nếu gửi OK
+      if (result?.sent) {
+        for (const a of alerts) await markAlerted(env, a.key);
+      } else if (result?.skipped === "cooldown") {
+        // Deep cooldown: gửi fallback rule-based ngắn để user không bỏ lỡ alert mới
+        const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
+        const ok = await sendTelegram(env, msg);
+        if (ok) {
+          for (const a of alerts) await markAlerted(env, a.key);
+        }
+        console.log(`[cron] alerts deep cooldown, fallback rule-based, telegram=${ok}`);
       }
     }
   } catch (e) {
