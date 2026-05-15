@@ -1181,13 +1181,24 @@ function scoreAlerts(alerts) {
  * @param {object} ctx — { atr?, minRr? } — minRr = R:R tối thiểu cho TP1 (default 0.7)
  */
 function validateTradeGeometry(setup, ctx = {}) {
-  const { entry, sl, tp1, tp2, tp3 } = setup;
+  // Normalize: AI có thể trả "4520.5" (string) → parse về number.
+  // null/undefined/NaN/empty → null.
+  const toNum = (v) => {
+    if (v == null || v === "") return null;
+    const n = typeof v === "string" ? parseFloat(v) : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const entry = toNum(setup.entry);
+  const sl = toNum(setup.sl);
+  const tp1 = toNum(setup.tp1);
+  const tp2 = toNum(setup.tp2);
+  const tp3 = toNum(setup.tp3);
   const bias = String(setup.bias || "").toUpperCase();
   const minRr = ctx.minRr ?? 0.7;
 
   // Required fields
-  if (!Number.isFinite(entry) || !Number.isFinite(sl) || !Number.isFinite(tp1)) {
-    return { valid: false, reason: "thiếu entry/SL/TP1" };
+  if (entry == null || sl == null || tp1 == null) {
+    return { valid: false, reason: "thiếu entry/SL/TP1 (hoặc không phải số hợp lệ)" };
   }
 
   const isLong = bias === "BUY" || bias === "LONG";
@@ -1205,14 +1216,14 @@ function validateTradeGeometry(setup, ctx = {}) {
   }
 
   // TP order: TP1 < TP2 < TP3 (long) hoặc TP1 > TP2 > TP3 (short)
-  if (Number.isFinite(tp2)) {
+  if (tp2 != null) {
     if (isLong && tp2 <= tp1) return { valid: false, reason: `LONG cần tp2>tp1, got tp1=${tp1} tp2=${tp2}` };
     if (isShort && tp2 >= tp1) return { valid: false, reason: `SHORT cần tp2<tp1, got tp1=${tp1} tp2=${tp2}` };
   }
-  if (Number.isFinite(tp3)) {
-    const ref = Number.isFinite(tp2) ? tp2 : tp1;
-    if (isLong && tp3 <= ref) return { valid: false, reason: `LONG cần tp3>${Number.isFinite(tp2)?"tp2":"tp1"}, got tp3=${tp3}` };
-    if (isShort && tp3 >= ref) return { valid: false, reason: `SHORT cần tp3<${Number.isFinite(tp2)?"tp2":"tp1"}, got tp3=${tp3}` };
+  if (tp3 != null) {
+    const ref = tp2 != null ? tp2 : tp1;
+    if (isLong && tp3 <= ref) return { valid: false, reason: `LONG cần tp3>${tp2 != null ? "tp2" : "tp1"}, got tp3=${tp3}` };
+    if (isShort && tp3 >= ref) return { valid: false, reason: `SHORT cần tp3<${tp2 != null ? "tp2" : "tp1"}, got tp3=${tp3}` };
   }
 
   // R:R tối thiểu cho TP1
@@ -1224,9 +1235,10 @@ function validateTradeGeometry(setup, ctx = {}) {
     return { valid: false, reason: `R:R đến TP1 = ${rr.toFixed(2)} < ${minRr} (TP1 quá gần entry so với SL)` };
   }
 
-  // SL distance ≥ 1× ATR (nếu có atr trong ctx)
-  if (Number.isFinite(ctx.atr) && ctx.atr > 0 && slDist < ctx.atr * 0.8) {
-    return { valid: false, reason: `SL cách entry ${slDist.toFixed(2)} < 0.8× ATR (${ctx.atr.toFixed(2)}) — quá gần, dễ bị quét stop` };
+  // SL distance ≥ 0.8× ATR (nếu có atr trong ctx)
+  const atrNum = toNum(ctx.atr);
+  if (atrNum != null && atrNum > 0 && slDist < atrNum * 0.8) {
+    return { valid: false, reason: `SL cách entry ${slDist.toFixed(2)} < 0.8× ATR (${atrNum.toFixed(2)}) — quá gần, dễ bị quét stop` };
   }
 
   return { valid: true, reason: null };
@@ -2096,7 +2108,13 @@ ${schemaWithExamples}`;
     lines.push(`🔔 <b>TÍN HIỆU KỸ THUẬT</b> — ${alerts.length} cảnh báo vừa kích hoạt`);
   }
   const ratioText = regime.ratio != null ? ` (ATR ${regime.ratio.toFixed(2)}× nền 24g)` : "";
-  lines.push(`Giá: <b>$${latest.close.toFixed(2)}</b> | Phiên: ${h(sessionVi)} | Biến động: ${h(regimeVi)}${h(ratioText)}`);
+  // Giá: ưu tiên ctx.displayPrice (nến live mới nhất từ cron), fallback latest.close
+  // (= close nến trigger đã đóng). Nếu khác nhau >0.5 → show cả 2 để minh bạch.
+  const displayPriceDeep = Number.isFinite(Number(ctx.displayPrice)) ? Number(ctx.displayPrice) : null;
+  const priceLine = (displayPriceDeep != null && Math.abs(displayPriceDeep - latest.close) > 0.5)
+    ? `Giá: <b>$${displayPriceDeep.toFixed(2)}</b> <i>(nến trigger đã đóng $${latest.close.toFixed(2)})</i> | Phiên: ${h(sessionVi)} | Biến động: ${h(regimeVi)}${h(ratioText)}`
+    : `Giá: <b>$${(displayPriceDeep ?? latest.close).toFixed(2)}</b> | Phiên: ${h(sessionVi)} | Biến động: ${h(regimeVi)}${h(ratioText)}`;
+  lines.push(priceLine);
 
   // Alerts block — mega hiển thị "Cảnh báo song hành" (non-redundant), alerts hiển thị full list
   if (alerts.length > 0) {
@@ -2785,38 +2803,38 @@ function formatAlertMessage(latest, alerts, pivots, mtfContext = null) {
 // Reusable: call Gemini với KV cache + rotation + Workers AI fallback
 // (Dùng từ Telegram bot handler — khác /v1beta route ở chỗ trả parsed JSON)
 // ──────────────────────────────────────────────────────────
-async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
+async function callGeminiSmart(env, body, model = "gemini-2.5-flash", opts = {}) {
   const bodyStr = JSON.stringify(body);
   const hash = await hashBody(bodyStr);
   const cacheKey = `gemini:${model}:${hash}`;
   const wantJson = body?.generationConfig?.responseMimeType === "application/json";
 
-  // Cache hit — chỉ trả nếu valid (đã filter ở write side, nhưng safety)
+  // Cache hit — chỉ trả nếu valid
   const cached = await cacheGet(env, cacheKey);
   if (cached) {
     try { return JSON.parse(cached); } catch {}
   }
 
   // Validate response: text KHÔNG được rỗng cho MỌI mode (tránh cache empty/safety-block).
-  // Với JSON mode còn phải parse được JSON.
   const isValidResponse = (resp) => {
     if (!resp) return false;
     const text = resp?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text || !String(text).trim()) return false; // empty / whitespace-only / safety block
+    if (!text || !String(text).trim()) return false;
     if (!wantJson) return true;
     return extractJSON(text) !== null;
   };
 
-  // Try Gemini keys
   const allKeys = collectGeminiKeys(env);
   const active = allKeys.filter(k => !isKeyOnCooldown(k.label));
   const tryKeys = active.length > 0 ? active : allKeys;
 
-  // Worker waitUntil chỉ ~30s sau response → phải fail-fast để có cơ hội thử
-  // Workers AI fallback. Chỉ thử TỐI ĐA 2 key Gemini, mỗi key timeout 12s.
-  // Worst case: 2×12 = 24s + Workers AI ~5s = 29s ≈ 30s limit.
-  const GEMINI_TIMEOUT_MS = 12_000;
-  const MAX_KEYS_TO_TRY = 2;
+  // Budget timeout config:
+  //   default (cron/deep alert): 2 keys × 12s + Workers AI 20s = ~44s (vượt 30s waitUntil)
+  //   botMode (Telegram /15p, /nhanh, /tin, /ask): chặt hơn để fit waitUntil ~30s
+  //     1 key × 10s + Workers AI 12s = ~22s
+  // Pass opts.botMode=true từ handler Telegram để dùng budget chặt.
+  const GEMINI_TIMEOUT_MS = opts.geminiTimeoutMs ?? (opts.botMode ? 10_000 : 12_000);
+  const MAX_KEYS_TO_TRY = opts.maxKeys ?? (opts.botMode ? 1 : 2);
 
   let attempted = 0;
   for (const { key, label } of tryKeys) {
@@ -2862,7 +2880,7 @@ async function callGeminiSmart(env, body, model = "gemini-2.5-flash") {
   }
 
   // Fallback Workers AI
-  const ai = await tryWorkersAI(env, bodyStr);
+  const ai = await tryWorkersAI(env, bodyStr, opts);
   if (ai && isValidResponse(ai)) {
     await cachePut(env, cacheKey, JSON.stringify(ai));
     return ai;
@@ -3794,7 +3812,7 @@ ${currentPrice != null ? `- Vùng giá: $${(currentPrice * 0.97).toFixed(0)} –
       },
     };
 
-    const resp = await callGeminiSmart(env, body);
+    const resp = await callGeminiSmart(env, body, undefined, { botMode: true });
     const aiText = extractText(resp);
     if (!aiText) {
       await sendTelegramTo(env, chatId, "❌ AI không phản hồi.", replyTo);
@@ -3914,7 +3932,7 @@ Trả lời câu hỏi của user dùng giá/indicators thực ở trên. Tính 
       },
     };
 
-    const resp = await callGeminiSmart(env, body);
+    const resp = await callGeminiSmart(env, body, undefined, { botMode: true });
     const text = extractText(resp);
     if (!text) {
       await sendTelegramTo(env, chatId, "❌ AI không phản hồi. Thử lại.", replyTo);
@@ -4211,7 +4229,7 @@ Trả JSON:
         temperature: 0.4,
       },
     };
-    const resp = await callGeminiSmart(env, body);
+    const resp = await callGeminiSmart(env, body, undefined, { botMode: true });
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
@@ -4425,7 +4443,7 @@ ${htfBlock}
         thinkingConfig: { thinkingBudget: 0 },
       },
     };
-    const resp = await callGeminiSmart(env, body);
+    const resp = await callGeminiSmart(env, body, undefined, { botMode: true });
     const text = extractText(resp);
     const d = extractJSON(text);
     if (!d) {
@@ -4728,7 +4746,7 @@ LƯU Ý xac_suat_pct: LONG + SHORT ≤ 100. Phần còn lại là xác suất "C
     };
 
     log("calling gemini");
-    const resp = await callGeminiSmart(env, body);
+    const resp = await callGeminiSmart(env, body, undefined, { botMode: true });
     log(`gemini done (source=${resp?.usageMetadata?.source || "gemini"})`);
     const text = extractText(resp);
     const d = extractJSON(text);
@@ -5217,7 +5235,7 @@ async function runAlertCheck(env, { force = false } = {}) {
 
       let result = null;
       try {
-        result = await runDeepAnalysis(env, { mode: "mega", mega, e5m, e15m: closedE15m, e1h, e4h, regime, session, alerts: extraAlerts, latest, pivots, mtfContext });
+        result = await runDeepAnalysis(env, { mode: "mega", mega, e5m, e15m: closedE15m, e1h, e4h, regime, session, alerts: extraAlerts, latest, displayPrice: displayCandle?.close, pivots, mtfContext });
       } catch (e) {
         console.log(`[cron] mega deep analysis fail: ${e.message}`);
       }
@@ -5272,7 +5290,7 @@ async function runAlertCheck(env, { force = false } = {}) {
       } else {
         let result = null;
         try {
-          result = await runDeepAnalysis(env, { mode: "alerts", alerts, e5m, e15m: closedE15m, e1h, e4h, regime, session, latest, pivots, mtfContext, alertScore: score });
+          result = await runDeepAnalysis(env, { mode: "alerts", alerts, e5m, e15m: closedE15m, e1h, e4h, regime, session, latest, displayPrice: displayCandle?.close, pivots, mtfContext, alertScore: score });
         } catch (e) {
           console.log(`[cron] alerts deep analysis fail: ${e.message}`);
         }
@@ -5302,7 +5320,7 @@ async function runAlertCheck(env, { force = false } = {}) {
   }
 }
 
-async function tryWorkersAI(env, body) {
+async function tryWorkersAI(env, body, callerOpts = {}) {
   if (!env.AI) {
     console.log(`[workers-ai] env.AI binding không có → bỏ qua`);
     return null;
@@ -5324,29 +5342,28 @@ async function tryWorkersAI(env, body) {
     });
   }
 
-  const opts = {
+  const aiOpts = {
     messages,
     max_tokens: parsed.generationConfig?.maxOutputTokens || 2048,
     temperature: parsed.generationConfig?.temperature ?? 0.5,
   };
   if (parsed.generationConfig?.responseMimeType === "application/json") {
-    opts.response_format = { type: "json_object" };
+    aiOpts.response_format = { type: "json_object" };
   }
 
   const totalChars = messages.reduce((s, m) => s + m.content.length, 0);
   // Llama 3.1 8B nhanh hơn 3.3 70B nhiều (~3-5s vs 10-20s) cho output schema cứng.
-  // Quality kém hơn nhưng đủ cho structured JSON khi Gemini outage.
   const model = "@cf/meta/llama-3.1-8b-instruct-fast";
-  console.log(`[workers-ai] gọi ${model} (${totalChars} chars input, max ${opts.max_tokens} tokens)`);
+  console.log(`[workers-ai] gọi ${model} (${totalChars} chars input, max ${aiOpts.max_tokens} tokens)`);
 
-  // Timeout 20s — Worker waitUntil 30s tổng, đã dùng ~7s cho 2 keys Gemini
-  // còn ~23s, để 3s buffer cho format + send Telegram
   const t0 = Date.now();
   let aiResp;
   try {
+    // botMode: 12s thay vì 20s (Telegram waitUntil ~30s, đã ăn 10s Gemini)
+    const aiTimeoutMs = callerOpts.workersAiTimeoutMs ?? (callerOpts.botMode ? 12_000 : 20_000);
     aiResp = await Promise.race([
-      env.AI.run(model, opts),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("Workers AI timeout 20s")), 20_000)),
+      env.AI.run(model, aiOpts),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`Workers AI timeout ${aiTimeoutMs/1000}s`)), aiTimeoutMs)),
     ]);
   } catch (e) {
     console.log(`[workers-ai] error after ${Date.now() - t0}ms: ${e.message}`);
