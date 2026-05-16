@@ -1817,16 +1817,16 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
   "confidence_pct": 0-100,
   "trade_status": "enterable|watch|avoid",
   "move_phase": "impulse|exhaustion|retest|mean_reversion|consolidation",
-  "summary": "2-3 câu tiếng Việt: phe nào kiểm soát, đang ở giai đoạn nào, có nên hành động gì.",
+  "summary": "2-3 câu TV: phe nào kiểm soát, đang ở giai đoạn nào, có nên hành động gì. MỌI giá phải là số tuyệt đối có $ (vd $${(currentPrice - atr).toFixed(2)}, $${(currentPrice + atr).toFixed(2)}). CẤM placeholder $X $Y $Z.",
   "outlook_short": {
     "direction": "long|short|neutral",
     "confidence_pct": <0-100>,
-    "note": "1 câu ngắn TV về xu hướng 15-30 phút tới (vd: 'nến 15p kế tiếp có thể test lại $X')"
+    "note": "1 câu TV xu hướng 15-30 phút tới. Mọi giá là SỐ THẬT (vd 'nến 15p kế tiếp có thể test lại $${(currentPrice - atr * 0.5).toFixed(2)}'). CẤM $X/$Y/$Z."
   },
   "outlook_medium": {
     "direction": "long|short|neutral",
     "confidence_pct": <0-100>,
-    "note": "1 câu ngắn TV về xu hướng 1-4 giờ tới (vd: 'phiên Mỹ có thể đẩy giá tới $Y nếu phá $Z')"
+    "note": "1 câu TV xu hướng 1-4 giờ tới. Mọi giá là SỐ THẬT (vd 'phiên Mỹ có thể đẩy giá tới $${(currentPrice - atr * 2).toFixed(2)} nếu phá $${(currentPrice - atr).toFixed(2)}'). CẤM placeholder."
   },
   "key_factors": [
     "Lý do BẢN CHẤT, ≤100 ký tự (vd: 'RSI 1g vẫn dưới 70, trend còn space để đẩy tiếp')",
@@ -1855,6 +1855,7 @@ function buildDeepAnalysisSchema(currentPrice, atr) {
 }
 
 QUY TẮC TUYỆT ĐỐI:
+- **MỌI GIÁ trong MỌI FIELD phải là SỐ THẬT có $** (vd $${(currentPrice + atr).toFixed(2)}, $${(currentPrice - atr * 2).toFixed(2)}). **CẤM dùng chữ cái placeholder $X, $Y, $Z, $W, $A, $B... trong summary/outlook/note** — đây là lỗi nghiêm trọng, message sẽ bị từ chối.
 - **trade_status BẮT BUỘC**: "enterable" (≥3 confluence, setup rõ), "watch" (signal có nhưng đợi xác nhận), "avoid" (xung đột/data stale/đảo chiều không rõ).
 - **move_phase BẮT BUỘC** (đặc biệt cho mega-move): "impulse" (đẩy mạnh tiếp diễn), "exhaustion" (đà yếu, gần đỉnh/đáy), "retest" (kiểm tra lại mức phá), "mean_reversion" (về EMA/giá trung bình), "consolidation" (đi ngang sau move). Dùng để tránh câu trả lời chung chung reversal/continuation.
 - Giá là SỐ TUYỆT ĐỐI trong $${(currentPrice - atr * 5).toFixed(0)}-$${(currentPrice + atr * 5).toFixed(0)}. KHÔNG dùng $1.95/$1.00 — đó là sai.
@@ -2179,17 +2180,30 @@ ${schemaWithExamples}`;
       lines.push(parts.join(" | "));
     }
 
+    // Helper: strip placeholder literals $X/$Y/$Z/$W/$A-D... mà AI có thể leak
+    // bất chấp prompt instruction. Replace bằng "???" để user thấy rõ AI bị lỗi.
+    const stripPlaceholders = (s) => {
+      if (!s || typeof s !== "string") return s;
+      // Match $X, $Y, $Z, $W, $A, $B, $C, $D (single uppercase letter, NOT followed by digit)
+      // → tránh false-positive với $4500 (number).
+      const cleaned = s.replace(/\$([A-Z])(?![\w])/g, "???");
+      if (cleaned !== s) {
+        console.log(`[deep] stripped placeholder leak: "${s.slice(0, 100)}"`);
+      }
+      return cleaned;
+    };
+
     // Pre-compute Summary + key_factors lines — sẽ push sau KẾ HOẠCH (trade_setups)
     // Thứ tự render mới: Bias → Mốc → Kế hoạch → Lý do (theo audit feedback).
     const deferredReasonLines = [];
     if (aiResult.summary && typeof aiResult.summary === "string") {
-      const s = aiResult.summary.trim();
+      const s = stripPlaceholders(aiResult.summary.trim());
       const sTrim = s.length > 400 ? s.slice(0, 397) + "…" : s;
       deferredReasonLines.push(h(sTrim));
     }
     if (Array.isArray(aiResult.key_factors) && aiResult.key_factors.length > 0) {
       const trimmed = aiResult.key_factors.slice(0, 3)
-        .map(f => String(f || "").trim())
+        .map(f => stripPlaceholders(String(f || "").trim()))
         .filter(Boolean)
         .map(f => f.length > 140 ? f.slice(0, 137) + "…" : f);
       if (trimmed.length > 0) deferredReasonLines.push(trimmed.map(f => "• " + h(f)).join("\n"));
@@ -2202,7 +2216,8 @@ ${schemaWithExamples}`;
       const dirIcon = dir === "long" ? "📈" : dir === "short" ? "📉" : dir === "neutral" ? "➡️" : "❓";
       const dirText = dir === "long" ? "TĂNG" : dir === "short" ? "GIẢM" : dir === "neutral" ? "ĐI NGANG" : "?";
       const conf = Number.isFinite(Number(o.confidence_pct)) ? ` ${Math.round(o.confidence_pct)}%` : "";
-      const note = o.note ? ` — <i>${h(String(o.note).slice(0, 200))}</i>` : "";
+      const noteRaw = o.note ? stripPlaceholders(String(o.note).slice(0, 200)) : "";
+      const note = noteRaw ? ` — <i>${h(noteRaw)}</i>` : "";
       return `${dirIcon} <b>${labelTime}:</b> ${dirText}${conf}${note}`;
     };
     const oShort = renderOutlook(aiResult.outlook_short, "15-30 phút tới");
