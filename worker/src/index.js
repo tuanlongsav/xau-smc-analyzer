@@ -8,6 +8,13 @@
 //
 // Set key: wrangler secret put GEMINI_API_KEY_1 (rồi _2, _3, _4, _5 cho rotation).
 
+import {
+  analyzeSmcContext,
+  formatSmcContextForPrompt,
+  formatSmcCompactForTelegram,
+  detectRsiDivergence,
+} from "./smc-detect.js";
+
 const GOOGLE_BASE = "https://generativelanguage.googleapis.com";
 
 // Origin nào được phép gọi (CORS). Browser sẽ enforce, curl thì không.
@@ -347,15 +354,31 @@ function rsi(closes, period = 14) {
 function bollinger(closes, period = 20, mult = 2) {
   const u = new Array(closes.length).fill(null);
   const l = new Array(closes.length).fill(null);
+  const mid = new Array(closes.length).fill(null);
   for (let i = period - 1; i < closes.length; i++) {
     const sl = closes.slice(i - period + 1, i + 1);
     const m = sl.reduce((a, b) => a + b, 0) / period;
     const v = sl.reduce((a, b) => a + (b - m) ** 2, 0) / period;
     const sd = Math.sqrt(v);
+    mid[i] = m;
     u[i] = m + mult * sd;
     l[i] = m - mult * sd;
   }
-  return { upper: u, lower: l };
+  return { upper: u, lower: l, middle: mid };
+}
+
+function macd(closes, fast = 12, slow = 26, signal = 9) {
+  const emaFast = ema(closes, fast);
+  const emaSlow = ema(closes, slow);
+  const macdLine = closes.map((_, i) =>
+    emaFast[i] !== null && emaSlow[i] !== null ? emaFast[i] - emaSlow[i] : null
+  );
+  const cleanIdxStart = macdLine.findIndex(v => v !== null);
+  if (cleanIdxStart === -1) return { macd: macdLine, signal: macdLine.map(() => null) };
+  const cleanMacd = macdLine.slice(cleanIdxStart).map(v => v ?? 0);
+  const sigClean = ema(cleanMacd, signal);
+  const sigOut = new Array(cleanIdxStart).fill(null).concat(sigClean);
+  return { macd: macdLine, signal: sigOut };
 }
 
 function atr(highs, lows, closes, period = 14) {
@@ -393,7 +416,8 @@ function enrichIndicators(candles) {
   const s50 = sma(closes, 50);
   const s200 = sma(closes, 200);
   const r14 = rsi(closes, 14);
-  const { upper: bu, lower: bl } = bollinger(closes, 20, 2);
+  const { upper: bu, lower: bl, middle: bm } = bollinger(closes, 20, 2);
+  const { macd: macdLine, signal: macdSignal } = macd(closes);
   const atr14 = atr(highs, lows, closes, 14);
   const rh50 = rollingMax(highs, 50);
   const rl50 = rollingMin(lows, 50);
@@ -402,11 +426,71 @@ function enrichIndicators(candles) {
     ema21: e21[i], ema50: e50[i], ema200: e200[i],
     sma50: s50[i], sma200: s200[i],
     rsi: r14[i],
-    bbUpper: bu[i], bbLower: bl[i],
+    bbUpper: bu[i], bbMiddle: bm[i], bbLower: bl[i],
+    macd: macdLine[i], macdSignal: macdSignal[i],
     atr: atr14[i],
     recentHigh: rh50[i],
     recentLow: rl50[i],
   }));
+}
+
+function computeFib(candles, lookback = 50) {
+  if (!candles || candles.length < 5) return null;
+  const window = candles.slice(-Math.min(lookback, candles.length));
+  let hhIdx = 0, llIdx = 0;
+  for (let i = 0; i < window.length; i++) {
+    if (window[i].high > window[hhIdx].high) hhIdx = i;
+    if (window[i].low < window[llIdx].low) llIdx = i;
+  }
+  const hh = window[hhIdx].high;
+  const ll = window[llIdx].low;
+  const range = hh - ll;
+  if (range <= 0) return null;
+  const isUptrend = llIdx < hhIdx;
+  const fibs = [0.236, 0.382, 0.5, 0.618, 0.786];
+  const levels = fibs.map(f => ({
+    level: f,
+    price: isUptrend ? hh - range * f : ll + range * f,
+  }));
+  return { hh, ll, isUptrend, levels };
+}
+
+function formatFibBlock(candles, currentPrice) {
+  const fib = computeFib(candles, 50);
+  if (!fib) return "";
+  const near = fib.levels
+    .map(l => ({ ...l, distance: Math.abs(l.price - currentPrice) }))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 3);
+  const trend = fib.isUptrend ? "uptrend" : "downtrend";
+  return `\n## Fibonacci (${trend}, swing ${fib.ll.toFixed(2)} → ${fib.hh.toFixed(2)})\n` +
+    near.map(l => `- ${(l.level * 100).toFixed(1)}%: $${l.price.toFixed(2)}`).join("\n");
+}
+
+function formatMacdLine(latest, prev) {
+  if (latest.macd == null || latest.macdSignal == null) return "- MACD: chưa rõ";
+  const hist = latest.macd - latest.macdSignal;
+  let crossNote = "";
+  if (prev?.macd != null && prev?.macdSignal != null) {
+    if (prev.macd <= prev.macdSignal && latest.macd > latest.macdSignal) crossNote = " — vừa cắt LÊN signal";
+    else if (prev.macd >= prev.macdSignal && latest.macd < latest.macdSignal) crossNote = " — vừa cắt XUỐNG signal";
+  }
+  return `- MACD: ${latest.macd.toFixed(2)} / Signal ${latest.macdSignal.toFixed(2)} (hist ${hist.toFixed(2)})${crossNote}`;
+}
+
+function getClosedEnrichedSlice(enriched, isLatestClosed) {
+  if (isLatestClosed === false) return enriched.slice(0, -1);
+  return enriched;
+}
+
+function buildPromptAnalysisBlock(candlesEnriched, latest, prev) {
+  const smcCtx = analyzeSmcContext(candlesEnriched, latest, prev);
+  return {
+    smcCtx,
+    smcBlock: formatSmcContextForPrompt(smcCtx, latest),
+    fibBlock: formatFibBlock(candlesEnriched, latest?.close),
+    macdLine: formatMacdLine(latest, prev),
+  };
 }
 
 function computePivots(candle) {
@@ -812,6 +896,16 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
         "Đà chuyển sang giảm. Theo dõi đóng cửa dưới EMA50 để xác nhận.");
   }
 
+  // ── 4b. MACD cắt Signal ──
+  if (prev.macd != null && prev.macdSignal != null && latest.macd != null && latest.macdSignal != null) {
+    if (prev.macd <= prev.macdSignal && latest.macd > latest.macdSignal)
+      await push("macd_up", "🟢", "MACD cắt lên Signal — tín hiệu đà tăng",
+        "Momentum chuyển sang bullish. Xác nhận thêm bằng giá trên EMA21 hoặc retest hỗ trợ.");
+    if (prev.macd >= prev.macdSignal && latest.macd < latest.macdSignal)
+      await push("macd_dn", "🔴", "MACD cắt xuống Signal — tín hiệu đà giảm",
+        "Momentum chuyển sang bearish. Xác nhận thêm bằng giá dưới EMA21 hoặc retest kháng cự.");
+  }
+
   // ── 5. Phá vỡ Điểm xoay (Pivot break) ──
   if (pivots) {
     const levels = [
@@ -964,6 +1058,18 @@ async function detectFreshAlerts(env, latest, prev, pivots, candlesEnriched) {
         `Phá range tích luỹ ${rb.consolidationHours}h ${dirText} *$${rb.breakoutPrice.toFixed(2)}* — biên độ tích luỹ ${rb.rangeSize.toFixed(2)} điểm (${rb.rangeAtrRatio.toFixed(2)}× ATR nền)`,
         `Sau giai đoạn tích luỹ (consolidation), breakout thường đẩy tiếp theo measured move. Mục tiêu kỹ thuật: $${rb.targetPrice.toFixed(2)}. Theo dõi retest mức phá vỡ làm hỗ trợ/kháng cự mới.`);
       break; // chỉ lấy 1 timeframe để tránh trùng alert
+    }
+  }
+
+  // ── 10. Phân kỳ RSI (2 swing gần nhất) ──
+  if (Array.isArray(candlesEnriched) && candlesEnriched.length >= 30) {
+    const div = detectRsiDivergence(candlesEnriched);
+    if (div) {
+      const isBull = div.includes("bullish");
+      await push(`rsi_div_${isBull ? "bull" : "bear"}`, isBull ? "📈" : "📉", div,
+        isBull
+          ? "Phân kỳ tăng — đà giảm có thể kiệt sức. Đợi xác nhận đóng cửa trên EMA21 trước khi long."
+          : "Phân kỳ giảm — đà tăng có thể kiệt sức. Đợi xác nhận đóng cửa dưới EMA21 trước khi short.");
     }
   }
 
@@ -2052,6 +2158,11 @@ async function runDeepAnalysis(env, ctx) {
     ? `${fmtNum(pivotsCtx.r2)}/${fmtNum(pivotsCtx.r1)}/${fmtNum(pivotsCtx.pp)}/${fmtNum(pivotsCtx.s1)}/${fmtNum(pivotsCtx.s2)}`
     : "?";
 
+  const pick15Deep = pickTriggerCandle(e15m, 15 * 60);
+  const prev15Deep = pick15Deep?.prev || e15m[e15m.length - 2];
+  const closedSlice15 = getClosedEnrichedSlice(e15m, pick15Deep?.isLatestClosed);
+  const deepExtras = buildPromptAnalysisBlock(closedSlice15, latest, prev15Deep);
+
   const context = `## BỐI CẢNH
 - Phiên: ${session.name} | Biến động: ${regimeVi}${regime.ratio != null ? ` (ATR ${regime.ratio.toFixed(2)}× nền 24g)` : ""}
 - 5p: bias ${biasOfTf(last5m)} | RSI ${fmtNum(last5m?.rsi)} | ATR ${fmtNum(last5m?.atr)} | EMA21 ${fmtNum(last5m?.ema21)}
@@ -2059,7 +2170,12 @@ async function runDeepAnalysis(env, ctx) {
 - 1g: bias ${biasOfTf(last1h)} | RSI ${fmtNum(last1h?.rsi)} | ATR ${fmtNum(last1h?.atr)} | EMA21 ${fmtNum(last1h?.ema21)}
 ${last4h ? `- 4g: bias ${biasOfTf(last4h)} | RSI ${fmtNum(last4h.rsi)} | ATR ${fmtNum(last4h.atr)}` : ""}
 - Pivots R2/R1/PP/S1/S2: ${pivLine}
-- 50-nến H/L (15p): ${fmtNum(latest.recentHigh)} / ${fmtNum(latest.recentLow)}`;
+- 50-nến H/L (15p): ${fmtNum(latest.recentHigh)} / ${fmtNum(latest.recentLow)}
+${deepExtras.macdLine}
+
+## Phân tích SMC (rule-based — dùng làm anchor)
+${deepExtras.smcBlock}
+${deepExtras.fibBlock}`;
 
   // Phần 3: SIGNALS (mega: reversal scan; alerts: list)
   let signalsBlock = "";
@@ -2664,6 +2780,9 @@ function buildRuleBasedFallback(latest, pivots, tf, horizon) {
   if (latest.atr != null) {
     m += `📏 <b>ATR(14):</b> ${fmt2(latest.atr)} điểm — biên độ trung bình mỗi nến\n`;
   }
+  if (latest.macd != null && latest.macdSignal != null) {
+    m += `📊 <b>MACD:</b> ${latest.macd.toFixed(2)} / Signal ${latest.macdSignal.toFixed(2)}\n`;
+  }
 
   // Key levels
   if (lv.above.length || lv.below.length) {
@@ -2719,8 +2838,8 @@ function generateTradeSuggestion(latest, alerts, trend, lv) {
   let bullScore = 0, bearScore = 0;
   for (const a of alerts) {
     const t = a.text;
-    if (/quá bán|Oversold|sweep DƯỚI|Golden Cross|Giao cắt vàng|cắt lên|BB upper|biên trên|TĂNG|Pivot.*lên|piv_up|đẩy lên/i.test(t)) bullScore++;
-    if (/quá mua|Overbought|sweep TRÊN|Death Cross|Giao cắt tử thần|cắt xuống|BB lower|biên dưới|GIẢM|Pivot.*xuống|piv_dn|đẩy xuống/i.test(t)) bearScore++;
+    if (/quá bán|Oversold|sweep DƯỚI|Golden Cross|Giao cắt vàng|cắt lên|BB upper|biên trên|TĂNG|Pivot.*lên|piv_up|đẩy lên|MACD cắt lên|Phân kỳ RSI tăng/i.test(t)) bullScore++;
+    if (/quá mua|Overbought|sweep TRÊN|Death Cross|Giao cắt tử thần|cắt xuống|BB lower|biên dưới|GIẢM|Pivot.*xuống|piv_dn|đẩy xuống|MACD cắt xuống|Phân kỳ RSI giảm/i.test(t)) bearScore++;
   }
   // Xu hướng đóng góp 0.5 điểm
   const isBull = trend?.label.includes("Tăng");
@@ -2770,7 +2889,7 @@ function biasOf(l) {
   return { icon: "↔️", short: "Đi ngang", dir: "side" };
 }
 
-function formatAlertMessage(latest, alerts, pivots, mtfContext = null) {
+function formatAlertMessage(latest, alerts, pivots, mtfContext = null, candlesEnriched = null, prev = null) {
   const t = new Date().toISOString().slice(0, 16).replace("T", " ");
   let m = `🥇 *Cảnh báo giá XAU/USD* (đa khung 5p+15p+1g, trigger 15p)\n`;
   m += `Giá hiện tại: *$${latest.close.toFixed(2)}* — ${t} UTC\n\n`;
@@ -2779,6 +2898,13 @@ function formatAlertMessage(latest, alerts, pivots, mtfContext = null) {
   for (const a of alerts) {
     m += `${a.icon} ${a.text}\n`;
     if (a.suggestion) m += `   💡 _${a.suggestion}_\n`;
+  }
+
+  if (candlesEnriched && latest) {
+    const smcLine = formatSmcCompactForTelegram(
+      analyzeSmcContext(candlesEnriched, latest, prev ?? null),
+    );
+    if (smcLine) m += `\n*🧠 SMC (rule-based):* ${smcLine}\n`;
   }
 
   // 🌊 Xác nhận đa khung — show bias + RSI cho mỗi khung
@@ -2861,7 +2987,10 @@ function formatAlertMessage(latest, alerts, pivots, mtfContext = null) {
   }
 
   // Chỉ báo tóm tắt (15p)
-  m += `\n_Chỉ báo (15p): RSI ${latest.rsi?.toFixed(1)} | ATR ${latest.atr?.toFixed(2)} | EMA 21/50/200: ${latest.ema21?.toFixed(0)}/${latest.ema50?.toFixed(0)}/${latest.ema200?.toFixed(0)}_\n`;
+  const macdTag = (latest.macd != null && latest.macdSignal != null)
+    ? ` | MACD ${latest.macd.toFixed(1)}/${latest.macdSignal.toFixed(1)}`
+    : "";
+  m += `\n_Chỉ báo (15p): RSI ${latest.rsi?.toFixed(1)} | ATR ${latest.atr?.toFixed(2)}${macdTag} | EMA 21/50/200: ${latest.ema21?.toFixed(0)}/${latest.ema50?.toFixed(0)}/${latest.ema200?.toFixed(0)}_\n`;
   if (pivots) {
     m += `_Điểm xoay (Pivot): R2 ${pivots.r2.toFixed(1)} | R1 ${pivots.r1.toFixed(1)} | PP ${pivots.pp.toFixed(1)} | S1 ${pivots.s1.toFixed(1)} | S2 ${pivots.s2.toFixed(1)}_\n`;
   }
@@ -3271,8 +3400,9 @@ function glossaryMessage() {
 • RSI (Relative Strength Index) — Chỉ số sức mạnh tương đối
 • ATR (Average True Range) — Biên độ thực trung bình
 • BB (Bollinger Bands) — Dải Bollinger
-• MACD — chỉ báo phân kỳ hội tụ trung bình
+• MACD — Phân kỳ/hội tụ trung bình (bot tính + cảnh báo cắt Signal)
 • Pivot Point — Điểm xoay (mốc S/R quan trọng)
+• Premium/Discount — Vùng đắt/rẻ theo range SMC (EQ = 50%)
 
 *Pattern nến:*
 • Pin Bar / Hammer / Shooting Star — Nến rút râu
@@ -3309,8 +3439,8 @@ function helpMessage() {
   return `🥇 *XAU Bot — Lệnh*
 
 *Tức thời (no AI):*
-\`/gia\` — giá + indicators 1 khung
-\`/nhanh\` — Pulse 5 khung (bias mỗi khung, kết luận chung)
+\`/gia\` — giá + RSI/MACD/ATR + Premium/Discount
+\`/nhanh\` — Pulse 5 khung + SMC 15p (sweep/FVG/zone)
 
 *Quick scan AI (~5s/khung):*
 \`/nhanh5p\` \`/nhanh15p\` \`/nhanh1h\` \`/nhanh4h\` \`/nhanh1d\`
@@ -3479,10 +3609,15 @@ async function handlePriceCmd(env, chatId, replyTo) {
       return;
     }
     const e = enrichIndicators(c15);
-    const l = e[e.length - 1];
+    const pick = pickTriggerCandle(e, 15 * 60);
+    const l = pick?.latest || e[e.length - 1];
+    const prev = pick?.prev || e[e.length - 2];
+    const displayPrice = pick?.displayCandle?.close ?? l.close;
+    const closedE = getClosedEnrichedSlice(e, pick?.isLatestClosed);
+    const smcCtx = analyzeSmcContext(closedE, l, prev);
     const pivots = await getCachedDailyPivots(env);
 
-    const c = l.close;
+    const c = displayPrice;
 
     // Trend determination từ EMA alignment
     let trend = "—", trendIcon = "❓", trendColor = "";
@@ -3520,9 +3655,20 @@ async function handlePriceCmd(env, chatId, replyTo) {
     const below = levels.filter(lv => lv.price < c).sort((a, b) => b.price - a.price).slice(0, 4);
 
     let m = `<b>🥇 XAU/USD</b> — 15m\n`;
-    m += `Giá: <b>$${c.toFixed(2)}</b>\n\n`;
+    m += `Giá: <b>$${c.toFixed(2)}</b>`;
+    if (Math.abs(c - l.close) > 0.3) m += ` <i>(nến đóng $${l.close.toFixed(2)})</i>`;
+    m += `\n\n`;
     m += `${trendIcon} Trend: <b>${trend}</b>\n`;
     m += `RSI(14): <b>${rsiVal?.toFixed(1)}</b> (${rsiTag})\n`;
+    if (l.atr != null) m += `ATR(14): <b>${l.atr.toFixed(2)}</b> điểm\n`;
+    if (l.macd != null && l.macdSignal != null) {
+      m += `MACD: ${l.macd.toFixed(2)} / Signal ${l.macdSignal.toFixed(2)}\n`;
+    }
+    if (smcCtx.premiumDiscount) {
+      const pd = smcCtx.premiumDiscount;
+      const zVi = { premium: "Premium (đắt)", discount: "Discount (rẻ)", equilibrium: "Equilibrium" }[pd.zone] || pd.zone;
+      m += `Vùng SMC: <b>${zVi}</b> — ${pd.pctInRange.toFixed(0)}% range (EQ $${pd.equilibrium.toFixed(2)})\n`;
+    }
     m += `EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}\n`;
     m += `SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(golden)" : "(death)"}\n`;
     m += `BB(20): ${l.bbLower?.toFixed(2)} – ${l.bbUpper?.toFixed(2)}\n`;
@@ -3946,6 +4092,8 @@ async function handleAskCmd(env, chatId, replyTo, question) {
     const trend = getTrendAssessment(latest);
     const session = getTradingSession();
     const candlePattern = detectCandlePattern(latest, prev);
+    const closedAsk = getClosedEnrichedSlice(enriched, pickAsk?.isLatestClosed);
+    const askExtras = buildPromptAnalysisBlock(closedAsk, latest, prev);
 
     const systemText = `Bạn là chuyên gia tư vấn quản lý rủi ro (Risk Management) và chiến lược giao dịch XAU/USD.
 
@@ -3980,11 +4128,16 @@ NGÔN NGỮ:
 - Giá XAU/USD live: $${displayCloseAsk.toFixed(2)} (close nến 15p đóng: $${latest.close.toFixed(2)})
 - Xu hướng 15m (theo nến đóng): ${trend?.label || "?"} ${trend?.note ? `(${trend.note})` : ""}
 - RSI(14): ${latest.rsi?.toFixed(1)} | ATR(14): ${latest.atr?.toFixed(2)}
+${askExtras.macdLine}
 - EMA 21/50/200: ${latest.ema21?.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}
 - BB(20): ${latest.bbLower?.toFixed(2)} – ${latest.bbUpper?.toFixed(2)}
 - Pivots (daily): ${pivots ? `R2 ${pivots.r2.toFixed(2)} | R1 ${pivots.r1.toFixed(2)} | PP ${pivots.pp.toFixed(2)} | S1 ${pivots.s1.toFixed(2)} | S2 ${pivots.s2.toFixed(2)}` : "không có"}
 - Nến mới: ${candlePattern}
-- Phiên: ${session}`;
+- Phiên: ${session}
+
+## SMC (rule-based)
+${askExtras.smcBlock}
+${askExtras.fibBlock}`;
 
     const userText = `${marketContext}
 
@@ -4046,6 +4199,7 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
             prev: prevClosed,
             displayClose,
             isLatestClosed: pickN?.isLatestClosed ?? true,
+            enriched: e,
           };
         } catch { return null; }
       })),
@@ -4134,6 +4288,15 @@ async function handleNhanhPulse(env, chatId, replyTo, auxArgs = []) {
         for (const lv of above) m += `▲ <b>$${lv.price.toFixed(2)}</b> ${htmlEsc(lv.label)} <i>(+${(lv.price - c).toFixed(2)})</i>\n`;
         for (const lv of below) m += `▼ <b>$${lv.price.toFixed(2)}</b> ${htmlEsc(lv.label)} <i>(-${(c - lv.price).toFixed(2)})</i>\n`;
       }
+    }
+
+    const d15smc = valid.find(d => d.tf === "15m");
+    if (d15smc?.enriched) {
+      const closed15 = getClosedEnrichedSlice(d15smc.enriched, d15smc.isLatestClosed);
+      const smcLine = formatSmcCompactForTelegram(
+        analyzeSmcContext(closed15, d15smc.latest, d15smc.prev),
+      );
+      if (smcLine) m += `\n<b>🧠 SMC (15p):</b> ${htmlEsc(smcLine)}\n`;
     }
 
     // Kết luận đồng thuận giữa các khung
@@ -4230,12 +4393,14 @@ async function handleScanCmd(env, chatId, replyTo, tf = "15m", auxArgs = []) {
     }
     const e = enrichIndicators(candles);
     // Phân tích trên NẾN ĐÃ ĐÓNG (tránh wick/RSI dao động trong nến chạy).
-    // displayCandle = nến mới nhất (có thể chưa đóng) → dùng cho "Giá hiện tại".
     const intervalSec = TF_INTERVAL_SEC[tf] || 900;
     const pick = pickTriggerCandle(e, intervalSec);
     const l = pick?.latest || e[e.length - 1];
+    const prevScan = pick?.prev || e[e.length - 2];
     const displayPrice = pick?.displayCandle?.close ?? l.close;
     const fresh = checkDataFreshness(pick?.displayCandle || l, intervalSec);
+    const closedEnriched = getClosedEnrichedSlice(e, pick?.isLatestClosed);
+    const scanExtras = buildPromptAnalysisBlock(closedEnriched, l, prevScan);
 
     const pivots = await getCachedDailyPivots(env);
 
@@ -4263,9 +4428,15 @@ YÊU CẦU BẮT BUỘC: Trong câu trả lời (tom_tat hoặc canh_bao), PHẢ
 - OIL giảm → áp lực giảm XAU.
 Đối chiếu với setup XAU: nếu liên thị trường đồng thuận → tăng độ tin cậy. Nếu mâu thuẫn → giảm độ tin cậy + thêm vào canh_bao.` : "";
     const userText = `XAU/USD khung ${tf} (horizon ${horizon}), giá $${l.close.toFixed(2)}.
-RSI: ${l.rsi?.toFixed(1)} | ATR: ${l.atr?.toFixed(2) || "?"} | EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
+RSI: ${l.rsi?.toFixed(1)} | ATR: ${l.atr?.toFixed(2) || "?"}
+${scanExtras.macdLine}
+EMA 21/50/200: ${l.ema21?.toFixed(2)}/${l.ema50?.toFixed(2)}/${l.ema200?.toFixed(2)}
 SMA 50/200: ${l.sma50?.toFixed(2)}/${l.sma200?.toFixed(2)} | BB: ${l.bbLower?.toFixed(2)}-${l.bbUpper?.toFixed(2)}
-${pivotStr}${auxText}
+${pivotStr}
+
+## SMC (rule-based — anchor cho setup)
+${scanExtras.smcBlock}
+${scanExtras.fibBlock}${auxText}
 
 QUY TẮC SETUP:
 - Nếu setup rõ (LONG hoặc SHORT) → BẮT BUỘC điền đủ entry + sl + tp1 + tp2 + tp3.
@@ -4306,11 +4477,8 @@ Trả JSON:
       const finish = resp?.candidates?.[0]?.finishReason || "?";
       const blocked = resp?.promptFeedback?.blockReason;
       console.log(`[bot] /nhanh${tf} JSON parse fail (len=${(text||"").length}, finish=${finish}, blocked=${blocked||"no"}), text: ${text||""}`);
-      let errMsg = `❌ AI response không hợp lệ (len=${(text||"").length}, finish=${finish})`;
-      if (blocked) errMsg += `\nBlocked: <code>${htmlEsc(blocked)}</code>`;
-      if (text && text.length < 500) errMsg += `\n<i>${htmlEsc(text.slice(0, 300))}</i>`;
-      errMsg += `\nThử lại sau.`;
-      await sendTelegramTo(env, chatId, errMsg, replyTo, "HTML");
+      const fallbackMsg = buildRuleBasedFallback(l, pivots, tf, horizon);
+      await sendTelegramTo(env, chatId, fallbackMsg, replyTo, "HTML");
       return;
     }
 
@@ -4331,6 +4499,8 @@ Trả JSON:
     m += `Giá: <b>$${displayPrice.toFixed(2)}</b> | ${huongIcon} <b>${huongLabel}</b>${confTag}\n`;
     if (triggerTimeStr) m += `<i>📊 Phân tích nến ${tfVi} đóng lúc ${triggerTimeStr}</i>\n`;
     if (fresh.isStale) m += `⚠️ <b>Data cũ:</b> ${htmlEsc(fresh.reason)} — độ tin cậy giảm\n`;
+    const smcLineScan = formatSmcCompactForTelegram(scanExtras.smcCtx);
+    if (smcLineScan) m += `<b>🧠 SMC:</b> ${htmlEsc(smcLineScan)}\n`;
     if (auxCtx) {
       const auxLines = formatAuxBlock(auxCtx).split("\n");
       m += auxLines.map(l => htmlEsc(l)).join("\n") + "\n";
@@ -4433,6 +4603,8 @@ async function handleAnalyzeCmd(env, chatId, replyTo, tfArg, auxArgs = []) {
     const htfBlock = htfCtx
       ? `- Xu hướng khung lớn: 4h ${htfCtx.trend4h}, 1d ${htfCtx.trend1d}\n  (Tip: 4h/1d giống dòng sông lớn, ${tf} chỉ là gợn sóng. Đi ngược HTF = rủi ro cao.)`
       : "";
+    const closedEnrichedA = getClosedEnrichedSlice(e, pickA?.isLatestClosed);
+    const analyzeExtras = buildPromptAnalysisBlock(closedEnrichedA, l, pickA?.prev || e[e.length - 2]);
 
     const systemText = `Bạn là chuyên gia phân tích kỹ thuật XAU/USD, có sư phạm tốt.
 
@@ -4464,6 +4636,7 @@ Quy tắc tương quan:
 📊 DỮ LIỆU THỊ TRƯỜNG:
 - Giá hiện tại: $${l.close.toFixed(2)}
 - RSI(14): ${l.rsi?.toFixed(1)} | ATR: ${l.atr?.toFixed(2)}
+${analyzeExtras.macdLine}
 - EMA 21/50/200: ${l.ema21?.toFixed(2)} / ${l.ema50?.toFixed(2)} / ${l.ema200?.toFixed(2)}
 - SMA 50/200: ${l.sma50?.toFixed(2)} / ${l.sma200?.toFixed(2)} ${l.sma50 > l.sma200 ? "(Golden alignment — xu hướng tăng dài hạn)" : "(Death alignment — xu hướng giảm dài hạn)"}
 - Bollinger Bands(20): Lower ${l.bbLower?.toFixed(2)} – Upper ${l.bbUpper?.toFixed(2)}
@@ -4471,7 +4644,11 @@ Quy tắc tương quan:
 - Nến vừa đóng: ${candlePattern}
 - Phiên giao dịch hiện tại: ${session}
 ${htfBlock}
-- 10 nến gần nhất (OHLC): ${last10}${auxBlock}
+- 10 nến gần nhất (OHLC): ${last10}
+
+## SMC (rule-based — dùng làm anchor, có thể bổ sung nếu thấy setup khác)
+${analyzeExtras.smcBlock}
+${analyzeExtras.fibBlock}${auxBlock}
 
 # CẤU TRÚC ĐẦU RA BẮT BUỘC (JSON)
 {
@@ -4696,7 +4873,7 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs 
           const displayClose = pickTf?.displayCandle?.close ?? latestClosed.close;
           const fresh = checkDataFreshness(pickTf?.displayCandle || latestClosed, intervalSec);
           log(`fetch ${tf} ok (${candles.length} candles, closed=${pickTf?.isLatestClosed ?? "?"}, stale=${fresh.isStale})`);
-          return { tf, latest: latestClosed, displayClose, fresh, candles, isLatestClosed: pickTf?.isLatestClosed ?? true };
+          return { tf, latest: latestClosed, prev: pickTf?.prev, displayClose, fresh, candles, enriched, isLatestClosed: pickTf?.isLatestClosed ?? true };
         } catch (e) {
           console.log(`[multi-tf] fetch ${tf} fail: ${e.message}`);
           return null;
@@ -4714,19 +4891,25 @@ async function handleMultiTfAnalyze(env, chatId, replyTo, tfs, isNhanh, auxArgs 
     const pivots = await getCachedDailyPivots(env);
 
     // Build prompt với data từng TF
-    const tfDataLines = valid.map(({ tf, latest, candles, isLatestClosed }) => {
-      // Slice bỏ nến chưa đóng để AI không lẫn data nến đang chạy
+    const tfDataLines = valid.map(({ tf, latest, prev, enriched, candles, isLatestClosed }) => {
       const closedTail = isLatestClosed === false ? candles.slice(0, -1) : candles;
+      const closedEnriched = getClosedEnrichedSlice(enriched, isLatestClosed);
+      const extras = buildPromptAnalysisBlock(closedEnriched, latest, prev);
       const last5 = closedTail.slice(-5).map(c =>
         `O=${c.open.toFixed(2)} H=${c.high.toFixed(2)} L=${c.low.toFixed(2)} C=${c.close.toFixed(2)}`
       ).join(" | ");
       return `--- ${tf.toUpperCase()} ---
 Giá: $${latest.close.toFixed(2)} | RSI: ${latest.rsi?.toFixed(1)} | ATR: ${latest.atr?.toFixed(2) ?? "?"}
+${extras.macdLine}
 EMA 21/50/200: ${latest.ema21?.toFixed(2)} / ${latest.ema50?.toFixed(2)} / ${latest.ema200?.toFixed(2)}
 SMA 50/200: ${latest.sma50?.toFixed(2)} / ${latest.sma200?.toFixed(2)} ${latest.sma50 > latest.sma200 ? "(golden)" : "(death)"}
 BB(20): ${latest.bbLower?.toFixed(2)} - ${latest.bbUpper?.toFixed(2)}
 50-nến H/L: ${latest.recentHigh?.toFixed(2) ?? "?"} / ${latest.recentLow?.toFixed(2) ?? "?"}
-5 nến gần: ${last5}`;
+5 nến gần: ${last5}
+
+SMC (rule-based):
+${extras.smcBlock}
+${extras.fibBlock}`;
     }).join("\n\n");
 
     const pivotStr = pivots
@@ -5327,7 +5510,7 @@ async function runAlertCheck(env, { force = false } = {}) {
       // Fallback: mega cooldown nhưng còn non-redundant alerts → gửi regular alerts
       let fallbackOk = null;
       if (result?.skipped === "cooldown" && extraAlerts.length > 0) {
-        const msg = formatAlertMessage(latest, extraAlerts, pivots, mtfContext);
+        const msg = formatAlertMessage(latest, extraAlerts, pivots, mtfContext, closedE15m, prev);
         fallbackOk = await sendTelegram(env, msg);
         if (fallbackOk) {
           for (const a of extraAlerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
@@ -5353,7 +5536,7 @@ async function runAlertCheck(env, { force = false } = {}) {
       console.log(`[cron] ${alerts.length} alerts (score ${score.total}, dir=${score.primaryDirection}, weak=${score.isWeak}) keys=${alertKeys.join(",")}`);
 
       if (score.isWeak) {
-        const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
+        const msg = formatAlertMessage(latest, alerts, pivots, mtfContext, closedE15m, prev);
         const ok = await sendTelegram(env, msg);
         if (ok) {
           for (const a of alerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
@@ -5377,7 +5560,7 @@ async function runAlertCheck(env, { force = false } = {}) {
         if (result?.sent) {
           for (const a of alerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
         } else if (result?.skipped === "cooldown") {
-          const msg = formatAlertMessage(latest, alerts, pivots, mtfContext);
+          const msg = formatAlertMessage(latest, alerts, pivots, mtfContext, closedE15m, prev);
           fbOk = await sendTelegram(env, msg);
           if (fbOk) {
             for (const a of alerts) if (a.key) await markAlerted(env, a.key, a.priceCtx);
