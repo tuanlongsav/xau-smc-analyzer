@@ -6,7 +6,7 @@
 // - API calls (TwelveData/Gemini/RSS): network-only (luôn cần fresh)
 // - Icons + Tailwind/CDN: cache-first
 
-const VERSION = "v1.14.0";
+const VERSION = "v1.15.0";
 const APP_CACHE = `xau-smc-app-${VERSION}`;
 
 // App shell — đầy đủ JS modules đang import. Thiếu file → SW không cache,
@@ -23,7 +23,9 @@ const APP_SHELL = [
   "./js/prompts.js",
   "./js/gemini.js",
   "./js/chart.js",
-  "./js/news.js",       // RSS news fetcher (thiếu trước đây → news offline fail)
+  "./js/news.js",
+  "./js/trade-utils.js",
+  "./js/smc-detect.js",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
 ];

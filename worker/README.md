@@ -18,6 +18,17 @@ npx wrangler secret put TWELVEDATA_API_KEY_2  # (tuỳ chọn) key 2 — auto ro
 npx wrangler secret put TWELVEDATA_API_KEY_3  # (tuỳ chọn) key 3
 npx wrangler secret put TELEGRAM_BOT_TOKEN    # cho bot + cron alert
 npx wrangler secret put TELEGRAM_CHAT_ID      # vd -1001234567890 (group)
+
+# Khuyến nghị (tùy chọn — không set = hành vi cũ, tương thích deploy hiện tại):
+npx wrangler secret put ADMIN_SECRET          # bảo vệ /diag, /test-*, /setup-webhook, ...
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET  # chống spoof webhook; sau đó gọi lại /setup-webhook
+```
+
+Sau khi set `TELEGRAM_WEBHOOK_SECRET`, chạy lại webhook (cần `ADMIN_SECRET` nếu đã set):
+
+```bash
+curl -H "Authorization: Bearer <ADMIN_SECRET>" \
+  "https://xau-gemini-proxy.<subdomain>.workers.dev/setup-webhook"
 ```
 
 Sau khi deploy, copy URL ra và update `js/config.js` của frontend (field `GEMINI_PROXY_URL`).
@@ -45,7 +56,7 @@ Worker rotate tự động:
 - Per-minute / 429 → cooldown 60s
 - Lỗi khác → cooldown 2 phút
 
-Xem trạng thái: `curl https://<worker>/health` (field `td_keys_state`) hoặc `/diag` (probe từng key).
+Xem trạng thái: `curl https://<worker>/health` (field `td_keys_state`) hoặc `/diag?secret=<ADMIN_SECRET>` (khi đã set ADMIN_SECRET).
 
 ## Xem logs
 
@@ -57,5 +68,7 @@ npx wrangler tail
 
 - Key chỉ tồn tại trong Cloudflare Worker secret, không bao giờ ra client.
 - CORS allowlist chỉ chấp nhận `xau-smc-analyzer.pages.dev` + preview branches + localhost.
-- Browser enforce CORS → web khác không gọi được. Curl/script vẫn có thể nhưng phải fake `Origin` header.
-- Để tăng cứng: thêm Cloudflare Rate Limiting rule trên dashboard, hoặc thêm shared-secret header trong code.
+- Proxy Gemini/TD: từ chối Origin không hợp lệ; request có `ADMIN_SECRET` hợp lệ được bypass (curl debug).
+- **`ADMIN_SECRET`** (khuyến nghị): khóa `/diag`, `/test-*`, `/setup-webhook`, `/probe`, … Không set → các route vẫn mở như trước.
+- **`TELEGRAM_WEBHOOK_SECRET`** (khuyến nghị): chống POST giả vào `/telegram-webhook`. Không set → hành vi cũ.
+- Để tăng cứng thêm: Cloudflare Rate Limiting trên dashboard.

@@ -37,5 +37,7 @@ cpu_ms = 60000
 #   npx wrangler secret put TWELVEDATA_API_KEY_1   # rồi _2, _3 — free 800 credits/key/ngày
 #   npx wrangler secret put TELEGRAM_BOT_TOKEN
 #   npx wrangler secret put TELEGRAM_CHAT_ID
+#   npx wrangler secret put ADMIN_SECRET              # (khuyến nghị) khóa debug routes
+#   npx wrangler secret put TELEGRAM_WEBHOOK_SECRET   # (khuyến nghị) anti-spoof webhook
 #
 # KHÔNG để key trong file này (file này commit lên Git).

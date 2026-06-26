@@ -43,6 +43,54 @@ function jsonResponse(status, obj, origin) {
   });
 }
 
+// Debug/admin routes — khi ADMIN_SECRET được set, bắt buộc Bearer hoặc ?secret=
+const ADMIN_DEBUG_PATHS = new Set([
+  "/test-cmd", "/test-precal", "/trace", "/test-alerts", "/test-megamove",
+  "/diag", "/webhook-info", "/setup-webhook", "/register-commands",
+  "/test-telegram", "/run-alert-check", "/cleanup-now", "/test-instant-delete",
+  "/test-auto-delete", "/chat-info", "/bot-permissions", "/cleanup-queue",
+  "/test-news", "/test-cron-alert", "/clear-alert-cooldowns", "/probe", "/probe-public",
+]);
+
+/** null = OK; Response = từ chối. Không set ADMIN_SECRET → giữ hành vi cũ (tương thích). */
+function requireAdminAuth(request, env, origin) {
+  if (!env.ADMIN_SECRET) return null;
+  const expected = env.ADMIN_SECRET;
+  const auth = request.headers.get("Authorization");
+  if (auth === `Bearer ${expected}`) return null;
+  const secret = new URL(request.url).searchParams.get("secret");
+  if (secret === expected) return null;
+  return jsonResponse(403, { error: "Forbidden — cần ADMIN_SECRET (Authorization: Bearer … hoặc ?secret=)" }, origin);
+}
+
+function isAdminAuthed(request, env) {
+  if (!env.ADMIN_SECRET) return false;
+  return requireAdminAuth(request, env, "") === null;
+}
+
+function verifyTelegramWebhookSecret(request, env) {
+  if (!env.TELEGRAM_WEBHOOK_SECRET) return null;
+  const token = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+  if (token === env.TELEGRAM_WEBHOOK_SECRET) return null;
+  return new Response("Forbidden", { status: 403 });
+}
+
+const CRON_LOCK_KEY = "cron:lock";
+const CRON_LOCK_TTL_S = 150;
+
+async function tryAcquireCronLock(env) {
+  if (!env.CACHE) return true;
+  const existing = await env.CACHE.get(CRON_LOCK_KEY);
+  if (existing) return false;
+  await env.CACHE.put(CRON_LOCK_KEY, String(Date.now()), { expirationTtl: CRON_LOCK_TTL_S });
+  return true;
+}
+
+async function releaseCronLock(env) {
+  if (!env.CACHE) return;
+  try { await env.CACHE.delete(CRON_LOCK_KEY); } catch {}
+}
+
 /**
  * Gom các Gemini key có cấu hình thành mảng theo thứ tự ưu tiên.
  * Tên chuẩn duy nhất: GEMINI_API_KEY_1..5
@@ -2299,12 +2347,19 @@ ${schemaWithExamples}`;
 
         const entryAvg = ez.length === 2 ? (parseFloat(ez[0]) + parseFloat(ez[1])) / 2 : parseFloat(ez[0]);
         const slNum = parseFloat(sl), tp1Num = parseFloat(tp1);
-        if (s.bias === "long" && (slNum >= entryAvg || tp1Num <= entryAvg)) {
-          console.log(`[deep:${mode}] skip long setup with bad SL/TP direction: entry=${entryAvg} sl=${slNum} tp1=${tp1Num}`);
-          continue;
-        }
-        if (s.bias === "short" && (slNum <= entryAvg || tp1Num >= entryAvg)) {
-          console.log(`[deep:${mode}] skip short setup with bad SL/TP direction: entry=${entryAvg} sl=${slNum} tp1=${tp1Num}`);
+        const geomCheck = validateTradeGeometry(
+          {
+            bias: s.bias === "long" ? "LONG" : "SHORT",
+            entry: entryAvg,
+            sl: slNum,
+            tp1: tp1Num,
+            tp2: tp2 != null ? parseFloat(tp2) : null,
+            tp3: tp3 != null ? parseFloat(tp3) : null,
+          },
+          { atr: latest.atr, minRr: 0.7 },
+        );
+        if (!geomCheck.valid) {
+          console.log(`[deep:${mode}] skip setup geometry: ${geomCheck.reason}`);
           continue;
         }
 
@@ -5133,6 +5188,15 @@ async function appendCronTrace(env, entry) {
 }
 
 async function runAlertCheck(env, { force = false } = {}) {
+  let releaseLock = false;
+  if (!force) {
+    if (!await tryAcquireCronLock(env)) {
+      console.log("[cron] skip — run đang chạy (lock active)");
+      return;
+    }
+    releaseLock = true;
+  }
+  try {
   // Dọn message hết hạn — ALWAYS chạy (kể cả thiếu Telegram secret, kể cả cuối tuần).
   await cleanupExpiredMessages(env);
 
@@ -5333,6 +5397,9 @@ async function runAlertCheck(env, { force = false } = {}) {
   } catch (e) {
     console.log(`[cron] error: ${e.message}`);
   }
+  } finally {
+    if (releaseLock) await releaseCronLock(env);
+  }
 }
 
 async function tryWorkersAI(env, body, callerOpts = {}) {
@@ -5490,6 +5557,9 @@ export default {
     //
     // Dedup theo update_id phòng Telegram retry trùng (TTL 5 phút).
     if (url.pathname === "/telegram-webhook" && request.method === "POST") {
+      const webhookDenied = verifyTelegramWebhookSecret(request, env);
+      if (webhookDenied) return webhookDenied;
+
       let update;
       try {
         update = await request.json();
@@ -5499,21 +5569,45 @@ export default {
       }
 
       const updateId = update?.update_id;
-      if (updateId && env.CACHE) {
-        const dedupKey = `tg_processed:${updateId}`;
+      const dedupKey = updateId != null ? `tg_processed:${updateId}` : null;
+      const procKey = updateId != null ? `tg_processing:${updateId}` : null;
+
+      if (dedupKey && env.CACHE) {
         const seen = await env.CACHE.get(dedupKey);
         if (seen) {
           console.log(`[webhook] skip duplicate update_id=${updateId}`);
           return new Response("OK", { status: 200 });
         }
-        ctx.waitUntil(env.CACHE.put(dedupKey, "1", { expirationTtl: 300 }));
+        const processing = await env.CACHE.get(procKey);
+        if (processing) {
+          console.log(`[webhook] skip in-flight update_id=${updateId}`);
+          return new Response("OK", { status: 200 });
+        }
+        await env.CACHE.put(procKey, "1", { expirationTtl: 120 });
       }
 
-      // Trả 200 OK NGAY (Telegram timeout ~10s) + xử lý trong waitUntil.
-      ctx.waitUntil(handleTelegramUpdate(env, update).catch(e => {
-        console.log(`[webhook] handler fatal: ${e.message}`);
-      }));
+      ctx.waitUntil(
+        handleTelegramUpdate(env, update)
+          .then(async () => {
+            if (dedupKey && env.CACHE) {
+              await env.CACHE.put(dedupKey, "1", { expirationTtl: 300 });
+              await env.CACHE.delete(procKey);
+            }
+          })
+          .catch(async (e) => {
+            console.log(`[webhook] handler fatal: ${e.message}`);
+            if (procKey && env.CACHE) {
+              try { await env.CACHE.delete(procKey); } catch {}
+            }
+          }),
+      );
       return new Response("OK", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }
+
+    // Debug/admin — khi ADMIN_SECRET được set, yêu cầu auth (không set = hành vi cũ)
+    if (ADMIN_DEBUG_PATHS.has(url.pathname)) {
+      const denied = requireAdminAuth(request, env, origin);
+      if (denied) return denied;
     }
 
     // Debug: chạy 1 lệnh bot synchronous + dump error nếu có.
@@ -5651,8 +5745,9 @@ export default {
         if (c15m.length < 50) return jsonResponse(500, { error: `insufficient candles` }, origin);
         const e15m = enrichIndicators(c15m);
         const e1h = c1h.length >= 50 ? enrichIndicators(c1h) : null;
-        const latest = e15m[e15m.length - 1];
-        const prev = e15m[e15m.length - 2];
+        const pickTest = pickTriggerCandle(e15m, 15 * 60);
+        const latest = pickTest?.latest || e15m[e15m.length - 1];
+        const prev = pickTest?.prev || e15m[e15m.length - 2];
         const pivots = await getCachedDailyPivots(env);
 
         let alerts = await detectFreshAlerts(env, latest, prev, pivots, e15m);
@@ -5865,9 +5960,21 @@ export default {
         return jsonResponse(500, { error: "TELEGRAM_BOT_TOKEN chưa set" }, origin);
       }
       const webhookUrl = `https://${url.host}/telegram-webhook`;
-      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
+      const setBody = { url: webhookUrl };
+      if (env.TELEGRAM_WEBHOOK_SECRET) {
+        setBody.secret_token = env.TELEGRAM_WEBHOOK_SECRET;
+      }
+      const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(setBody),
+      });
       const result = await r.json();
-      return jsonResponse(200, { webhookUrl, telegramResponse: result }, origin);
+      return jsonResponse(200, {
+        webhookUrl,
+        secret_token_set: !!env.TELEGRAM_WEBHOOK_SECRET,
+        telegramResponse: result,
+      }, origin);
     }
 
     // Register bot commands với Telegram (loại bỏ 'Unknown command' warning + autocomplete)
@@ -6164,9 +6271,8 @@ export default {
       }, origin);
     }
 
-    // Block non-allowed origins for actual API calls
-    // (preflight already handled; this catches direct curl-like calls without origin too)
-    if (!isAllowedOrigin(origin)) {
+    // Block non-allowed origins for proxy API (admin đã auth được bypass để curl debug)
+    if (!isAllowedOrigin(origin) && !isAdminAuthed(request, env)) {
       return jsonResponse(403, { error: "Origin không được phép" }, origin);
     }
 

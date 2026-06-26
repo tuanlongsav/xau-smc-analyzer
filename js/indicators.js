@@ -1,9 +1,7 @@
 // ============================================================
 // Technical indicators — pure JS, không phụ thuộc lib
 // ============================================================
-//
-// Input format: array of OHLCV { time, open, high, low, close, volume }
-// Output: gắn các trường tính toán (ema20, rsi, atr, ...) vào nến.
+import { detectLiquiditySweep, detectRsiDivergence } from "./smc-detect.js";
 
 /**
  * Exponential Moving Average.
@@ -252,11 +250,12 @@ export function detectCrosses(candles) {
 }
 
 /**
- * Tính vùng giá tham chiếu từ ATR + recent extremes.
+ * Tính vùng giá tham chiếu từ ATR + recent extremes + SMC equilibrium.
  */
-export function calculateZones(latest) {
+export function calculateZones(latest, smcCtx = null) {
   if (!latest || !latest.atr) return {};
   const { close, atr: a, recentHigh, recentLow } = latest;
+  const pd = smcCtx?.premiumDiscount;
   return {
     support: recentLow ?? close,
     resistance: recentHigh ?? close,
@@ -265,13 +264,17 @@ export function calculateZones(latest) {
     targetLong: close + 3.0 * a,
     targetShort: close - 3.0 * a,
     atrValue: a,
+    equilibrium: pd?.equilibrium ?? null,
+    premiumDiscount: pd?.zone ?? null,
+    nearestFvg: smcCtx?.nearestFvg ?? null,
+    nearestOb: smcCtx?.nearestOb ?? null,
   };
 }
 
 /**
- * Rule-based alerts không cần LLM.
+ * Rule-based alerts — đồng bộ worker (crossover, SMA, sweep, wick, RSI div).
  */
-export function detectAlerts(latest, prev) {
+export function detectAlerts(latest, prev, candles = null) {
   const alerts = [];
   if (!latest) return alerts;
 
@@ -280,11 +283,14 @@ export function detectAlerts(latest, prev) {
     else if (latest.rsi < 30) alerts.push(`🟢 RSI quá bán (${latest.rsi.toFixed(1)}) — khả năng phục hồi`);
   }
 
-  if (latest.bbUpper && latest.close > latest.bbUpper) {
-    alerts.push(`📈 Giá $${latest.close.toFixed(2)} vượt biên Bollinger trên ($${latest.bbUpper.toFixed(2)})`);
-  }
-  if (latest.bbLower && latest.close < latest.bbLower) {
-    alerts.push(`📉 Giá $${latest.close.toFixed(2)} phá biên Bollinger dưới ($${latest.bbLower.toFixed(2)})`);
+  if (prev && latest.bbUpper != null && prev.bbUpper != null) {
+    if (latest.close > latest.bbUpper && prev.close <= prev.bbUpper) {
+      alerts.push(`📈 Vượt biên Bollinger trên ($${latest.bbUpper.toFixed(2)}) — đà tăng mạnh`);
+    }
+    if (latest.bbLower != null && prev.bbLower != null
+        && latest.close < latest.bbLower && prev.close >= prev.bbLower) {
+      alerts.push(`📉 Phá biên Bollinger dưới ($${latest.bbLower.toFixed(2)}) — đà giảm mạnh`);
+    }
   }
 
   if (prev && latest.macd != null && prev.macd != null) {
@@ -295,12 +301,39 @@ export function detectAlerts(latest, prev) {
     }
   }
 
-  if (prev && latest.ema50 && prev.ema50 && latest.ema200 && prev.ema200) {
-    if (prev.ema50 <= prev.ema200 && latest.ema50 > latest.ema200) {
-      alerts.push("⭐ Golden Cross (EMA50 cắt lên EMA200) — xu hướng tăng dài hạn");
-    } else if (prev.ema50 >= prev.ema200 && latest.ema50 < latest.ema200) {
-      alerts.push("⚠️ Death Cross (EMA50 cắt xuống EMA200) — xu hướng giảm dài hạn");
+  if (prev && latest.sma50 != null && prev.sma50 != null && latest.sma200 != null && prev.sma200 != null) {
+    if (prev.sma50 <= prev.sma200 && latest.sma50 > latest.sma200) {
+      alerts.push("⭐ Golden Cross (SMA50 cắt lên SMA200) — xu hướng tăng dài hạn");
+    } else if (prev.sma50 >= prev.sma200 && latest.sma50 < latest.sma200) {
+      alerts.push("💀 Death Cross (SMA50 cắt xuống SMA200) — xu hướng giảm dài hạn");
     }
+  }
+
+  const sweep = detectLiquiditySweep(latest, prev);
+  if (sweep?.type === "bearish") {
+    alerts.push(`🎣 Liquidity sweep TRÊN $${sweep.level.toFixed(2)} — đóng lại trong (bearish SMC)`);
+  } else if (sweep?.type === "bullish") {
+    alerts.push(`🎣 Liquidity sweep DƯỚI $${sweep.level.toFixed(2)} — đóng lại trong (bullish SMC)`);
+  }
+
+  if (latest.atr > 0 && latest.high != null && latest.low != null) {
+    const body = Math.abs(latest.close - latest.open);
+    const range = latest.high - latest.low;
+    const upperWick = latest.high - Math.max(latest.open, latest.close);
+    const lowerWick = Math.min(latest.open, latest.close) - latest.low;
+    if (range > 0.7 * latest.atr && body > 0) {
+      if (upperWick > 1.5 * body && upperWick > lowerWick * 1.5) {
+        alerts.push(`🪶 Rejection đỉnh — râu trên ${upperWick.toFixed(2)} (${(upperWick / body).toFixed(1)}× thân)`);
+      }
+      if (lowerWick > 1.5 * body && lowerWick > upperWick * 1.5) {
+        alerts.push(`🪶 Rejection đáy — râu dưới ${lowerWick.toFixed(2)} (${(lowerWick / body).toFixed(1)}× thân)`);
+      }
+    }
+  }
+
+  if (candles) {
+    const div = detectRsiDivergence(candles);
+    if (div) alerts.push(div);
   }
 
   return alerts;

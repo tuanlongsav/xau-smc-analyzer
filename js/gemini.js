@@ -105,8 +105,8 @@ function buildConfig({ jsonMode = true, maxTokens = 4096, temperature = 0.5, thi
  * Phân tích SMC đầy đủ. Trả dict JSON đã parse hoặc {error}.
  * @param {string} newsBlock - tin tức đã format (từ news.formatNewsForPrompt)
  */
-export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "") {
-  const { system, user } = buildSmcPrompt(latest, zones, candles, timeframe, crossCheck, newsBlock);
+export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "", prev = null, htfBlock = "") {
+  const { system, user } = buildSmcPrompt(latest, zones, candles, timeframe, crossCheck, newsBlock, prev, htfBlock);
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: [{ text: user }] }],
@@ -149,8 +149,8 @@ export async function analyzeSmc(latest, zones, candles, timeframe, crossCheck =
 /**
  * Quick scan — text 3-5 dòng, tắt thinking cho nhanh.
  */
-export async function quickScan(latest, zones) {
-  const { system, user } = buildQuickPrompt(latest, zones);
+export async function quickScan(latest, zones, candles = null, prev = null) {
+  const { system, user } = buildQuickPrompt(latest, zones, candles, prev);
   const body = {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: "user", parts: [{ text: user }] }],

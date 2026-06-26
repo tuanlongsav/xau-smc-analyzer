@@ -3,6 +3,8 @@
 // ============================================================
 import { fetchSpot, fetchOHLCV, TF_TO_TD } from "./data.js";
 import { computeIndicators, calculateZones, detectAlerts, computePivots } from "./indicators.js";
+import { pickTriggerCandle, TF_INTERVAL_SEC, validateTradeGeometry } from "./trade-utils.js";
+import { analyzeSmcContext } from "./smc-detect.js";
 import { analyzeSmc, quickScan } from "./gemini.js";
 import { initChart, updateChart, resizeChart, setPivots } from "./chart.js";
 import { fetchNews, formatNewsForPrompt } from "./news.js";
@@ -187,13 +189,40 @@ function onTogglePivot() {
   renderChart();
 }
 
+function getHtfBiasLines(state, tf) {
+  const order = ["5m", "15m", "1h", "4h", "1d"];
+  const idx = order.indexOf(tf);
+  if (idx < 0) return "";
+  const lines = [];
+  for (let i = idx + 1; i < order.length; i++) {
+    const htf = order[i];
+    const c = state.candlesByTf[htf];
+    if (!c || c.length < 50) continue;
+    const pick = getTriggerForCandles(c, htf);
+    const l = pick?.latest || c[c.length - 1];
+    let trend = "sideways";
+    if (l.ema200 != null) {
+      if (l.close > l.ema200 && l.ema21 > l.ema50) trend = "bullish";
+      else if (l.close < l.ema200 && l.ema21 < l.ema50) trend = "bearish";
+    }
+    lines.push(`- ${htf}: ${trend} | giá $${l.close.toFixed(2)} | RSI ${l.rsi?.toFixed(1) ?? "?"}`);
+  }
+  return lines.length ? `\n## HTF bias (top-down)\n${lines.join("\n")}\n` : "";
+}
+
+function getTriggerForCandles(candles, tf) {
+  const intervalSec = TF_INTERVAL_SEC[tf] || TF_INTERVAL_SEC["15m"];
+  return pickTriggerCandle(candles, intervalSec);
+}
+
 function renderAlerts() {
   const candles = state.candles;
   const container = $("#alerts");
   container.innerHTML = "";
-  if (!candles || candles.length < 2) return;
-  const latest = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
+  if (!candles || candles.length < 3) return;
+  const pick = getTriggerForCandles(candles, state.tf);
+  if (!pick) return;
+  const { latest, prev } = pick;
 
   // ── Pivot Points cho key levels (always computed, độc lập với toggle hiển thị chart) ──
   const pivots = computePivots(prev);
@@ -201,8 +230,25 @@ function renderAlerts() {
   // ── Default panel: Xu hướng trong ngày + Key technical levels ──
   container.innerHTML = renderTrendSummary(latest, candles, pivots);
 
+  const smcCtx = analyzeSmcContext(candles, latest, prev);
+  if (smcCtx.premiumDiscount || smcCtx.sweep || smcCtx.structure) {
+    const parts = [];
+    if (smcCtx.premiumDiscount) {
+      const z = smcCtx.premiumDiscount.zone;
+      const zVi = z === "premium" ? "Premium" : z === "discount" ? "Discount" : "Equilibrium";
+      parts.push(`${zVi} (${smcCtx.premiumDiscount.pctInRange.toFixed(0)}% range)`);
+    }
+    if (smcCtx.sweep) {
+      parts.push(`Sweep ${smcCtx.sweep.type === "bullish" ? "đáy" : "đỉnh"} $${smcCtx.sweep.level.toFixed(2)}`);
+    }
+    if (smcCtx.structure) {
+      parts.push(`${smcCtx.structure.type} ${smcCtx.structure.direction}`);
+    }
+    container.innerHTML += `<div class="bg-violet-500/10 border-l-4 border-violet-500 p-3 rounded text-xs mt-2">🧠 SMC: ${parts.join(" · ")}</div>`;
+  }
+
   // ── Rule-based alerts (nếu có) ──
-  const alerts = detectAlerts(latest, prev);
+  const alerts = detectAlerts(latest, prev, candles);
   if (alerts.length === 0) {
     container.innerHTML += `<div class="text-slate-500 text-xs italic mt-2">Không có cảnh báo rule-based đặc biệt (RSI/BB/MACD/Cross).</div>`;
   } else {
@@ -361,14 +407,15 @@ function renderAnalysis() {
     if (top) {
       const pct = (top[1] / biases.length) * 100;
       const icon = { bullish: "📈", bearish: "📉", sideways: "➡️" }[top[0]] || "❓";
+      const safeBias = escapeHtml(top[0]);
       const banner = document.createElement("div");
       const cls = pct === 100 ? "bg-green-500/15 border-green-500" : pct >= 50 ? "bg-amber-500/15 border-amber-500" : "bg-red-500/15 border-red-500";
       banner.className = `${cls} border-l-4 p-4 rounded mb-4`;
       const msg = pct === 100
-        ? `Đồng thuận 100%: ${icon} <strong>${top[0].toUpperCase()}</strong> trên ${biases.length} khung`
+        ? `Đồng thuận 100%: ${icon} <strong>${safeBias.toUpperCase()}</strong> trên ${biases.length} khung`
         : pct >= 50
-        ? `Đa số: ${icon} <strong>${top[0].toUpperCase()}</strong> (${pct.toFixed(0)}%) — phân bố: ${Object.entries(counts).map(([k,v])=>`${v} ${k}`).join(", ")}`
-        : `Phân vân — phân bố: ${Object.entries(counts).map(([k,v])=>`${v} ${k}`).join(", ")}`;
+        ? `Đa số: ${icon} <strong>${safeBias.toUpperCase()}</strong> (${pct.toFixed(0)}%) — phân bố: ${Object.entries(counts).map(([k,v])=>`${v} ${escapeHtml(k)}`).join(", ")}`
+        : `Phân vân — phân bố: ${Object.entries(counts).map(([k,v])=>`${v} ${escapeHtml(k)}`).join(", ")}`;
       banner.innerHTML = `<div class="font-semibold">🎯 ${msg}</div>`;
       container.appendChild(banner);
     }
@@ -389,9 +436,14 @@ function renderSmcCard(r, tf) {
     return `<div class="text-red-500"><strong>Khung ${tf}:</strong> ${escapeHtml(r.error)}</div>`;
   }
 
-  const bias = (r.bias || "N/A").toUpperCase();
-  const biasIcon = { BULLISH: "📈", BEARISH: "📉", SIDEWAYS: "➡️" }[bias] || "❓";
-  const biasColor = { BULLISH: "text-green-500", BEARISH: "text-red-500", SIDEWAYS: "text-slate-500" }[bias] || "";
+  const bias = escapeHtml((r.bias || "N/A").toUpperCase());
+  const biasKey = (r.bias || "").toUpperCase();
+  const biasIcon = { BULLISH: "📈", BEARISH: "📉", SIDEWAYS: "➡️" }[biasKey] || "❓";
+  const biasColor = { BULLISH: "text-green-500", BEARISH: "text-red-500", SIDEWAYS: "text-slate-500" }[biasKey] || "";
+
+  const candlesForTf = state.candlesByTf[tf] || (tf === state.tf ? state.candles : null);
+  const triggerPick = candlesForTf ? getTriggerForCandles(candlesForTf, tf) : null;
+  const atrForGeom = triggerPick?.latest?.atr ?? null;
 
   // Schema mới (3 tasks) — fallback các field cũ cho history legacy
   const t1 = r.task1_cau_truc_dong_luong || {};
@@ -424,8 +476,21 @@ function renderSmcCard(r, tf) {
         <div class="text-xs italic mt-1 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do || "Chưa thuận")}</div>
       </div>`;
     }
-    const entry = sc.entry ?? sc.vung_vao_lenh ?? "";
-    const tp = sc.take_profit ?? sc.target;
+    const entryRaw = sc.entry ?? sc.vung_vao_lenh;
+    const tpRaw = sc.take_profit ?? sc.target;
+    const geom = validateTradeGeometry(
+      { bias: label, entry: entryRaw, sl: sc.stop_loss, tp1: tpRaw, tp2: sc.tp2, tp3: sc.tp3 },
+      { atr: atrForGeom, minRr: 0.7 },
+    );
+    if (!geom.valid) {
+      return `<div class="border-2 border-amber-500 rounded-lg p-3 opacity-80">
+        <div class="font-bold">${icon} ${label} ⚠️ setup không hợp lệ</div>
+        <div class="text-xs mt-1 text-amber-700 dark:text-amber-300">${escapeHtml(geom.reason)}</div>
+        ${sc.ly_do ? `<div class="text-xs italic mt-1 text-slate-600 dark:text-slate-400">${escapeHtml(sc.ly_do)}</div>` : ""}
+      </div>`;
+    }
+    const entry = entryRaw;
+    const tp = tpRaw;
     const rr = sc.risk_reward;
     const cardBorder = label === "LONG" ? "border-green-500" : "border-red-500";
     return `<div class="border-2 ${cardBorder} rounded-lg p-3 bg-white dark:bg-slate-900">
@@ -524,7 +589,7 @@ function renderHistory() {
     const biasIcon = { bullish: "📈", bearish: "📉", sideways: "➡️" }[h.bias?.toLowerCase()] || "❓";
     div.innerHTML = `
       <div class="flex justify-between items-center">
-        <span>${t} • ${h.tf} • ${biasIcon} <strong>${h.bias?.toUpperCase() || "?"}</strong></span>
+        <span>${t} • ${escapeHtml(h.tf)} • ${biasIcon} <strong>${escapeHtml(h.bias?.toUpperCase() || "?")}</strong></span>
         <button data-idx="${i}" class="restore-btn text-blue-500 text-xs hover:underline">Xem lại</button>
       </div>
       <div class="text-xs text-slate-500 truncate">${escapeHtml(h.tom_tat || "")}</div>
@@ -608,14 +673,19 @@ async function onFullAnalysis() {
 
   try {
     const newsBlock = formatNewsForPrompt(state.news, 8);
-    // Stagger 400ms giữa các call để tránh Gemini overload heuristics + free tier RPM
+    // Preload mọi TF trước để HTF bias có sẵn khi phân tích LTF (top-down SMC)
+    await Promise.all(tfs.map(t => loadTfData(t)));
     const jobs = await Promise.all(tfs.map(async (t, i) => {
       if (i > 0) await new Promise(r => setTimeout(r, i * 400));
-      const candles = await loadTfData(t);
-      const latest = candles[candles.length - 1];
-      const zones = calculateZones(latest);
+      const candles = state.candlesByTf[t];
+      const pick = getTriggerForCandles(candles, t);
+      const latest = pick?.latest || candles[candles.length - 1];
+      const prev = pick?.prev ?? candles[candles.length - 2];
+      const smcCtx = analyzeSmcContext(candles, latest, prev);
+      const zones = calculateZones(latest, smcCtx);
+      const htfBlock = getHtfBiasLines(state, t);
       const cc = state.spot ? { twelvedata: state.spot } : null;
-      return analyzeSmc(latest, zones, candles, t, cc, newsBlock).then(r => [t, r]);
+      return analyzeSmc(latest, zones, candles, t, cc, newsBlock, prev, htfBlock).then(r => [t, r]);
     }));
     jobs.forEach(([t, r]) => {
       state.smcResults[t] = r;
@@ -633,9 +703,12 @@ async function onQuickScan() {
   if (!state.candles || state.candles.length === 0) return;
   setLoading(true, "Quick scan với Gemini...");
   try {
-    const latest = state.candles[state.candles.length - 1];
-    const zones = calculateZones(latest);
-    state.quickResult = await quickScan(latest, zones);
+    const pick = getTriggerForCandles(state.candles, state.tf);
+    const latest = pick?.latest || state.candles[state.candles.length - 1];
+    const prev = pick?.prev ?? state.candles[state.candles.length - 2];
+    const smcCtx = analyzeSmcContext(state.candles, latest, prev);
+    const zones = calculateZones(latest, smcCtx);
+    state.quickResult = await quickScan(latest, zones, state.candles, prev);
     renderAnalysis();
   } catch (e) {
     showError(`Lỗi: ${e.message}`);

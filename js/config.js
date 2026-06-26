@@ -20,7 +20,7 @@ export const CONFIG = {
   GEMINI_PROXY_URL: "https://xau-gemini-proxy.tuanlong-sav.workers.dev",
 
   SYMBOL: "XAU/USD",
-  OUTPUT_SIZE: 1000,
+  OUTPUT_SIZE: 350,
 
   // Default TF khi mở app
   DEFAULT_TF: "15m",

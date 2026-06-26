@@ -6,6 +6,7 @@
 //   2. Vùng cản quan trọng (S/R + Fibonacci nếu vừa có sóng đẩy)
 //   3. Kế hoạch giao dịch (kịch bản chính + entry/SL/TP/R:R cho LONG và SHORT)
 import { computeFib } from "./indicators.js";
+import { analyzeSmcContext, formatSmcContextForPrompt } from "./smc-detect.js";
 
 export const SMC_SYSTEM_PROMPT = `Bạn là chuyên gia phân tích kỹ thuật và giao dịch XAU/USD chuyên nghiệp với 15 năm kinh nghiệm scalping/day trading + Smart Money Concepts (SMC).
 
@@ -106,8 +107,11 @@ function describeMacd(latest) {
 // PUBLIC BUILDERS
 // ============================================================
 
-export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "") {
+export function buildSmcPrompt(latest, zones, candles, timeframe, crossCheck = null, newsBlock = "", prev = null, htfBlock = "") {
   const updateTime = new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const prevCandle = prev ?? (candles.length >= 2 ? candles[candles.length - 2] : null);
+  const smcCtx = analyzeSmcContext(candles, latest, prevCandle);
+  const smcBlock = formatSmcContextForPrompt(smcCtx, latest);
   const ohl = getIntradayOHL(candles, timeframe);
   const fibInfo = getNearestFibs(candles, latest.close);
   const horizon = getTfHorizon(timeframe);
@@ -153,16 +157,21 @@ ${ohlBlock}
 
 ## Vùng giá tham chiếu
 - Hỗ trợ gần: $${safe(zones.support).toFixed(2)}
-- Kháng cự gần: $${safe(zones.resistance).toFixed(2)}${fibBlock}
+- Kháng cự gần: $${safe(zones.resistance).toFixed(2)}
+${zones.equilibrium != null ? `- Equilibrium (50% range): $${safe(zones.equilibrium).toFixed(2)} — giá đang ở vùng ${zones.premiumDiscount || "?"}` : ""}${fibBlock}
 
+## Phân tích SMC (rule-based — dùng làm anchor, có thể bổ sung nếu thấy setup khác)
+${smcBlock}
+${htfBlock}
 ## 10 nến gần nhất (OHLC)
 ${fmtCandles(candles, 10)}${macroBlock}
 
 # YÊU CẦU PHÂN TÍCH (3 tasks)
 
 **TASK 1 — Đánh giá Cấu trúc & Động lượng (${timeframe})**
-- Dựa vào biên độ High/Low và giá hiện tại: phe MUA hay BÁN đang nắm quyền kiểm soát?
-- BOS hoặc CHOCH gần nhất ở mốc nào? Có Order Block / FVG nào còn fresh?
+- Dựa vào block SMC rule-based ở trên + OHLC: phe MUA hay BÁN đang nắm quyền kiểm soát?
+- Xác nhận hoặc điều chỉnh BOS/CHOCH, OB/FVG — ưu tiên setup có liquidity sweep + displacement (confluence model).
+- Long chỉ khả thi khi discount zone + bullish sweep/FVG/OB; short khi premium + bearish confluence.
 - Sự kết hợp RSI + MACD có dấu hiệu kiệt sức (exhaustion) hay phân kỳ (divergence) báo hiệu đảo chiều không?
 
 **TASK 2 — Xác định Vùng Cản Quan Trọng**
@@ -244,11 +253,23 @@ ${fmtCandles(candles, 10)}${macroBlock}
   return { system: SMC_SYSTEM_PROMPT, user };
 }
 
-export function buildQuickPrompt(latest, zones) {
+export function buildQuickPrompt(latest, zones, candles = null, prev = null) {
+  const prevCandle = prev ?? (candles?.length >= 2 ? candles[candles.length - 2] : null);
+  let smcExtra = "";
+  if (candles && latest) {
+    const ctx = analyzeSmcContext(candles, latest, prevCandle);
+    const parts = [];
+    if (ctx.premiumDiscount) {
+      parts.push(`zone ${ctx.premiumDiscount.zone} (${ctx.premiumDiscount.pctInRange.toFixed(0)}% range)`);
+    }
+    if (ctx.sweep) parts.push(`sweep ${ctx.sweep.type} @$${ctx.sweep.level.toFixed(2)}`);
+    if (ctx.structure) parts.push(`${ctx.structure.type} ${ctx.structure.direction}`);
+    if (parts.length) smcExtra = `\nSMC: ${parts.join(" | ")}`;
+  }
   const user = `Giá: $${safe(latest.close).toFixed(2)} | RSI: ${safe(latest.rsi).toFixed(0)} | ATR: ${safe(latest.atr).toFixed(1)}
 S/R: $${safe(zones.support).toFixed(2)} / $${safe(zones.resistance).toFixed(2)}
 EMA 9/21/50/200: ${safe(latest.ema9).toFixed(2)} / ${safe(latest.ema21).toFixed(2)} / ${safe(latest.ema50).toFixed(2)} / ${safe(latest.ema200).toFixed(2)}
-SMA 50/200: ${safe(latest.sma50).toFixed(2)} / ${safe(latest.sma200).toFixed(2)}
+SMA 50/200: ${safe(latest.sma50).toFixed(2)} / ${safe(latest.sma200).toFixed(2)}${smcExtra}
 
 Trả lời 3-5 dòng:
 1. Phe nào kiểm soát + trend?
